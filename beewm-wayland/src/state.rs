@@ -7,17 +7,27 @@ use beewm_core::model::window::Geometry;
 use beewm_core::model::workspace::Workspace;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::glow::GlowRenderer;
+use smithay::backend::renderer::Color32F;
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction};
 use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Size, Transform};
+use smithay::utils::{Rectangle, Size, Transform};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -33,18 +43,25 @@ pub struct Beewm {
     pub display_handle: DisplayHandle,
     pub running: bool,
     pub config: Config,
+    pub start_time: std::time::Instant,
 
     // Smithay protocol state
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xdg_decoration_state: XdgDecorationState,
+    pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
+    pub cursor_status: CursorImageStatus,
 
     // Desktop management
     pub space: Space<Window>,
     pub layout: Box<dyn Layout>,
     pub workspaces: Vec<Workspace>,
+    pub workspace_windows: Vec<Vec<Window>>,
     pub active_workspace: usize,
 }
 
@@ -54,7 +71,11 @@ impl Beewm {
 
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "beewm");
 
@@ -72,16 +93,107 @@ impl Beewm {
             display_handle,
             running: true,
             config,
+            start_time: std::time::Instant::now(),
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
+            layer_shell_state,
             shm_state,
+            data_device_state,
+            primary_selection_state,
             seat_state,
             seat,
+            cursor_status: CursorImageStatus::default_named(),
             space: Space::default(),
             layout,
             workspaces: (0..num_ws).map(Workspace::new).collect(),
+            workspace_windows: (0..num_ws).map(|_| Vec::new()).collect(),
             active_workspace: 0,
         }
+    }
+
+    /// Build border render elements for all visible windows.
+    pub fn border_elements(&self) -> Vec<SolidColorRenderElement> {
+        let bw = self.config.border_width as i32;
+        if bw == 0 {
+            return Vec::new();
+        }
+
+        let focused_surface = self
+            .seat
+            .get_keyboard()
+            .and_then(|kb| kb.current_focus());
+
+        let focused_color = hex_to_color32f(self.config.border_color_focused);
+        let unfocused_color = hex_to_color32f(self.config.border_color_unfocused);
+
+        let mut elements = Vec::new();
+
+        for window in self.space.elements() {
+            let geo = match self.space.element_geometry(window) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            let is_focused = window
+                .toplevel()
+                .and_then(|tl| {
+                    focused_surface
+                        .as_ref()
+                        .map(|fs| *fs == *tl.wl_surface())
+                })
+                .unwrap_or(false);
+
+            let color = if is_focused {
+                focused_color
+            } else {
+                unfocused_color
+            };
+
+            // Window content is at geo.loc with size geo.size.
+            // Borders are drawn OUTSIDE the content area.
+            let x = geo.loc.x - bw;
+            let y = geo.loc.y - bw;
+            let w = geo.size.w + bw * 2;
+            let h = geo.size.h + bw * 2;
+
+            let commit = smithay::backend::renderer::utils::CommitCounter::default();
+
+            // Top border
+            elements.push(SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::new((x, y).into(), (w, bw).into()),
+                commit,
+                color,
+                Kind::Unspecified,
+            ));
+            // Bottom border
+            elements.push(SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::new((x, y + h - bw).into(), (w, bw).into()),
+                commit,
+                color,
+                Kind::Unspecified,
+            ));
+            // Left border
+            elements.push(SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::new((x, y + bw).into(), (bw, h - bw * 2).into()),
+                commit,
+                color,
+                Kind::Unspecified,
+            ));
+            // Right border
+            elements.push(SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::new((x + w - bw, y + bw).into(), (bw, h - bw * 2).into()),
+                commit,
+                color,
+                Kind::Unspecified,
+            ));
+        }
+
+        elements
     }
 
     /// Re-tile all windows in the space using the current layout.
@@ -102,7 +214,7 @@ impl Beewm {
             (output_geo.size.h - gap * 2).max(0) as u32,
         );
 
-        let windows: Vec<Window> = self.space.elements().cloned().collect();
+        let windows = &self.workspace_windows[self.active_workspace];
         let count = windows.len();
 
         if count == 0 {
@@ -126,6 +238,111 @@ impl Beewm {
             self.space.map_element(window.clone(), (x, y), false);
         }
     }
+
+    /// Switch to a different workspace by index.
+    pub fn switch_workspace(&mut self, idx: usize) {
+        if idx >= self.workspaces.len() || idx == self.active_workspace {
+            return;
+        }
+
+        tracing::info!(
+            "Switching workspace {} -> {}",
+            self.active_workspace + 1,
+            idx + 1
+        );
+
+        // Unmap all windows from the current workspace
+        for window in &self.workspace_windows[self.active_workspace] {
+            self.space.unmap_elem(window);
+        }
+
+        self.active_workspace = idx;
+
+        // Map all windows from the target workspace
+        for window in &self.workspace_windows[self.active_workspace] {
+            self.space.map_element(window.clone(), (0, 0), false);
+        }
+
+        self.relayout();
+
+        // Focus the active window on the new workspace
+        let ws = &self.workspaces[self.active_workspace];
+        if let Some(focus_idx) = ws.focused_idx {
+            if let Some(window) = self.workspace_windows[self.active_workspace].get(focus_idx) {
+                if let Some(toplevel) = window.toplevel() {
+                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    let keyboard = self.seat.get_keyboard().unwrap();
+                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
+                }
+            }
+        } else {
+            // No windows — clear keyboard focus
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let keyboard = self.seat.get_keyboard().unwrap();
+            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+        }
+    }
+
+    /// Move the focused window to another workspace.
+    pub fn move_to_workspace(&mut self, target: usize) {
+        if target >= self.workspaces.len() || target == self.active_workspace {
+            return;
+        }
+
+        let ws = &self.workspaces[self.active_workspace];
+        let focus_idx = match ws.focused_idx {
+            Some(i) => i,
+            None => return,
+        };
+
+        let current = self.active_workspace;
+        if focus_idx >= self.workspace_windows[current].len() {
+            return;
+        }
+
+        // Remove window from current workspace
+        let window = self.workspace_windows[current].remove(focus_idx);
+        self.workspaces[current].remove_window(focus_idx);
+
+        // Unmap from space (it's being moved away from the visible workspace)
+        self.space.unmap_elem(&window);
+
+        // Add to target workspace
+        self.workspace_windows[target].push(window);
+        self.workspaces[target].add_window();
+
+        tracing::info!(
+            "Moved window from workspace {} to {}",
+            current + 1,
+            target + 1
+        );
+
+        self.relayout();
+
+        // Focus next window on current workspace if any
+        let ws = &self.workspaces[self.active_workspace];
+        if let Some(focus_idx) = ws.focused_idx {
+            if let Some(window) = self.workspace_windows[self.active_workspace].get(focus_idx) {
+                if let Some(toplevel) = window.toplevel() {
+                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    let keyboard = self.seat.get_keyboard().unwrap();
+                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
+                }
+            }
+        } else {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let keyboard = self.seat.get_keyboard().unwrap();
+            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+        }
+    }
+}
+
+/// Convert a 0xRRGGBB hex color to smithay's Color32F (with alpha=1.0).
+fn hex_to_color32f(hex: u32) -> Color32F {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    Color32F::new(r, g, b, 1.0)
 }
 
 /// Per-client state required by smithay.
@@ -263,24 +480,47 @@ impl WaylandBackend {
             // Render
             let output = data.state.space.outputs().next().cloned();
             if let Some(ref output) = output {
-                if let Ok((renderer, mut framebuffer)) = winit_backend.bind() {
-                    let elements = data
-                        .state
-                        .space
-                        .render_elements_for_output(renderer, output, 1.0)
-                        .unwrap_or_default();
+                let size = winit_backend.window_size();
+                let damage = smithay::utils::Rectangle::from_size(size);
 
-                    damage_tracker
-                        .render_output(
-                            renderer,
-                            &mut framebuffer,
-                            0,
-                            &elements,
-                            [0.1, 0.1, 0.1, 1.0],
-                        )
-                        .ok();
+                let border_elements = data.state.border_elements();
+
+                if let Ok((renderer, mut framebuffer)) = winit_backend.bind() {
+                    smithay::desktop::space::render_output::<
+                        _,
+                        SolidColorRenderElement,
+                        _,
+                        _,
+                    >(
+                        output,
+                        renderer,
+                        &mut framebuffer,
+                        1.0,
+                        0,
+                        [&data.state.space],
+                        &border_elements,
+                        &mut damage_tracker,
+                        [0.1, 0.1, 0.1, 1.0],
+                    )
+                    .ok();
                 }
-                winit_backend.submit(None).ok();
+                winit_backend.submit(Some(&[damage])).ok();
+
+                // Tell clients to draw their next frame
+                let elapsed = data.state.start_time.elapsed();
+                data.state.space.elements().for_each(|window| {
+                    window.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    });
+                });
+
+                // Send frame to layer surfaces too
+                let layer_map = smithay::desktop::layer_map_for_output(output);
+                for layer in layer_map.layers() {
+                    layer.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    });
+                }
             }
 
             // Dispatch event loop

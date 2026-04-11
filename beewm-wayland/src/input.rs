@@ -131,10 +131,10 @@ fn execute_action(state: &mut Beewm, action: Action) {
             state.running = false;
         }
         Action::SwitchWorkspace(idx) => {
-            tracing::info!("Switch workspace {}", idx);
+            state.switch_workspace(idx);
         }
         Action::MoveToWorkspace(idx) => {
-            tracing::info!("Move to workspace {}", idx);
+            state.move_to_workspace(idx);
         }
     }
 }
@@ -142,7 +142,7 @@ fn execute_action(state: &mut Beewm, action: Action) {
 fn focused_window(state: &Beewm) -> Option<&smithay::desktop::Window> {
     let ws = &state.workspaces[state.active_workspace];
     let idx = ws.focused_idx?;
-    state.space.elements().nth(idx)
+    state.workspace_windows[state.active_workspace].get(idx)
 }
 
 fn focus_current_window(state: &mut Beewm) {
@@ -152,7 +152,7 @@ fn focus_current_window(state: &mut Beewm) {
         None => return,
     };
 
-    let window = match state.space.elements().nth(idx).cloned() {
+    let window = match state.workspace_windows[state.active_workspace].get(idx).cloned() {
         Some(w) => w,
         None => return,
     };
