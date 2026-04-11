@@ -5,3 +5,10 @@ edition = "2021"
 
 [dependencies]
 beewm-core = { path = "../beewm-core" }
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "desktop",
+    "wayland_frontend",
+    "renderer_glow",
+] }
+tracing = "0.1"

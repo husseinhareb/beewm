@@ -1,6 +1,5 @@
 use crate::layout::Layout;
 use crate::model::window::Geometry;
-use crate::WindowHandle;
 
 /// Classic master-stack layout: one master window on the left, remaining windows stacked
 /// on the right.
@@ -16,22 +15,22 @@ impl Default for MasterStack {
     }
 }
 
-impl<H: WindowHandle> Layout<H> for MasterStack {
-    fn apply(&self, screen: &Geometry, windows: &[H]) -> Vec<Geometry> {
-        if windows.is_empty() {
+impl Layout for MasterStack {
+    fn apply(&self, screen: &Geometry, window_count: usize) -> Vec<Geometry> {
+        if window_count == 0 {
             return Vec::new();
         }
 
-        if windows.len() == 1 {
+        if window_count == 1 {
             return vec![*screen];
         }
 
         let master_width = (screen.width as f64 * self.master_ratio) as u32;
         let stack_width = screen.width - master_width;
-        let stack_count = windows.len() - 1;
+        let stack_count = window_count - 1;
         let stack_height = screen.height / stack_count as u32;
 
-        let mut geometries = Vec::with_capacity(windows.len());
+        let mut geometries = Vec::with_capacity(window_count);
 
         // Master window
         geometries.push(Geometry::new(
@@ -70,15 +69,11 @@ impl<H: WindowHandle> Layout<H> for MasterStack {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    struct TestHandle(u32);
-    impl WindowHandle for TestHandle {}
-
     #[test]
     fn empty_windows() {
         let layout = MasterStack::default();
         let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, &[] as &[TestHandle]);
+        let result = layout.apply(&screen, 0);
         assert!(result.is_empty());
     }
 
@@ -86,7 +81,7 @@ mod tests {
     fn single_window_fills_screen() {
         let layout = MasterStack::default();
         let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, &[TestHandle(1)]);
+        let result = layout.apply(&screen, 1);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], screen);
     }
@@ -95,7 +90,7 @@ mod tests {
     fn two_windows_split() {
         let layout = MasterStack::default();
         let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, &[TestHandle(1), TestHandle(2)]);
+        let result = layout.apply(&screen, 2);
         assert_eq!(result.len(), 2);
         // Master takes ~55%
         assert_eq!(result[0].width, 1056);
@@ -110,7 +105,7 @@ mod tests {
     fn three_windows_stacked() {
         let layout = MasterStack::default();
         let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, &[TestHandle(1), TestHandle(2), TestHandle(3)]);
+        let result = layout.apply(&screen, 3);
         assert_eq!(result.len(), 3);
         // Two stack windows each get half height
         assert_eq!(result[1].height, 540);

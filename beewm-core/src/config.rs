@@ -22,6 +22,14 @@ pub enum Action {
     Quit,
 }
 
+/// A keybinding with resolved numeric keycode and modifier mask.
+#[derive(Debug, Clone)]
+pub struct ResolvedKeybind {
+    pub modifiers: u32,
+    pub keycode: u32,
+    pub action: Action,
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -47,8 +55,62 @@ impl Default for Config {
             num_workspaces: 9,
             focus_follows_mouse: true,
             master_ratio: 0.55,
-            keybinds: Vec::new(),
+            keybinds: Self::default_keybinds(),
         }
+    }
+}
+
+impl Config {
+    fn default_keybinds() -> Vec<Keybind> {
+        let mut binds = vec![
+            Keybind {
+                modifiers: vec!["super".into()],
+                key: "Return".into(),
+                action: Action::Spawn("foot".into()),
+            },
+            Keybind {
+                modifiers: vec!["super".into()],
+                key: "d".into(),
+                action: Action::Spawn("wofi --show run".into()),
+            },
+            Keybind {
+                modifiers: vec!["super".into()],
+                key: "j".into(),
+                action: Action::FocusNext,
+            },
+            Keybind {
+                modifiers: vec!["super".into()],
+                key: "k".into(),
+                action: Action::FocusPrev,
+            },
+            Keybind {
+                modifiers: vec!["super".into()],
+                key: "q".into(),
+                action: Action::CloseWindow,
+            },
+            Keybind {
+                modifiers: vec!["super".into(), "shift".into()],
+                key: "e".into(),
+                action: Action::Quit,
+            },
+        ];
+        // Super+1 through Super+9: switch workspace
+        for i in 1..=9 {
+            binds.push(Keybind {
+                modifiers: vec!["super".into()],
+                key: i.to_string(),
+                action: Action::SwitchWorkspace(i - 1),
+            });
+        }
+        // Super+Shift+1 through Super+Shift+9: move to workspace
+        for i in 1..=9 {
+            binds.push(Keybind {
+                modifiers: vec!["super".into(), "shift".into()],
+                key: i.to_string(),
+                action: Action::MoveToWorkspace(i - 1),
+            });
+        }
+        binds
     }
 }
 

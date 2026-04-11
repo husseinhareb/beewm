@@ -7,5 +7,3 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
-bitflags = "2"
-tokio = { version = "1", features = ["net"] }

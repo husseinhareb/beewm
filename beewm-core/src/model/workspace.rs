@@ -1,61 +1,60 @@
-use crate::WindowHandle;
-
-/// An i3-style numbered workspace.
+/// An i3-style numbered workspace tracking window indices.
 #[derive(Debug)]
-pub struct Workspace<H: WindowHandle> {
+pub struct Workspace {
     pub id: usize,
     pub name: String,
-    pub windows: Vec<H>,
-    pub focused: Option<H>,
+    pub window_count: usize,
+    pub focused_idx: Option<usize>,
 }
 
-impl<H: WindowHandle> Workspace<H> {
+impl Workspace {
     pub fn new(id: usize) -> Self {
         Self {
             id,
             name: format!("{}", id + 1),
-            windows: Vec::new(),
-            focused: None,
+            window_count: 0,
+            focused_idx: None,
         }
     }
 
-    pub fn add_window(&mut self, handle: H) {
-        self.windows.push(handle);
-        self.focused = Some(handle);
+    pub fn add_window(&mut self) {
+        self.focused_idx = Some(self.window_count);
+        self.window_count += 1;
     }
 
-    pub fn remove_window(&mut self, handle: H) {
-        self.windows.retain(|&w| w != handle);
-        if self.focused == Some(handle) {
-            self.focused = self.windows.last().copied();
+    pub fn remove_window(&mut self, idx: usize) {
+        if self.window_count == 0 {
+            return;
+        }
+        self.window_count -= 1;
+        if self.window_count == 0 {
+            self.focused_idx = None;
+        } else if let Some(focused) = self.focused_idx {
+            if focused == idx {
+                self.focused_idx = Some(self.window_count.saturating_sub(1));
+            } else if focused > idx {
+                self.focused_idx = Some(focused - 1);
+            }
         }
     }
 
     pub fn focus_next(&mut self) {
-        if self.windows.is_empty() {
+        if self.window_count == 0 {
             return;
         }
-        let current_idx = self
-            .focused
-            .and_then(|f| self.windows.iter().position(|&w| w == f))
-            .unwrap_or(0);
-        let next_idx = (current_idx + 1) % self.windows.len();
-        self.focused = Some(self.windows[next_idx]);
+        let current = self.focused_idx.unwrap_or(0);
+        self.focused_idx = Some((current + 1) % self.window_count);
     }
 
     pub fn focus_prev(&mut self) {
-        if self.windows.is_empty() {
+        if self.window_count == 0 {
             return;
         }
-        let current_idx = self
-            .focused
-            .and_then(|f| self.windows.iter().position(|&w| w == f))
-            .unwrap_or(0);
-        let prev_idx = if current_idx == 0 {
-            self.windows.len() - 1
+        let current = self.focused_idx.unwrap_or(0);
+        self.focused_idx = Some(if current == 0 {
+            self.window_count - 1
         } else {
-            current_idx - 1
-        };
-        self.focused = Some(self.windows[prev_idx]);
+            current - 1
+        });
     }
 }

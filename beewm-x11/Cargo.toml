@@ -1,9 +1,0 @@
-[package]
-name = "beewm-x11"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-beewm-core = { path = "../beewm-core" }
-x11rb = { version = "0.13", features = ["randr"] }
-tracing = "0.1"
