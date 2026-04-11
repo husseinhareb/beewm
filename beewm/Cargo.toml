@@ -1,0 +1,11 @@
+[package]
+name = "beewm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+beewm-core = { path = "../beewm-core" }
+beewm-x11 = { path = "../beewm-x11" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

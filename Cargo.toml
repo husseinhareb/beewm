@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "beewm",
+    "beewm-core",
+    "beewm-x11",
+    "beewm-wayland",
+]
+resolver = "2"
