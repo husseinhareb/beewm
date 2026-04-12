@@ -16,6 +16,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
@@ -45,12 +46,17 @@ pub struct Beewm {
     pub shm_state: ShmState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub dmabuf_state: DmabufState,
+    pub dmabuf_global: Option<DmabufGlobal>,
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
     pub cursor_status: CursorImageStatus,
 
     // Pointer
     pub pointer_location: Point<f64, Logical>,
+
+    // Session (for VT switching in TTY mode)
+    pub session: Option<Box<dyn std::any::Any>>,
 
     // Desktop management
     pub space: Space<Window>,
@@ -71,6 +77,7 @@ impl Beewm {
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        let dmabuf_state = DmabufState::new();
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "beewm");
 
@@ -96,10 +103,13 @@ impl Beewm {
             shm_state,
             data_device_state,
             primary_selection_state,
+            dmabuf_state,
+            dmabuf_global: None,
             seat_state,
             seat,
             cursor_status: CursorImageStatus::default_named(),
             pointer_location: Point::from((0.0, 0.0)),
+            session: None,
             space: Space::default(),
             layout,
             workspaces: (0..num_ws).map(Workspace::new).collect(),
@@ -190,6 +200,21 @@ impl Beewm {
         }
 
         elements
+    }
+
+    /// Build a simple software cursor element (used by DRM backend).
+    pub fn cursor_elements(&self) -> Vec<SolidColorRenderElement> {
+        let commit = smithay::backend::renderer::utils::CommitCounter::default();
+        vec![SolidColorRenderElement::new(
+            Id::new(),
+            Rectangle::new(
+                (self.pointer_location.x as i32, self.pointer_location.y as i32).into(),
+                (16, 16).into(),
+            ),
+            commit,
+            Color32F::new(1.0, 1.0, 1.0, 1.0),
+            Kind::Unspecified,
+        )]
     }
 
     /// Re-tile all windows in the space using the current layout.

@@ -4,16 +4,17 @@ use std::time::Duration;
 use beewm_core::config::Config;
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::Format;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
+use smithay::desktop::space::space_render_elements;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
@@ -24,6 +25,7 @@ use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::wayland::socket::ListeningSocketSource;
 
+use crate::render::OutputRenderElement;
 use crate::state::{Beewm, CalloopData, ClientState};
 
 /// Per-GPU state for the DRM backend.
@@ -40,6 +42,7 @@ struct GpuData {
         DrmDeviceFd,
     >,
     output: Output,
+    dmabuf_formats: Vec<Format>,
 }
 
 /// Run the compositor on real hardware from a TTY using DRM/KMS.
@@ -156,15 +159,42 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // We just store it as local mutable state since we own the loop.
     let mut gpu = gpu;
 
+    // Store session for VT switching
+    data.state.session = Some(Box::new(session.clone()));
+
+    // Create DMABUF global with renderer formats
+    let dmabuf_formats = gpu.dmabuf_formats.clone();
+    data.state.dmabuf_global = Some(
+        data.state
+            .dmabuf_state
+            .create_global::<Beewm>(&data.display_handle, dmabuf_formats),
+    );
+
     tracing::info!("Starting udev event loop");
 
     while data.state.running {
-        // Render
-        let border_elements = data.state.border_elements();
-
-        let result = gpu.compositor.render_frame::<_, SolidColorRenderElement>(
+        // Collect space (window + layer) elements
+        let space_elements = space_render_elements(
             &mut gpu.renderer,
-            &border_elements,
+            [&data.state.space],
+            &gpu.output,
+            1.0,
+        )
+        .unwrap_or_else(|_| Vec::new());
+
+        // Collect custom elements
+        let border_elements = data.state.border_elements();
+        let cursor_elements = data.state.cursor_elements();
+
+        // Build final element list: cursor → borders → space (front to back)
+        let mut elements: Vec<OutputRenderElement> = Vec::new();
+        elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));
+        elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
+        elements.extend(space_elements.into_iter().map(OutputRenderElement::from));
+
+        let result = gpu.compositor.render_frame::<_, OutputRenderElement>(
+            &mut gpu.renderer,
+            &elements,
             [0.1, 0.1, 0.1, 1.0],
             FrameFlags::empty(),
         );
@@ -273,6 +303,7 @@ fn init_gpu(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
+    let dmabuf_formats = renderer_formats.clone();
 
     let renderer = unsafe { GlesRenderer::new(egl_context)? };
 
@@ -351,6 +382,7 @@ fn init_gpu(
         renderer,
         compositor,
         output,
+        dmabuf_formats,
     })
 }
 

@@ -1,5 +1,6 @@
 use smithay::delegate_compositor;
 use smithay::delegate_data_device;
+use smithay::delegate_dmabuf;
 use smithay::delegate_layer_shell;
 use smithay::delegate_output;
 use smithay::delegate_primary_selection;
@@ -20,6 +21,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
@@ -36,6 +38,7 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
 use crate::state::{Beewm, ClientState};
@@ -255,3 +258,21 @@ delegate_data_device!(Beewm);
 delegate_primary_selection!(Beewm);
 delegate_seat!(Beewm);
 delegate_output!(Beewm);
+
+impl DmabufHandler for Beewm {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        _dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        // Accept all dmabufs — actual import happens at render time.
+        let _ = notifier.successful::<Beewm>();
+    }
+}
+
+delegate_dmabuf!(Beewm);

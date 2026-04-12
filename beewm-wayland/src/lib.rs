@@ -1,5 +1,6 @@
 mod handlers;
 mod input;
+mod render;
 mod state;
 pub mod udev;
 pub mod winit;

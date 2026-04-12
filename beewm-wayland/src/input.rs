@@ -3,6 +3,8 @@ use smithay::backend::input::{
     AbsolutePositionEvent, Axis, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
     PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
+use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::session::Session;
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
 use smithay::input::keyboard::xkb;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
@@ -41,6 +43,19 @@ fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEven
         time,
         |state, modifiers, keysym_handle| {
             if key_state == KeyState::Pressed {
+                // VT switching: XF86Switch_VT_1 through XF86Switch_VT_12
+                let keysym = keysym_handle.modified_sym();
+                let raw = keysym.raw();
+                if raw >= 0x1008FE01 && raw <= 0x1008FE0C {
+                    let vt = (raw - 0x1008FE01 + 1) as i32;
+                    if let Some(ref mut session) = state.session {
+                        if let Some(session) = session.downcast_mut::<LibSeatSession>() {
+                            let _ = session.change_vt(vt);
+                        }
+                    }
+                    return FilterResult::Intercept(());
+                }
+
                 if let Some(action) = match_keybind(state, modifiers, &keysym_handle) {
                     execute_action(state, action);
                     return FilterResult::Intercept(());
