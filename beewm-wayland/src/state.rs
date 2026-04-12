@@ -1,28 +1,20 @@
-use std::time::Duration;
-
 use beewm_core::config::Config;
 use beewm_core::layout::master_stack::MasterStack;
 use beewm_core::layout::Layout;
 use beewm_core::model::window::Geometry;
 use beewm_core::model::workspace::Workspace;
 
-use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::glow::GlowRenderer;
 use smithay::backend::renderer::Color32F;
-use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::{Space, Window};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::{EventLoop, Interest, PostAction};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
@@ -30,7 +22,6 @@ use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
-use smithay::wayland::socket::ListeningSocketSource;
 
 /// Wrapper passed to calloop; holds compositor state + display handle.
 pub struct CalloopData {
@@ -39,6 +30,7 @@ pub struct CalloopData {
 }
 
 /// The main compositor state.
+#[allow(dead_code)]
 pub struct Beewm {
     pub display_handle: DisplayHandle,
     pub running: bool,
@@ -57,6 +49,9 @@ pub struct Beewm {
     pub seat: Seat<Self>,
     pub cursor_status: CursorImageStatus,
 
+    // Pointer
+    pub pointer_location: Point<f64, Logical>,
+
     // Desktop management
     pub space: Space<Window>,
     pub layout: Box<dyn Layout>,
@@ -66,7 +61,7 @@ pub struct Beewm {
 }
 
 impl Beewm {
-    fn new(display: &Display<Self>, config: Config) -> Self {
+    pub fn new(display: &Display<Self>, config: Config) -> Self {
         let display_handle = display.handle();
 
         let compositor_state = CompositorState::new::<Self>(&display_handle);
@@ -104,6 +99,7 @@ impl Beewm {
             seat_state,
             seat,
             cursor_status: CursorImageStatus::default_named(),
+            pointer_location: Point::from((0.0, 0.0)),
             space: Space::default(),
             layout,
             workspaces: (0..num_ws).map(Workspace::new).collect(),
@@ -358,179 +354,5 @@ impl ClientData for ClientState {
         _client_id: smithay::reexports::wayland_server::backend::ClientId,
         _reason: smithay::reexports::wayland_server::backend::DisconnectReason,
     ) {
-    }
-}
-
-/// The public Wayland backend entry point.
-pub struct WaylandBackend;
-
-impl WaylandBackend {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self)
-    }
-
-    /// Run the compositor with the winit backend (opens a window in current session).
-    pub fn run(self, config: Config) -> Result<(), Box<dyn std::error::Error>> {
-        let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
-        let display: Display<Beewm> = Display::new()?;
-        let display_handle = display.handle();
-
-        let state = Beewm::new(&display, config);
-
-        let mut data = CalloopData {
-            state,
-            display_handle: display_handle.clone(),
-        };
-
-        // Set up the Wayland listening socket
-        let listening_socket = ListeningSocketSource::new_auto()?;
-        let socket_name = listening_socket.socket_name().to_os_string();
-        tracing::info!("Wayland socket: {:?}", socket_name);
-
-        event_loop.handle().insert_source(
-            listening_socket,
-            |client_stream, _, data| {
-                if let Err(e) = data.display_handle.insert_client(
-                    client_stream,
-                    std::sync::Arc::new(ClientState::default()),
-                ) {
-                    tracing::error!("Failed to insert client: {}", e);
-                }
-            },
-        )?;
-
-        // Insert the Display into the event loop so wayland clients are dispatched
-        event_loop.handle().insert_source(
-            Generic::new(
-                display,
-                Interest::READ,
-                smithay::reexports::calloop::Mode::Level,
-            ),
-            |_, display, data| {
-                // Safety: we don't drop the display
-                unsafe {
-                    display
-                        .get_mut()
-                        .dispatch_clients(&mut data.state)
-                        .unwrap();
-                }
-                Ok(PostAction::Continue)
-            },
-        )?;
-
-        // Initialize winit backend
-        let (mut winit_backend, winit_evt) = winit::init::<GlowRenderer>()?;
-
-        // Create the output
-        let mode = Mode {
-            size: winit_backend.window_size(),
-            refresh: 60_000,
-        };
-
-        let output = Output::new(
-            "winit".to_string(),
-            PhysicalProperties {
-                size: (0, 0).into(),
-                subpixel: Subpixel::Unknown,
-                make: "beewm".into(),
-                model: "winit".into(),
-            },
-        );
-
-        output.create_global::<Beewm>(&display_handle);
-        output.change_current_state(
-            Some(mode),
-            Some(Transform::Flipped180),
-            None,
-            Some((0, 0).into()),
-        );
-        output.set_preferred(mode);
-        data.state.space.map_output(&output, (0, 0));
-
-        let mut damage_tracker = OutputDamageTracker::from_output(&output);
-
-        // Insert winit event source
-        event_loop
-            .handle()
-            .insert_source(winit_evt, move |event, _, data| match event {
-                WinitEvent::Resized { size, .. } => {
-                    let mode = Mode {
-                        size,
-                        refresh: 60_000,
-                    };
-                    if let Some(output) = data.state.space.outputs().next().cloned() {
-                        output.change_current_state(Some(mode), None, None, None);
-                    }
-                    data.state.relayout();
-                }
-                WinitEvent::Input(event) => {
-                    crate::input::handle_input(&mut data.state, event);
-                }
-                WinitEvent::Focus(_) | WinitEvent::Redraw => {}
-                WinitEvent::CloseRequested => {
-                    data.state.running = false;
-                }
-            })?;
-
-        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-
-        tracing::info!("Starting event loop");
-
-        while data.state.running {
-            // Render
-            let output = data.state.space.outputs().next().cloned();
-            if let Some(ref output) = output {
-                let size = winit_backend.window_size();
-                let damage = smithay::utils::Rectangle::from_size(size);
-
-                let border_elements = data.state.border_elements();
-
-                if let Ok((renderer, mut framebuffer)) = winit_backend.bind() {
-                    smithay::desktop::space::render_output::<
-                        _,
-                        SolidColorRenderElement,
-                        _,
-                        _,
-                    >(
-                        output,
-                        renderer,
-                        &mut framebuffer,
-                        1.0,
-                        0,
-                        [&data.state.space],
-                        &border_elements,
-                        &mut damage_tracker,
-                        [0.1, 0.1, 0.1, 1.0],
-                    )
-                    .ok();
-                }
-                winit_backend.submit(Some(&[damage])).ok();
-
-                // Tell clients to draw their next frame
-                let elapsed = data.state.start_time.elapsed();
-                data.state.space.elements().for_each(|window| {
-                    window.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
-                        Some(output.clone())
-                    });
-                });
-
-                // Send frame to layer surfaces too
-                let layer_map = smithay::desktop::layer_map_for_output(output);
-                for layer in layer_map.layers() {
-                    layer.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
-                        Some(output.clone())
-                    });
-                }
-            }
-
-            // Dispatch event loop
-            let timeout = Duration::from_millis(16);
-            event_loop.dispatch(Some(timeout), &mut data)?;
-
-            // Process pending surface state
-            data.state.space.refresh();
-        }
-
-        Ok(())
     }
 }
