@@ -200,11 +200,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         );
 
         match result {
-            Ok(render_result) => {
-                if !render_result.is_empty {
-                    if let Err(e) = gpu.compositor.queue_frame(()) {
-                        tracing::error!("Failed to queue frame: {:?}", e);
-                    }
+            Ok(_render_result) => {
+                if let Err(e) = gpu.compositor.queue_frame(()) {
+                    tracing::error!("Failed to queue frame: {:?}", e);
                 }
             }
             Err(e) => {

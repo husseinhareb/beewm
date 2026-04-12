@@ -54,6 +54,8 @@ pub struct Beewm {
 
     // Pointer
     pub pointer_location: Point<f64, Logical>,
+    pub cursor_id: Id,
+    pub cursor_serial: u64,
 
     // Session (for VT switching in TTY mode)
     pub session: Option<Box<dyn std::any::Any>>,
@@ -109,6 +111,8 @@ impl Beewm {
             seat,
             cursor_status: CursorImageStatus::default_named(),
             pointer_location: Point::from((0.0, 0.0)),
+            cursor_id: Id::new(),
+            cursor_serial: 0,
             session: None,
             space: Space::default(),
             layout,
@@ -204,9 +208,9 @@ impl Beewm {
 
     /// Build a simple software cursor element (used by DRM backend).
     pub fn cursor_elements(&self) -> Vec<SolidColorRenderElement> {
-        let commit = smithay::backend::renderer::utils::CommitCounter::default();
+        let commit = smithay::backend::renderer::utils::CommitCounter::from(self.cursor_serial as usize);
         vec![SolidColorRenderElement::new(
-            Id::new(),
+            self.cursor_id.clone(),
             Rectangle::new(
                 (self.pointer_location.x as i32, self.pointer_location.y as i32).into(),
                 (16, 16).into(),
