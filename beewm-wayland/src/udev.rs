@@ -43,19 +43,31 @@ struct GpuData {
     >,
     output: Output,
     dmabuf_formats: Vec<Format>,
+    /// True when a vblank has fired and we may render the next frame.
+    can_render: bool,
+}
+
+/// Top-level calloop data for the DRM/udev backend —
+/// combines compositor state with GPU state so VBlank handlers can reach both.
+struct UdevData {
+    calloop: CalloopData,
+    gpu: Option<GpuData>,
 }
 
 /// Run the compositor on real hardware from a TTY using DRM/KMS.
 pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let mut event_loop: EventLoop<UdevData> = EventLoop::try_new()?;
     let display: Display<Beewm> = Display::new()?;
     let display_handle = display.handle();
 
     let state = Beewm::new(&display, config);
 
-    let mut data = CalloopData {
-        state,
-        display_handle: display_handle.clone(),
+    let mut data = UdevData {
+        calloop: CalloopData {
+            state,
+            display_handle: display_handle.clone(),
+        },
+        gpu: None,
     };
 
     // --- Session ---
@@ -75,7 +87,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     event_loop.handle().insert_source(
         listening_socket,
         |client_stream, _, data| {
-            if let Err(e) = data.display_handle.insert_client(
+            if let Err(e) = data.calloop.display_handle.insert_client(
                 client_stream,
                 std::sync::Arc::new(ClientState::default()),
             ) {
@@ -95,7 +107,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             unsafe {
                 display
                     .get_mut()
-                    .dispatch_clients(&mut data.state)
+                    .dispatch_clients(&mut data.calloop.state)
                     .unwrap();
             }
             Ok(PostAction::Continue)
@@ -113,17 +125,15 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(libinput_backend, |event, _, data| {
-            crate::input::handle_input(&mut data.state, event);
+            crate::input::handle_input(&mut data.calloop.state, event);
         })?;
 
     // --- Udev: enumerate GPUs ---
     let udev = UdevBackend::new(&session.seat())?;
-    let mut gpu_data: Option<GpuData> = None;
 
-    // Open the primary GPU from initial device list
     for (device_id, path) in udev.device_list() {
         tracing::info!("Found DRM device: {} at {}", device_id, path.display());
-        if gpu_data.is_none() {
+        if data.gpu.is_none() {
             match init_gpu(
                 &mut session,
                 &event_loop,
@@ -131,8 +141,8 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 &path,
             ) {
                 Ok(gd) => {
-                    data.state.space.map_output(&gd.output, (0, 0));
-                    gpu_data = Some(gd);
+                    data.calloop.state.space.map_output(&gd.output, (0, 0));
+                    data.gpu = Some(gd);
                 }
                 Err(e) => tracing::warn!("Failed to init GPU {}: {}", path.display(), e),
             }
@@ -154,91 +164,100 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    let gpu = gpu_data.ok_or("No usable GPU found")?;
-    // Move GPU data into a RefCell-like holder so we can use it in the loop
-    // We just store it as local mutable state since we own the loop.
-    let mut gpu = gpu;
+    if data.gpu.is_none() {
+        return Err("No usable GPU found".into());
+    }
 
     // Store session for VT switching
-    data.state.session = Some(Box::new(session.clone()));
+    data.calloop.state.session = Some(Box::new(session.clone()));
 
     // Create DMABUF global with renderer formats
-    let dmabuf_formats = gpu.dmabuf_formats.clone();
-    data.state.dmabuf_global = Some(
-        data.state
+    let dmabuf_formats = data.gpu.as_ref().unwrap().dmabuf_formats.clone();
+    data.calloop.state.dmabuf_global = Some(
+        data.calloop
+            .state
             .dmabuf_state
-            .create_global::<Beewm>(&data.display_handle, dmabuf_formats),
+            .create_global::<Beewm>(&data.calloop.display_handle, dmabuf_formats),
     );
 
     tracing::info!("Starting udev event loop");
 
-    while data.state.running {
-        // Collect space (window + layer) elements
-        let space_elements = space_render_elements(
-            &mut gpu.renderer,
-            [&data.state.space],
-            &gpu.output,
-            1.0,
-        )
-        .unwrap_or_else(|_| Vec::new());
-
-        // Collect custom elements
-        let border_elements = data.state.border_elements();
-        let cursor_elements = data.state.cursor_elements();
-
-        // Build final element list: cursor → borders → space (front to back)
-        let mut elements: Vec<OutputRenderElement> = Vec::new();
-        elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));
-        elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
-        elements.extend(space_elements.into_iter().map(OutputRenderElement::from));
-
-        let result = gpu.compositor.render_frame::<_, OutputRenderElement>(
-            &mut gpu.renderer,
-            &elements,
-            [0.1, 0.1, 0.1, 1.0],
-            FrameFlags::empty(),
-        );
-
-        match result {
-            Ok(_render_result) => {
-                if let Err(e) = gpu.compositor.queue_frame(()) {
-                    tracing::error!("Failed to queue frame: {:?}", e);
-                }
-            }
-            Err(e) => {
-                tracing::error!("Render error: {:?}", e);
-            }
+    while data.calloop.state.running {
+        // Only render when the previous frame has been presented (VBlank fired).
+        if data.gpu.as_ref().map_or(false, |g| g.can_render) {
+            render_frame(&mut data);
         }
-
-        // Tell clients to draw their next frame
-        let elapsed = data.state.start_time.elapsed();
-        let output = &gpu.output;
-        data.state.space.elements().for_each(|window| {
-            window.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
-                Some(output.clone())
-            });
-        });
-
-        let layer_map = smithay::desktop::layer_map_for_output(output);
-        for layer in layer_map.layers() {
-            layer.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
-                Some(output.clone())
-            });
-        }
-
-        // Dispatch event loop — wait for vblank or input
-        let timeout = Duration::from_millis(16);
-        event_loop.dispatch(Some(timeout), &mut data)?;
-
-        data.state.space.refresh();
+        event_loop.dispatch(Some(Duration::from_millis(20)), &mut data)?;
+        data.calloop.state.space.refresh();
     }
 
     Ok(())
 }
 
+/// Render the current state into the DRM framebuffer and queue it.
+fn render_frame(data: &mut UdevData) {
+    let gpu = match data.gpu.as_mut() {
+        Some(g) => g,
+        None => return,
+    };
+    gpu.can_render = false;
+
+    let space_elements = space_render_elements(
+        &mut gpu.renderer,
+        [&data.calloop.state.space],
+        &gpu.output,
+        1.0,
+    )
+    .unwrap_or_else(|_| Vec::new());
+
+    let border_elements = data.calloop.state.border_elements();
+    let cursor_elements = data.calloop.state.cursor_elements();
+
+    let mut elements: Vec<OutputRenderElement> = Vec::new();
+    elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));
+    elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
+    elements.extend(space_elements.into_iter().map(OutputRenderElement::from));
+
+    let gpu = data.gpu.as_mut().unwrap();
+
+    let result = gpu.compositor.render_frame::<_, OutputRenderElement>(
+        &mut gpu.renderer,
+        &elements,
+        [0.1, 0.1, 0.1, 1.0],
+        FrameFlags::empty(),
+    );
+
+    match result {
+        Ok(_) => {
+            if let Err(e) = gpu.compositor.queue_frame(()) {
+                tracing::error!("Failed to queue frame: {:?}", e);
+                gpu.can_render = true;
+            }
+        }
+        Err(e) => {
+            tracing::error!("Render error: {:?}", e);
+            gpu.can_render = true;
+        }
+    }
+
+    let elapsed = data.calloop.state.start_time.elapsed();
+    let output = data.gpu.as_ref().unwrap().output.clone();
+    data.calloop.state.space.elements().for_each(|window| {
+        window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+            Some(output.clone())
+        });
+    });
+    let layer_map = smithay::desktop::layer_map_for_output(&output);
+    for layer in layer_map.layers() {
+        layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+            Some(output.clone())
+        });
+    }
+}
+
 fn init_gpu(
     session: &mut LibSeatSession,
-    event_loop: &EventLoop<CalloopData>,
+    event_loop: &EventLoop<UdevData>,
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     path: &Path,
 ) -> Result<GpuData, Box<dyn std::error::Error>> {
@@ -364,11 +383,18 @@ fn init_gpu(
         Some(gbm_device.clone()),
     )?;
 
-    // Insert DRM event source for vblank handling
+    // VBlank: frame was presented — acknowledge it and allow the next render.
     let drm_notifier_token = event_loop.handle().insert_source(
         drm_notifier,
-        |event, _, _data| match event {
-            DrmEvent::VBlank(_crtc) => {}
+        |event, _, data: &mut UdevData| match event {
+            DrmEvent::VBlank(_crtc) => {
+                if let Some(gpu) = data.gpu.as_mut() {
+                    if let Err(e) = gpu.compositor.frame_submitted() {
+                        tracing::error!("frame_submitted error: {:?}", e);
+                    }
+                    gpu.can_render = true;
+                }
+            }
             DrmEvent::Error(e) => tracing::error!("DRM error: {:?}", e),
         },
     )?;
@@ -381,6 +407,7 @@ fn init_gpu(
         compositor,
         output,
         dmabuf_formats,
+        can_render: true, // allow first frame immediately
     })
 }
 
