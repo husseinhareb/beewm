@@ -66,7 +66,7 @@ impl Config {
             Keybind {
                 modifiers: vec!["super".into()],
                 key: "Return".into(),
-                action: Action::Spawn("foot".into()),
+                action: Action::Spawn("kitty".into()),
             },
             Keybind {
                 modifiers: vec!["super".into()],
