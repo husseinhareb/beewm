@@ -235,11 +235,17 @@ fn render_frame(data: &mut UdevData) {
         &mut gpu.renderer,
         &elements,
         [0.1, 0.1, 0.1, 1.0],
-        FrameFlags::empty(),
+        FrameFlags::DEFAULT,
     );
 
     match result {
-        Ok(_) => {
+        Ok(result) => {
+            if result.is_empty {
+                // No damage — nothing to scan out. Re-enable rendering so the
+                // loop retries, but rely on the 20ms dispatch sleep to rate-limit.
+                gpu.can_render = true;
+                return;
+            }
             if let Err(e) = gpu.compositor.queue_frame(()) {
                 tracing::error!("Failed to queue frame: {:?}", e);
                 gpu.can_render = true;
