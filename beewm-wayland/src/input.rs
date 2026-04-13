@@ -33,6 +33,8 @@ fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEven
     let keycode = event.key_code();
     let key_state = event.state();
 
+    tracing::debug!("Key event: keycode={:?} state={:?}", keycode, key_state);
+
     let keyboard = state.seat.get_keyboard().unwrap();
 
     keyboard.input::<(), _>(
@@ -43,6 +45,12 @@ fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEven
         time,
         |state, modifiers, keysym_handle| {
             if key_state == KeyState::Pressed {
+                let raw = keysym_handle.raw_syms();
+                let sym = if raw.is_empty() { keysym_handle.modified_sym() } else { raw[0] };
+                tracing::debug!(
+                    "Key pressed: sym=0x{:x} logo={} shift={} ctrl={} alt={}",
+                    sym.raw(), modifiers.logo, modifiers.shift, modifiers.ctrl, modifiers.alt
+                );
                 // VT switching: XF86Switch_VT_1 through XF86Switch_VT_12
                 let keysym = keysym_handle.modified_sym();
                 let raw = keysym.raw();
@@ -71,7 +79,15 @@ fn match_keybind(
     modifiers: &ModifiersState,
     keysym_handle: &KeysymHandle<'_>,
 ) -> Option<Action> {
-    let keysym = keysym_handle.modified_sym();
+    // Use the level-0 (unshifted) keysym so that Shift is tracked via
+    // `modifiers.shift` rather than changing the symbol.  raw_syms()
+    // calls key_get_syms_by_level(.., 0) which is shift-independent.
+    let raw = keysym_handle.raw_syms();
+    let keysym = if raw.is_empty() {
+        keysym_handle.modified_sym()
+    } else {
+        raw[0]
+    };
 
     for bind in &state.config.keybinds {
         let mut want_super = false;
@@ -97,15 +113,9 @@ fn match_keybind(
             continue;
         }
 
-        // Match by xkb keysym name
-        let bind_keysym = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_NO_FLAGS);
+        // Match name case-insensitively so "Return" and "return" both work.
+        let bind_keysym = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_CASE_INSENSITIVE);
         if bind_keysym == keysym {
-            return Some(bind.action.clone());
-        }
-
-        // Case-insensitive fallback
-        let bind_keysym_ci = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_CASE_INSENSITIVE);
-        if bind_keysym_ci == keysym {
             return Some(bind.action.clone());
         }
     }

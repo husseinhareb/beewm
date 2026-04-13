@@ -1,13 +1,27 @@
 use beewm_core::config::Config;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("beewm=info".parse()?),
-        )
-        .init();
+    // When running from a bare TTY (DRM backend) stdout/stderr aren't visible,
+    // so write logs to /tmp/beewm.log for post-hoc debugging.
+    let has_display_early = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("DISPLAY").is_some();
+
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("beewm=debug".parse()?);
+
+    if has_display_early {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    } else {
+        use std::fs::OpenOptions;
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beewm.log")?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(log_file))
+            .init();
+    }
 
     tracing::info!("Starting beewm");
 
