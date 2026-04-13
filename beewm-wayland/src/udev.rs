@@ -1,3 +1,4 @@
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
 
@@ -52,6 +53,8 @@ struct GpuData {
 struct UdevData {
     calloop: CalloopData,
     gpu: Option<GpuData>,
+    /// Owned so we can call flush_clients() anywhere in the main loop.
+    display: Display<Beewm>,
 }
 
 /// Run the compositor on real hardware from a TTY using DRM/KMS.
@@ -62,12 +65,18 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Beewm::new(&display, config);
 
+    // Clone the display fd before moving display into UdevData — used to
+    // wake calloop when clients send data.
+    let display_fd = display.as_fd().try_clone_to_owned()
+        .expect("Failed to clone wayland display fd");
+
     let mut data = UdevData {
         calloop: CalloopData {
             state,
             display_handle: display_handle.clone(),
         },
         gpu: None,
+        display,
     };
 
     // --- Session ---
@@ -107,20 +116,19 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // Insert the Display into the event loop
+    // Register the display fd so calloop wakes up when clients send data.
+    // dispatch_clients + flush_clients are called via data.display below.
     event_loop.handle().insert_source(
         Generic::new(
-            display,
+            display_fd,
             Interest::READ,
             smithay::reexports::calloop::Mode::Level,
         ),
-        |_, display, data| {
-            unsafe {
-                display
-                    .get_mut()
-                    .dispatch_clients(&mut data.calloop.state)
-                    .unwrap();
-            }
+        |_, _, data: &mut UdevData| {
+            data.display
+                .dispatch_clients(&mut data.calloop.state)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            data.display.flush_clients()?;
             Ok(PostAction::Continue)
         },
     )?;
@@ -199,6 +207,10 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             render_frame(&mut data);
         }
         event_loop.dispatch(Some(Duration::from_millis(20)), &mut data)?;
+        // Flush outgoing Wayland events (configure, enter, frame callbacks, etc.)
+        // MUST be called every loop iteration — without this, clients never
+        // receive compositor-initiated events such as xdg_toplevel.configure.
+        data.display.flush_clients().ok();
         data.calloop.state.space.refresh();
     }
 

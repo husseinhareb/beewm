@@ -73,6 +73,8 @@ impl CompositorHandler for Beewm {
             self.workspace_windows[ws_idx].push(window.clone());
             self.workspaces[ws_idx].add_window();
             self.space.map_element(window.clone(), (0, 0), false);
+            // Propagate the first commit through the window's surface tree.
+            window.on_commit();
             self.relayout();
             // Focus the new window
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
