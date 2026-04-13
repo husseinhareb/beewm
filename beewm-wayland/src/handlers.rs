@@ -39,7 +39,9 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use crate::state::{Beewm, ClientState};
 
@@ -56,7 +58,34 @@ impl CompositorHandler for Beewm {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        // Handle xdg toplevel commits
+        // Process buffer attachment for the surface tree — required for
+        // the renderer to see committed wl_buffer contents.
+        on_commit_buffer_handler::<Self>(surface);
+
+        // If this is the initial commit of a pending window, map it now.
+        if let Some(pos) = self.pending_windows.iter().position(|w| {
+            w.toplevel()
+                .map(|t| t.wl_surface() == surface)
+                .unwrap_or(false)
+        }) {
+            let window = self.pending_windows.remove(pos);
+            let ws_idx = self.active_workspace;
+            self.workspace_windows[ws_idx].push(window.clone());
+            self.workspaces[ws_idx].add_window();
+            self.space.map_element(window.clone(), (0, 0), false);
+            self.relayout();
+            // Focus the new window
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let keyboard = self.seat.get_keyboard().unwrap();
+            if let Some(toplevel) = window.toplevel() {
+                let wl_surface = toplevel.wl_surface().clone();
+                keyboard.set_focus(self, Some(wl_surface), serial);
+            }
+            self.space.raise_element(&window, true);
+            return;
+        }
+
+        // For already-mapped windows, propagate commit through the surface tree.
         if let Some(window) = self
             .space
             .elements()
@@ -99,14 +128,15 @@ impl XdgShellHandler for Beewm {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Send initial configure: tell client it is activated so it renders.
+        // We do NOT include a size here — the client picks its own initial size.
+        // After the initial commit, we map and relayout to apply tiling.
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Activated);
+        });
+        surface.send_configure();
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window.clone(), (0, 0), true);
-
-        let ws_idx = self.active_workspace;
-        self.workspace_windows[ws_idx].push(window);
-        self.workspaces[ws_idx].add_window();
-
-        self.relayout();
+        self.pending_windows.push(window);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {

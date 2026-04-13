@@ -66,6 +66,8 @@ pub struct Beewm {
     pub workspaces: Vec<Workspace>,
     pub workspace_windows: Vec<Vec<Window>>,
     pub active_workspace: usize,
+    /// Windows that have been created but not yet committed their first buffer.
+    pub pending_windows: Vec<Window>,
 }
 
 impl Beewm {
@@ -119,6 +121,7 @@ impl Beewm {
             workspaces: (0..num_ws).map(Workspace::new).collect(),
             workspace_windows: (0..num_ws).map(|_| Vec::new()).collect(),
             active_workspace: 0,
+            pending_windows: Vec::new(),
         }
     }
 
