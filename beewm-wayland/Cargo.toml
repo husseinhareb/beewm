@@ -17,3 +17,4 @@ smithay = { version = "0.7", default-features = false, features = [
     "renderer_glow",
 ] }
 tracing = "0.1"
+libc = "0.2"

@@ -117,11 +117,28 @@ fn execute_action(state: &mut Beewm, action: Action) {
     match action {
         Action::Spawn(cmd) => {
             tracing::info!("Spawning: {}", cmd);
-            if let Err(e) = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .spawn()
-            {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&cmd);
+
+            // Ensure critical env vars are forwarded to the child.
+            // When running from a bare TTY these may be missing.
+            if let Ok(val) = std::env::var("WAYLAND_DISPLAY") {
+                command.env("WAYLAND_DISPLAY", val);
+            }
+            if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
+                command.env("XDG_RUNTIME_DIR", val);
+            }
+            if let Ok(val) = std::env::var("HOME") {
+                command.env("HOME", val);
+            }
+
+            // Detach from compositor's stdio so the child doesn't block
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+
+            if let Err(e) = command.spawn() {
                 tracing::error!("Failed to spawn '{}': {}", cmd, e);
             }
         }

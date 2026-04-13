@@ -84,6 +84,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Wayland socket: {:?}", socket_name);
     std::env::set_var("WAYLAND_DISPLAY", &socket_name);
 
+    // Ensure XDG_RUNTIME_DIR is set — required by Wayland clients like kitty.
+    // seatd/logind normally sets this; provide a fallback for bare TTY sessions.
+    if std::env::var("XDG_RUNTIME_DIR").is_err() {
+        let uid = unsafe { libc::getuid() };
+        let path = format!("/run/user/{}", uid);
+        if std::path::Path::new(&path).exists() {
+            std::env::set_var("XDG_RUNTIME_DIR", &path);
+            tracing::info!("Set XDG_RUNTIME_DIR to {}", path);
+        }
+    }
+
     event_loop.handle().insert_source(
         listening_socket,
         |client_stream, _, data| {

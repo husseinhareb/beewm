@@ -118,6 +118,7 @@ name = "beewm-wayland"
 version = "0.1.0"
 dependencies = [
  "beewm-core",
+ "libc",
  "smithay",
  "tracing",
 ]
