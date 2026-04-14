@@ -1,12 +1,12 @@
 use beewm_core::config::Action;
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, Event, InputBackend, InputEvent, KeyState,
+    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
+use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
-use smithay::input::keyboard::xkb;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
@@ -33,8 +33,6 @@ fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEven
     let keycode = event.key_code();
     let key_state = event.state();
 
-    tracing::debug!("Key event: keycode={:?} state={:?}", keycode, key_state);
-
     let keyboard = state.seat.get_keyboard().unwrap();
 
     keyboard.input::<(), _>(
@@ -45,16 +43,10 @@ fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEven
         time,
         |state, modifiers, keysym_handle| {
             if key_state == KeyState::Pressed {
-                let raw = keysym_handle.raw_syms();
-                let sym = if raw.is_empty() { keysym_handle.modified_sym() } else { raw[0] };
-                tracing::debug!(
-                    "Key pressed: sym=0x{:x} logo={} shift={} ctrl={} alt={}",
-                    sym.raw(), modifiers.logo, modifiers.shift, modifiers.ctrl, modifiers.alt
-                );
                 // VT switching: XF86Switch_VT_1 through XF86Switch_VT_12
                 let keysym = keysym_handle.modified_sym();
                 let raw = keysym.raw();
-                if raw >= 0x1008FE01 && raw <= 0x1008FE0C {
+                if (0x1008FE01..=0x1008FE0C).contains(&raw) {
                     let vt = (raw - 0x1008FE01 + 1) as i32;
                     if let Some(ref mut session) = state.session {
                         if let Some(session) = session.downcast_mut::<LibSeatSession>() {
@@ -79,9 +71,6 @@ fn match_keybind(
     modifiers: &ModifiersState,
     keysym_handle: &KeysymHandle<'_>,
 ) -> Option<Action> {
-    // Use the level-0 (unshifted) keysym so that Shift is tracked via
-    // `modifiers.shift` rather than changing the symbol.  raw_syms()
-    // calls key_get_syms_by_level(.., 0) which is shift-independent.
     let raw = keysym_handle.raw_syms();
     let keysym = if raw.is_empty() {
         keysym_handle.modified_sym()
@@ -89,33 +78,13 @@ fn match_keybind(
         raw[0]
     };
 
-    for bind in &state.config.keybinds {
-        let mut want_super = false;
-        let mut want_shift = false;
-        let mut want_ctrl = false;
-        let mut want_alt = false;
-
-        for m in &bind.modifiers {
-            match m.to_lowercase().as_str() {
-                "super" | "mod4" | "logo" => want_super = true,
-                "shift" => want_shift = true,
-                "ctrl" | "control" => want_ctrl = true,
-                "alt" | "mod1" => want_alt = true,
-                _ => {}
-            }
-        }
-
-        if modifiers.logo != want_super
-            || modifiers.shift != want_shift
-            || modifiers.ctrl != want_ctrl
-            || modifiers.alt != want_alt
+    for bind in &state.resolved_keybinds {
+        if modifiers.logo == bind.logo
+            && modifiers.shift == bind.shift
+            && modifiers.ctrl == bind.ctrl
+            && modifiers.alt == bind.alt
+            && bind.keysym == keysym
         {
-            continue;
-        }
-
-        // Match name case-insensitively so "Return" and "return" both work.
-        let bind_keysym = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_CASE_INSENSITIVE);
-        if bind_keysym == keysym {
             return Some(bind.action.clone());
         }
     }
@@ -140,6 +109,11 @@ fn execute_action(state: &mut Beewm, action: Action) {
             }
             if let Ok(val) = std::env::var("HOME") {
                 command.env("HOME", val);
+            }
+            // Forward DISPLAY so X11 apps can connect to XWayland when available
+            // (e.g. when running nested inside another compositor).
+            if let Ok(val) = std::env::var("DISPLAY") {
+                command.env("DISPLAY", val);
             }
 
             // Detach from compositor's stdio so the child doesn't block
@@ -183,9 +157,7 @@ fn execute_action(state: &mut Beewm, action: Action) {
 }
 
 fn focused_window(state: &Beewm) -> Option<&smithay::desktop::Window> {
-    let ws = &state.workspaces[state.active_workspace];
-    let idx = ws.focused_idx?;
-    state.workspace_windows[state.active_workspace].get(idx)
+    state.active_workspace_focused_window()
 }
 
 fn focus_current_window(state: &mut Beewm) {
@@ -207,6 +179,19 @@ fn focus_current_window(state: &mut Beewm) {
         keyboard.set_focus(state, Some(surface), serial);
     }
     state.space.raise_element(&window, true);
+    state.needs_render = true;
+}
+
+fn surface_under(
+    state: &Beewm,
+    pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+    state.space.element_under(pos).and_then(|(window, loc)| {
+        let local = pos - loc.to_f64();
+        window
+            .surface_under(local, WindowSurfaceType::ALL)
+            .map(|(surface, surface_loc)| (surface, loc.to_f64() + surface_loc.to_f64()))
+    })
 }
 
 fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMotionEvent) {
@@ -224,17 +209,12 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     new_pos.y = new_pos.y.clamp(0.0, output_geo.size.h as f64 - 1.0);
     state.pointer_location = new_pos;
     state.cursor_serial = state.cursor_serial.wrapping_add(1);
+    state.needs_render = true;
 
     let serial = SERIAL_COUNTER.next_serial();
     let pointer = state.seat.get_pointer().unwrap();
 
-    let under: Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> = state
-        .space
-        .element_under(new_pos)
-        .and_then(|(window, loc)| {
-            let surface = window.toplevel()?.wl_surface().clone();
-            Some((surface, loc.to_f64()))
-        });
+    let under = surface_under(state, new_pos);
 
     pointer.motion(
         state,
@@ -257,11 +237,18 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
         },
     );
 
-    // Focus follows mouse
+    // Focus follows mouse — only change focus when the surface changes
     if state.config.focus_follows_mouse {
         if let Some((surface, _)) = under {
             let keyboard = state.seat.get_keyboard().unwrap();
-            keyboard.set_focus(state, Some(surface), serial);
+            let already_focused = keyboard
+                .current_focus()
+                .as_ref()
+                .map(|f| *f == surface)
+                .unwrap_or(false);
+            if !already_focused {
+                keyboard.set_focus(state, Some(surface), serial);
+            }
         }
     }
 }
@@ -280,17 +267,12 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
 
     state.pointer_location = pos;
     state.cursor_serial = state.cursor_serial.wrapping_add(1);
+    state.needs_render = true;
 
     let serial = SERIAL_COUNTER.next_serial();
     let pointer = state.seat.get_pointer().unwrap();
 
-    let under: Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> = state
-        .space
-        .element_under(pos)
-        .and_then(|(window, loc)| {
-            let surface = window.toplevel()?.wl_surface().clone();
-            Some((surface, loc.to_f64()))
-        });
+    let under = surface_under(state, pos);
 
     pointer.motion(
         state,
@@ -302,11 +284,18 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
         },
     );
 
-    // Focus follows mouse
+    // Focus follows mouse — only change focus when the surface changes
     if state.config.focus_follows_mouse {
         if let Some((surface, _)) = under {
             let keyboard = state.seat.get_keyboard().unwrap();
-            keyboard.set_focus(state, Some(surface), serial);
+            let already_focused = keyboard
+                .current_focus()
+                .as_ref()
+                .map(|f| *f == surface)
+                .unwrap_or(false);
+            if !already_focused {
+                keyboard.set_focus(state, Some(surface), serial);
+            }
         }
     }
 }

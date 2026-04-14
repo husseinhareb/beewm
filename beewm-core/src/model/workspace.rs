@@ -1,20 +1,13 @@
 /// An i3-style numbered workspace tracking window indices.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Workspace {
-    pub id: usize,
-    pub name: String,
     pub window_count: usize,
     pub focused_idx: Option<usize>,
 }
 
 impl Workspace {
-    pub fn new(id: usize) -> Self {
-        Self {
-            id,
-            name: format!("{}", id + 1),
-            window_count: 0,
-            focused_idx: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn add_window(&mut self) {

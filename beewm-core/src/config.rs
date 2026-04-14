@@ -22,14 +22,6 @@ pub enum Action {
     Quit,
 }
 
-/// A keybinding with resolved numeric keycode and modifier mask.
-#[derive(Debug, Clone)]
-pub struct ResolvedKeybind {
-    pub modifiers: u32,
-    pub keycode: u32,
-    pub action: Action,
-}
-
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -40,6 +32,8 @@ pub struct Config {
     pub gap: u32,
     pub num_workspaces: usize,
     pub focus_follows_mouse: bool,
+    pub tap_to_click: bool,
+    pub natural_scroll: bool,
     pub master_ratio: f64,
     #[serde(default)]
     pub keybinds: Vec<Keybind>,
@@ -54,6 +48,8 @@ impl Default for Config {
             gap: 4,
             num_workspaces: 9,
             focus_follows_mouse: true,
+            tap_to_click: true,
+            natural_scroll: true,
             master_ratio: 0.55,
             keybinds: Self::default_keybinds(),
         }
@@ -119,14 +115,15 @@ impl Config {
     /// falling back to defaults if the file doesn't exist.
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = Self::config_path();
-        if path.exists() {
+        let config = if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
-            let config: Config = toml::from_str(&contents)?;
-            Ok(config)
+            toml::from_str(&contents)?
         } else {
             tracing::info!("No config file found at {}, using defaults", path.display());
-            Ok(Config::default())
-        }
+            Config::default()
+        };
+
+        Ok(config.validate()?)
     }
 
     fn config_path() -> PathBuf {
@@ -134,6 +131,24 @@ impl Config {
         path.push("beewm");
         path.push("config.toml");
         path
+    }
+
+    fn validate(self) -> Result<Self, std::io::Error> {
+        if self.num_workspaces == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "config num_workspaces must be at least 1",
+            ));
+        }
+
+        if !self.master_ratio.is_finite() || !(0.0..=1.0).contains(&self.master_ratio) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "config master_ratio must be a finite value between 0.0 and 1.0",
+            ));
+        }
+
+        Ok(self)
     }
 }
 
@@ -145,4 +160,33 @@ fn dirs_or_default() -> PathBuf {
             home.push(".config");
             home
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn rejects_zero_workspaces() {
+        let err = Config {
+            num_workspaces: 0,
+            ..Config::default()
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_invalid_master_ratio() {
+        let err = Config {
+            master_ratio: 2.0,
+            ..Config::default()
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

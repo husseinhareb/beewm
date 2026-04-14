@@ -11,13 +11,13 @@ type SpaceElem = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<G
 /// Combined render element for the DRM compositor.
 /// Wraps space elements (windows, layer surfaces) and custom elements (borders, cursor).
 pub enum OutputRenderElement {
-    Space(SpaceElem),
+    Space(Box<SpaceElem>),
     Border(SolidColorRenderElement),
 }
 
 impl From<SpaceElem> for OutputRenderElement {
     fn from(e: SpaceElem) -> Self {
-        Self::Space(e)
+        Self::Space(Box::new(e))
     }
 }
 
@@ -113,14 +113,16 @@ impl RenderElement<GlesRenderer> for OutputRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
         match self {
-            Self::Space(e) => RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions),
+            Self::Space(e) => {
+                RenderElement::<GlesRenderer>::draw(e.as_ref(), frame, src, dst, damage, opaque_regions)
+            }
             Self::Border(e) => RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions),
         }
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         match self {
-            Self::Space(e) => e.underlying_storage(renderer),
+            Self::Space(e) => e.as_ref().underlying_storage(renderer),
             Self::Border(e) => e.underlying_storage(renderer),
         }
     }

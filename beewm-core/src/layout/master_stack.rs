@@ -25,7 +25,12 @@ impl Layout for MasterStack {
             return vec![*screen];
         }
 
-        let master_width = (screen.width as f64 * self.master_ratio) as u32;
+        let master_ratio = if self.master_ratio.is_finite() {
+            self.master_ratio.clamp(0.0, 1.0)
+        } else {
+            Self::default().master_ratio
+        };
+        let master_width = (screen.width as f64 * master_ratio) as u32;
         let stack_width = screen.width - master_width;
         let stack_count = window_count - 1;
         let stack_height = screen.height / stack_count as u32;
@@ -58,10 +63,6 @@ impl Layout for MasterStack {
         }
 
         geometries
-    }
-
-    fn name(&self) -> &str {
-        "master-stack"
     }
 }
 
@@ -111,5 +112,14 @@ mod tests {
         assert_eq!(result[1].height, 540);
         assert_eq!(result[2].height, 540);
         assert_eq!(result[2].y, 540);
+    }
+
+    #[test]
+    fn invalid_ratio_is_clamped() {
+        let layout = MasterStack { master_ratio: 2.0 };
+        let screen = Geometry::new(0, 0, 1920, 1080);
+        let result = layout.apply(&screen, 2);
+        assert_eq!(result[0].width, 1920);
+        assert_eq!(result[1].width, 0);
     }
 }

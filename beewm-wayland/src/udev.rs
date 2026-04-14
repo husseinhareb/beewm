@@ -13,6 +13,7 @@ use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::session::Event as SessionEvent;
 use smithay::backend::session::Session;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::desktop::space::space_render_elements;
@@ -21,6 +22,8 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
 use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
 use smithay::reexports::input::Libinput;
+use smithay::backend::input::InputEvent;
+use smithay::reexports::input::ScrollMethod;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
@@ -30,11 +33,10 @@ use crate::render::OutputRenderElement;
 use crate::state::{Beewm, CalloopData, ClientState};
 
 /// Per-GPU state for the DRM backend.
-#[allow(dead_code)]
 struct GpuData {
-    drm_device: DrmDevice,
-    drm_notifier_token: RegistrationToken,
-    gbm_device: GbmDevice<DrmDeviceFd>,
+    _drm_device: DrmDevice,
+    _drm_notifier_token: RegistrationToken,
+    _gbm_device: GbmDevice<DrmDeviceFd>,
     renderer: GlesRenderer,
     compositor: DrmCompositor<
         GbmAllocator<DrmDeviceFd>,
@@ -85,13 +87,46 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop
         .handle()
-        .insert_source(notifier, |_, _, _| {})?;
+        .insert_source(notifier, |event, _, data| match event {
+            SessionEvent::PauseSession => {
+                tracing::info!("Session paused");
+                if let Some(gpu) = data.gpu.as_mut() {
+                    gpu._drm_device.pause();
+                    gpu.can_render = false;
+                }
+                data.calloop.state.needs_render = false;
+            }
+            SessionEvent::ActivateSession => {
+                tracing::info!("Session activated");
+                if let Some(gpu) = data.gpu.as_mut() {
+                    if let Err(err) = gpu._drm_device.activate(true) {
+                        tracing::error!("Failed to reactivate DRM device: {}", err);
+                        gpu.can_render = false;
+                        return;
+                    }
+                    if let Err(err) = gpu.compositor.reset_state() {
+                        tracing::error!("Failed to reset compositor state after reactivation: {}", err);
+                    }
+                    gpu.can_render = true;
+                }
+                data.calloop.state.needs_render = true;
+            }
+        })?;
 
     // --- Wayland socket ---
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_os_string();
     tracing::info!("Wayland socket: {:?}", socket_name);
     std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+
+    // Declare this as a Wayland session — GTK, Qt, and Electron all check
+    // XDG_SESSION_TYPE and auto-select their Wayland backends from it.
+    // Do NOT set GDK_BACKEND or QT_QPA_PLATFORM directly: those override
+    // auto-detection and crash apps when optional protocols are missing.
+    std::env::set_var("XDG_SESSION_TYPE", "wayland");
+    // Electron/Chromium (VS Code, etc.).
+    std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "auto");
+    std::env::set_var("NIXOS_OZONE_WL", "1");
 
     // Ensure XDG_RUNTIME_DIR is set — required by Wayland clients like kitty.
     // seatd/logind normally sets this; provide a fallback for bare TTY sessions.
@@ -127,7 +162,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         |_, _, data: &mut UdevData| {
             data.display
                 .dispatch_clients(&mut data.calloop.state)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             data.display.flush_clients()?;
             Ok(PostAction::Continue)
         },
@@ -144,11 +179,51 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(libinput_backend, |event, _, data| {
+            // Tap-to-click is a libinput-specific feature; configure it as
+            // devices appear (e.g. touchpad at startup or on hotplug).
+            if let InputEvent::DeviceAdded { mut device } = event {
+                let is_touchpad = device.config_tap_finger_count() > 0;
+                if is_touchpad {
+                    // Tap-to-click
+                    let tap = data.calloop.state.config.tap_to_click;
+                    let r = device.config_tap_set_enabled(tap);
+                    tracing::info!(
+                        "libinput: tap-to-click {} on '{}' ({:?})",
+                        if tap { "enabled" } else { "disabled" },
+                        device.name(),
+                        r,
+                    );
+
+                    // Two-finger scroll — enable it when the device supports it
+                    let supported = device.config_scroll_methods();
+                    if supported.contains(&ScrollMethod::TwoFinger) {
+                        let r = device.config_scroll_set_method(ScrollMethod::TwoFinger);
+                        tracing::info!(
+                            "libinput: two-finger scroll enabled on '{}' ({:?})",
+                            device.name(),
+                            r,
+                        );
+                    }
+
+                    // Natural (reversed) scroll direction
+                    if device.config_scroll_has_natural_scroll() {
+                        let natural = data.calloop.state.config.natural_scroll;
+                        let r = device.config_scroll_set_natural_scroll_enabled(natural);
+                        tracing::info!(
+                            "libinput: natural scroll {} on '{}' ({:?})",
+                            if natural { "enabled" } else { "disabled" },
+                            device.name(),
+                            r,
+                        );
+                    }
+                }
+                return;
+            }
             crate::input::handle_input(&mut data.calloop.state, event);
         })?;
 
     // --- Udev: enumerate GPUs ---
-    let udev = UdevBackend::new(&session.seat())?;
+    let udev = UdevBackend::new(session.seat())?;
 
     for (device_id, path) in udev.device_list() {
         tracing::info!("Found DRM device: {} at {}", device_id, path.display());
@@ -157,7 +232,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 &mut session,
                 &event_loop,
                 &display_handle,
-                &path,
+                path,
             ) {
                 Ok(gd) => {
                     data.calloop.state.space.map_output(&gd.output, (0, 0));
@@ -192,7 +267,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create DMABUF global with renderer formats
     let dmabuf_formats = data.gpu.as_ref().unwrap().dmabuf_formats.clone();
-    data.calloop.state.dmabuf_global = Some(
+    data.calloop.state._dmabuf_global = Some(
         data.calloop
             .state
             .dmabuf_state
@@ -202,15 +277,18 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting udev event loop");
 
     while data.calloop.state.running {
-        // Only render when the previous frame has been presented (VBlank fired).
-        if data.gpu.as_ref().map_or(false, |g| g.can_render) {
+        // Only render when the previous frame has been presented (VBlank fired)
+        // AND something visual has actually changed.
+        if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.calloop.state.needs_render {
             render_frame(&mut data);
         }
         event_loop.dispatch(Some(Duration::from_millis(20)), &mut data)?;
         // Flush outgoing Wayland events (configure, enter, frame callbacks, etc.)
         // MUST be called every loop iteration — without this, clients never
         // receive compositor-initiated events such as xdg_toplevel.configure.
-        data.display.flush_clients().ok();
+        if let Err(err) = data.display.flush_clients() {
+            tracing::warn!("Failed to flush Wayland clients: {}", err);
+        }
         data.calloop.state.space.refresh();
     }
 
@@ -225,13 +303,18 @@ fn render_frame(data: &mut UdevData) {
     };
     gpu.can_render = false;
 
-    let space_elements = space_render_elements(
+    let space_elements = match space_render_elements(
         &mut gpu.renderer,
         [&data.calloop.state.space],
         &gpu.output,
         1.0,
-    )
-    .unwrap_or_else(|_| Vec::new());
+    ) {
+        Ok(elems) => elems,
+        Err(e) => {
+            tracing::error!("space_render_elements failed: {:?}", e);
+            Vec::new()
+        }
+    };
 
     let border_elements = data.calloop.state.border_elements();
     let cursor_elements = data.calloop.state.cursor_elements();
@@ -253,12 +336,12 @@ fn render_frame(data: &mut UdevData) {
     match result {
         Ok(result) => {
             if result.is_empty {
-                // No damage — nothing to scan out. Re-enable rendering so the
-                // loop retries, but rely on the 20ms dispatch sleep to rate-limit.
+                // No damage — nothing to scan out.  Clear the render request
+                // so we don't spin; the next surface commit / relayout will
+                // set `needs_render = true` again.
+                data.calloop.state.needs_render = false;
                 gpu.can_render = true;
-                return;
-            }
-            if let Err(e) = gpu.compositor.queue_frame(()) {
+            } else if let Err(e) = gpu.compositor.queue_frame(()) {
                 tracing::error!("Failed to queue frame: {:?}", e);
                 gpu.can_render = true;
             }
@@ -269,6 +352,8 @@ fn render_frame(data: &mut UdevData) {
         }
     }
 
+    // Always send frame callbacks so clients can submit their next buffer,
+    // even when the compositor had no damage or hit a render error.
     let elapsed = data.calloop.state.start_time.elapsed();
     let output = data.gpu.as_ref().unwrap().output.clone();
     data.calloop.state.space.elements().for_each(|window| {
@@ -429,9 +514,9 @@ fn init_gpu(
     )?;
 
     Ok(GpuData {
-        drm_device,
-        drm_notifier_token,
-        gbm_device,
+        _drm_device: drm_device,
+        _drm_notifier_token: drm_notifier_token,
+        _gbm_device: gbm_device,
         renderer,
         compositor,
         output,

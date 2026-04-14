@@ -6,12 +6,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let has_display_early = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var_os("DISPLAY").is_some();
 
-    let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("beewm=debug".parse()?);
-
     if has_display_early {
+        // Interactive session: honour RUST_LOG, default to debug for beewm crates.
+        let filter = tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("beewm=debug".parse()?);
         tracing_subscriber::fmt().with_env_filter(filter).init();
     } else {
+        // DRM/TTY session: write to /tmp/beewm.log with a hardcoded conservative
+        // filter so the file never bloats from smithay internals or RUST_LOG.
+        let filter = tracing_subscriber::EnvFilter::new("warn,beewm=debug");
         use std::fs::OpenOptions;
         let log_file = OpenOptions::new()
             .create(true)

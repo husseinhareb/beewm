@@ -1,4 +1,6 @@
-use beewm_core::config::Config;
+use std::collections::HashMap;
+
+use beewm_core::config::{Config, Keybind};
 use beewm_core::layout::master_stack::MasterStack;
 use beewm_core::layout::Layout;
 use beewm_core::model::window::Geometry;
@@ -9,20 +11,25 @@ use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::{Space, Window};
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::keyboard::xkb;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point, Rectangle, Size};
-use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER};
+use smithay::wayland::compositor::{get_parent, CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::viewporter::ViewporterState;
 
 /// Wrapper passed to calloop; holds compositor state + display handle.
 pub struct CalloopData {
@@ -30,10 +37,20 @@ pub struct CalloopData {
     pub display_handle: DisplayHandle,
 }
 
+/// A keybinding pre-resolved at startup so the hot-path avoids string
+/// allocations and repeated `xkb::keysym_from_name` lookups.
+#[derive(Debug, Clone)]
+pub struct ResolvedKeybind {
+    pub logo: bool,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub keysym: xkb::Keysym,
+    pub action: beewm_core::config::Action,
+}
+
 /// The main compositor state.
-#[allow(dead_code)]
 pub struct Beewm {
-    pub display_handle: DisplayHandle,
     pub running: bool,
     pub config: Config,
     pub start_time: std::time::Instant,
@@ -41,16 +58,19 @@ pub struct Beewm {
     // Smithay protocol state
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
-    pub xdg_decoration_state: XdgDecorationState,
+    pub _xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
+    pub _output_manager_state: OutputManagerState,
+    pub _viewporter_state: ViewporterState,
+    pub _fractional_scale_manager_state: FractionalScaleManagerState,
+    pub _single_pixel_buffer_state: SinglePixelBufferState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub dmabuf_state: DmabufState,
-    pub dmabuf_global: Option<DmabufGlobal>,
+    pub _dmabuf_global: Option<DmabufGlobal>,
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
-    pub cursor_status: CursorImageStatus,
 
     // Pointer
     pub pointer_location: Point<f64, Logical>,
@@ -68,6 +88,20 @@ pub struct Beewm {
     pub active_workspace: usize,
     /// Windows that have been created but not yet committed their first buffer.
     pub pending_windows: Vec<Window>,
+    /// Root wl_surface -> mapped window lookup for commit-time surface routing.
+    pub window_lookup: HashMap<WlSurface, Window>,
+    /// Pre-allocated stable IDs for border elements (4 per window slot).
+    /// Reused across frames so the DRM damage tracker sees unchanged geometry.
+    pub border_ids: Vec<Id>,
+    /// Global commit version for border elements; bumped whenever focus visuals change.
+    pub border_commit_serial: u64,
+    /// Set when visual state changed and a new frame should be rendered.
+    pub needs_render: bool,
+    /// Pre-resolved keybindings (no per-keypress string allocs).
+    pub resolved_keybinds: Vec<ResolvedKeybind>,
+    /// Cached border colours derived from config (avoid per-frame conversion).
+    pub border_color_focused: Color32F,
+    pub border_color_unfocused: Color32F,
 }
 
 impl Beewm {
@@ -79,6 +113,10 @@ impl Beewm {
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
+        let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&display_handle);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
         let dmabuf_state = DmabufState::new();
@@ -94,39 +132,112 @@ impl Beewm {
         let layout = Box::new(MasterStack {
             master_ratio: config.master_ratio,
         });
+        let resolved_keybinds = resolve_keybinds(&config.keybinds);
+        let border_color_focused = hex_to_color32f(config.border_color_focused);
+        let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
 
         Self {
-            display_handle,
             running: true,
             config,
             start_time: std::time::Instant::now(),
             compositor_state,
             xdg_shell_state,
-            xdg_decoration_state,
+            _xdg_decoration_state: xdg_decoration_state,
             layer_shell_state,
             shm_state,
+            _output_manager_state: output_manager_state,
+            _viewporter_state: viewporter_state,
+            _fractional_scale_manager_state: fractional_scale_manager_state,
+            _single_pixel_buffer_state: single_pixel_buffer_state,
             data_device_state,
             primary_selection_state,
             dmabuf_state,
-            dmabuf_global: None,
+            _dmabuf_global: None,
             seat_state,
             seat,
-            cursor_status: CursorImageStatus::default_named(),
             pointer_location: Point::from((0.0, 0.0)),
             cursor_id: Id::new(),
             cursor_serial: 0,
             session: None,
             space: Space::default(),
             layout,
-            workspaces: (0..num_ws).map(Workspace::new).collect(),
+            workspaces: (0..num_ws).map(|_| Workspace::new()).collect(),
             workspace_windows: (0..num_ws).map(|_| Vec::new()).collect(),
             active_workspace: 0,
             pending_windows: Vec::new(),
+            window_lookup: HashMap::new(),
+            border_ids: Vec::new(),
+            border_commit_serial: 0,
+            needs_render: true,
+            resolved_keybinds,
+            border_color_focused,
+            border_color_unfocused,
+        }
+    }
+
+    pub fn window_index_for_surface(&self, workspace_idx: usize, surface: &WlSurface) -> Option<usize> {
+        let surface_root = root_surface(surface);
+        self.workspace_windows[workspace_idx]
+            .iter()
+            .position(|window| {
+                window
+                    .wl_surface()
+                    .as_ref()
+                    .map(|window_surface| **window_surface == surface_root)
+                    .unwrap_or(false)
+            })
+    }
+
+    pub fn mapped_window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.window_lookup.get(&root_surface(surface)).cloned()
+    }
+
+    pub fn track_window(&mut self, window: &Window) {
+        if let Some(surface) = window.wl_surface().as_ref() {
+            self.window_lookup.insert((**surface).clone(), window.clone());
+        }
+    }
+
+    pub fn untrack_window_for_surface(&mut self, surface: &WlSurface) -> Option<Window> {
+        self.window_lookup.remove(&root_surface(surface))
+    }
+
+    pub fn active_workspace_focused_index(&self) -> Option<usize> {
+        match self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+            Some(surface) => self.window_index_for_surface(self.active_workspace, &surface),
+            None => self.workspaces[self.active_workspace].focused_idx,
+        }
+    }
+
+    pub fn active_workspace_focused_window(&self) -> Option<&Window> {
+        let idx = self.active_workspace_focused_index()?;
+        self.workspace_windows[self.active_workspace].get(idx)
+    }
+
+    pub fn note_keyboard_focus_change(&mut self, focused: Option<&WlSurface>) {
+        if let Some(surface) = focused {
+            if let Some(idx) = self.window_index_for_surface(self.active_workspace, surface) {
+                self.workspaces[self.active_workspace].focused_idx = Some(idx);
+            }
+        }
+
+        self.border_commit_serial = self.border_commit_serial.wrapping_add(1);
+        self.needs_render = true;
+    }
+
+    pub fn set_keyboard_focus(&mut self, focused: Option<WlSurface>) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.seat.get_keyboard().unwrap();
+        keyboard.set_focus(self, focused.clone(), serial);
+
+        // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.
+        if focused.is_none() {
+            self.note_keyboard_focus_change(None);
         }
     }
 
     /// Build border render elements for all visible windows.
-    pub fn border_elements(&self) -> Vec<SolidColorRenderElement> {
+    pub fn border_elements(&mut self) -> Vec<SolidColorRenderElement> {
         let bw = self.config.border_width as i32;
         if bw == 0 {
             return Vec::new();
@@ -137,12 +248,19 @@ impl Beewm {
             .get_keyboard()
             .and_then(|kb| kb.current_focus());
 
-        let focused_color = hex_to_color32f(self.config.border_color_focused);
-        let unfocused_color = hex_to_color32f(self.config.border_color_unfocused);
+        let focused_color = self.border_color_focused;
+        let unfocused_color = self.border_color_unfocused;
 
         let mut elements = Vec::new();
+        let window_count = self.space.elements().count();
 
-        for window in self.space.elements() {
+        // Ensure we have enough pre-allocated IDs (4 per window: top, bottom, left, right).
+        let needed = window_count * 4;
+        while self.border_ids.len() < needed {
+            self.border_ids.push(Id::new());
+        }
+
+        for (win_idx, window) in self.space.elements().enumerate() {
             let geo = match self.space.element_geometry(window) {
                 Some(g) => g,
                 None => continue,
@@ -170,11 +288,20 @@ impl Beewm {
             let w = geo.size.w + bw * 2;
             let h = geo.size.h + bw * 2;
 
-            let commit = smithay::backend::renderer::utils::CommitCounter::default();
+            let commit =
+                smithay::backend::renderer::utils::CommitCounter::from(self.border_commit_serial as usize);
+
+            // Use stable pre-allocated IDs so the DRM compositor's damage
+            // tracker can recognise unchanged elements across frames.
+            let base = win_idx * 4;
+            let border_top_id = self.border_ids[base].clone();
+            let border_bottom_id = self.border_ids[base + 1].clone();
+            let border_left_id = self.border_ids[base + 2].clone();
+            let border_right_id = self.border_ids[base + 3].clone();
 
             // Top border
             elements.push(SolidColorRenderElement::new(
-                Id::new(),
+                border_top_id,
                 Rectangle::new((x, y).into(), (w, bw).into()),
                 commit,
                 color,
@@ -182,7 +309,7 @@ impl Beewm {
             ));
             // Bottom border
             elements.push(SolidColorRenderElement::new(
-                Id::new(),
+                border_bottom_id,
                 Rectangle::new((x, y + h - bw).into(), (w, bw).into()),
                 commit,
                 color,
@@ -190,7 +317,7 @@ impl Beewm {
             ));
             // Left border
             elements.push(SolidColorRenderElement::new(
-                Id::new(),
+                border_left_id,
                 Rectangle::new((x, y + bw).into(), (bw, h - bw * 2).into()),
                 commit,
                 color,
@@ -198,7 +325,7 @@ impl Beewm {
             ));
             // Right border
             elements.push(SolidColorRenderElement::new(
-                Id::new(),
+                border_right_id,
                 Rectangle::new((x + w - bw, y + bw).into(), (bw, h - bw * 2).into()),
                 commit,
                 color,
@@ -263,8 +390,13 @@ impl Beewm {
                 });
                 toplevel.send_pending_configure();
             }
-            self.space.map_element(window.clone(), (x, y), false);
+
+            let location = Point::from((x, y));
+            if self.space.element_location(window) != Some(location) {
+                self.space.map_element(window.clone(), location, false);
+            }
         }
+        self.needs_render = true;
     }
 
     /// Switch to a different workspace by index.
@@ -286,28 +418,20 @@ impl Beewm {
 
         self.active_workspace = idx;
 
-        // Map all windows from the target workspace
-        for window in &self.workspace_windows[self.active_workspace] {
-            self.space.map_element(window.clone(), (0, 0), false);
-        }
-
+        self.needs_render = true;
         self.relayout();
 
         // Focus the active window on the new workspace
-        let ws = &self.workspaces[self.active_workspace];
-        if let Some(focus_idx) = ws.focused_idx {
-            if let Some(window) = self.workspace_windows[self.active_workspace].get(focus_idx) {
-                if let Some(toplevel) = window.toplevel() {
-                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                    let keyboard = self.seat.get_keyboard().unwrap();
-                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
-                }
-            }
+        let focus = self.workspaces[self.active_workspace]
+            .focused_idx
+            .and_then(|focus_idx| self.workspace_windows[self.active_workspace].get(focus_idx))
+            .and_then(|window| window.toplevel())
+            .map(|toplevel| toplevel.wl_surface().clone());
+        if let Some(focus) = focus {
+            self.set_keyboard_focus(Some(focus));
         } else {
             // No windows — clear keyboard focus
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            let keyboard = self.seat.get_keyboard().unwrap();
-            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            self.set_keyboard_focus(None);
         }
     }
 
@@ -317,8 +441,7 @@ impl Beewm {
             return;
         }
 
-        let ws = &self.workspaces[self.active_workspace];
-        let focus_idx = match ws.focused_idx {
+        let focus_idx = match self.active_workspace_focused_index() {
             Some(i) => i,
             None => return,
         };
@@ -348,19 +471,15 @@ impl Beewm {
         self.relayout();
 
         // Focus next window on current workspace if any
-        let ws = &self.workspaces[self.active_workspace];
-        if let Some(focus_idx) = ws.focused_idx {
-            if let Some(window) = self.workspace_windows[self.active_workspace].get(focus_idx) {
-                if let Some(toplevel) = window.toplevel() {
-                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                    let keyboard = self.seat.get_keyboard().unwrap();
-                    keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
-                }
-            }
+        let focus = self.workspaces[self.active_workspace]
+            .focused_idx
+            .and_then(|focus_idx| self.workspace_windows[self.active_workspace].get(focus_idx))
+            .and_then(|window| window.toplevel())
+            .map(|toplevel| toplevel.wl_surface().clone());
+        if let Some(focus) = focus {
+            self.set_keyboard_focus(Some(focus));
         } else {
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            let keyboard = self.seat.get_keyboard().unwrap();
-            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            self.set_keyboard_focus(None);
         }
     }
 }
@@ -371,6 +490,45 @@ fn hex_to_color32f(hex: u32) -> Color32F {
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
     let b = (hex & 0xFF) as f32 / 255.0;
     Color32F::new(r, g, b, 1.0)
+}
+
+fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+    root
+}
+
+/// Pre-resolve keybinds so the hot-path is a simple integer comparison.
+fn resolve_keybinds(keybinds: &[Keybind]) -> Vec<ResolvedKeybind> {
+    keybinds
+        .iter()
+        .map(|bind| {
+            let mut logo = false;
+            let mut shift = false;
+            let mut ctrl = false;
+            let mut alt = false;
+            for m in &bind.modifiers {
+                match m.to_lowercase().as_str() {
+                    "super" | "mod4" | "logo" => logo = true,
+                    "shift" => shift = true,
+                    "ctrl" | "control" => ctrl = true,
+                    "alt" | "mod1" => alt = true,
+                    _ => {}
+                }
+            }
+            let keysym = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_CASE_INSENSITIVE);
+            ResolvedKeybind {
+                logo,
+                shift,
+                ctrl,
+                alt,
+                keysym,
+                action: bind.action.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Per-client state required by smithay.
