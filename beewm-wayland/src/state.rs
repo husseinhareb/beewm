@@ -10,6 +10,8 @@ use beewm_core::layout::Layout;
 use beewm_core::model::window::Geometry;
 use beewm_core::model::workspace::Workspace;
 
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::Id;
@@ -107,6 +109,8 @@ pub struct Beewm {
     pub border_commit_serial: u64,
     /// Set when visual state changed and a new frame should be rendered.
     pub needs_render: bool,
+    /// The window currently occupying the full screen, if any.
+    pub fullscreen_window: Option<Window>,
     /// Pre-resolved keybindings (no per-keypress string allocs).
     pub resolved_keybinds: Vec<ResolvedKeybind>,
     /// Cached border colours derived from config (avoid per-frame conversion).
@@ -178,6 +182,7 @@ impl Beewm {
             border_ids: Vec::new(),
             border_commit_serial: 0,
             needs_render: true,
+            fullscreen_window: None,
             resolved_keybinds,
             border_color_focused,
             border_color_unfocused,
@@ -278,7 +283,19 @@ impl Beewm {
         let unfocused_color = self.border_color_unfocused;
 
         let mut elements = Vec::new();
-        let window_count = self.space.elements().count();
+        // Exclude the fullscreen window — it has no borders.
+        let windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|w| {
+                self.fullscreen_window
+                    .as_ref()
+                    .map(|fs| fs != *w)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        let window_count = windows.len();
 
         // Ensure we have enough pre-allocated IDs (4 per window: top, bottom, left, right).
         let needed = window_count * 4;
@@ -286,7 +303,7 @@ impl Beewm {
             self.border_ids.push(Id::new());
         }
 
-        for (win_idx, window) in self.space.elements().enumerate() {
+        for (win_idx, window) in windows.iter().enumerate() {
             let geo = match self.space.element_geometry(window) {
                 Some(g) => g,
                 None => continue,
@@ -408,6 +425,54 @@ impl Beewm {
         }
     }
 
+    /// Toggle fullscreen for the currently focused window.
+    pub fn toggle_fullscreen(&mut self) {
+        if let Some(fs_window) = self.fullscreen_window.take() {
+            // Restore the window to its tiled geometry.
+            if let Some(toplevel) = fs_window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.size = None;
+                });
+                toplevel.send_configure();
+            }
+            self.relayout();
+        } else {
+            let window = match self.active_workspace_focused_window().cloned() {
+                Some(w) => w,
+                None => return,
+            };
+            let output = match self.space.outputs().next().cloned() {
+                Some(o) => o,
+                None => return,
+            };
+            let output_geo = self.space.output_geometry(&output).unwrap();
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                    state.size = Some(output_geo.size);
+                });
+                toplevel.send_configure();
+            }
+            self.space.map_element(window.clone(), output_geo.loc, true);
+            self.fullscreen_window = Some(window);
+            self.needs_render = true;
+        }
+    }
+
+    /// Exit fullscreen (if any) and restore the tiled layout.
+    pub fn restore_fullscreen(&mut self) {
+        if let Some(fs_window) = self.fullscreen_window.take() {
+            if let Some(toplevel) = fs_window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.size = None;
+                });
+                toplevel.send_configure();
+            }
+        }
+    }
+
     /// Re-tile all windows in the space using the current layout.
     pub fn relayout(&mut self) {
         let output = match self.space.outputs().next() {
@@ -433,9 +498,25 @@ impl Beewm {
             return;
         }
 
-        let geos = self.layout.apply(&usable, count);
+        // Skip the fullscreen window — it keeps its own output-sized geometry.
+        let tiled_windows: Vec<Window> = windows
+            .iter()
+            .filter(|w| {
+                self.fullscreen_window
+                    .as_ref()
+                    .map(|fs| *fs != **w)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        let tile_count = tiled_windows.len();
+        if tile_count == 0 {
+            return;
+        }
 
-        for (window, geo) in windows.iter().zip(geos.iter()) {
+        let geos = self.layout.apply(&usable, tile_count);
+
+        for (window, geo) in tiled_windows.iter().zip(geos.iter()) {
             let x = geo.x + gap;
             let y = geo.y + gap;
             let w = (geo.width as i32 - gap * 2 - bw * 2).max(1);
@@ -467,6 +548,9 @@ impl Beewm {
             self.active_workspace + 1,
             idx + 1
         );
+
+        // If a window is fullscreened, restore it before leaving the workspace.
+        self.restore_fullscreen();
 
         // Unmap all windows from the current workspace
         for window in &self.workspace_windows[self.active_workspace] {

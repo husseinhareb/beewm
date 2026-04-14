@@ -215,6 +215,17 @@ impl XdgShellHandler for Beewm {
                     false
                 };
                 self.untrack_window_for_surface(target_surface);
+                // If this window was fullscreened, clear the state so relayout
+                // works correctly and the next window gets a proper tiled size.
+                if self
+                    .fullscreen_window
+                    .as_ref()
+                    .and_then(|w| w.toplevel())
+                    .map(|t| t.wl_surface() == target_surface)
+                    .unwrap_or(false)
+                {
+                    self.fullscreen_window = None;
+                }
                 self.space.unmap_elem(&window);
                 self.workspaces[ws_idx].remove_window(pos);
                 if ws_idx == self.active_workspace {

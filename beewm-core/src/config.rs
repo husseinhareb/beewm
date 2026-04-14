@@ -17,6 +17,7 @@ pub enum Action {
     FocusNext,
     FocusPrev,
     CloseWindow,
+    ToggleFullscreen,
     SwitchWorkspace(usize),
     MoveToWorkspace(usize),
     Spawn(String),
@@ -122,7 +123,7 @@ impl Config {
             },
             Keybind {
                 modifiers: vec!["mod4".into()],
-                key: "d".into(),
+                key: "q".into(),
                 action: Action::Spawn("wofi --show run".into()),
             },
             Keybind {
@@ -136,7 +137,7 @@ impl Config {
                 action: Action::FocusPrev,
             },
             Keybind {
-                modifiers: vec!["mod4".into()],
+                modifiers: vec!["mod4".into(), "shift".into()],
                 key: "q".into(),
                 action: Action::CloseWindow,
             },
@@ -144,6 +145,11 @@ impl Config {
                 modifiers: vec!["mod4".into(), "shift".into()],
                 key: "e".into(),
                 action: Action::Quit,
+            },
+            Keybind {
+                modifiers: vec!["mod4".into()],
+                key: "f".into(),
+                action: Action::ToggleFullscreen,
             },
         ];
 
@@ -308,11 +314,12 @@ impl Config {
         text.push_str(&format!("tap_to_click {}\n", default.tap_to_click));
         text.push_str(&format!("natural_scroll {}\n\n", default.natural_scroll));
         text.push_str("bindsym $mod+Return exec $terminal\n");
-        text.push_str("bindsym $mod+d exec $launcher\n");
+        text.push_str("bindsym $mod+q exec $launcher\n");
         text.push_str("bindsym $mod+j focus_next\n");
         text.push_str("bindsym $mod+k focus_prev\n");
-        text.push_str("bindsym $mod+q kill\n");
+        text.push_str("bindsym $mod+Shift+q kill\n");
         text.push_str("bindsym $mod+Shift+e exit\n");
+        text.push_str("bindsym $mod+f fullscreen\n");
         for workspace in 1..=default.num_workspaces.min(9) {
             text.push_str(&format!("bindsym $mod+{} workspace {}\n", workspace, workspace));
         }
@@ -529,6 +536,7 @@ fn parse_action(action_text: &str, line_no: usize) -> Result<Action, ConfigError
         "focus_next" => Ok(Action::FocusNext),
         "focus_prev" => Ok(Action::FocusPrev),
         "close_window" | "kill" => Ok(Action::CloseWindow),
+        "fullscreen" | "toggle_fullscreen" => Ok(Action::ToggleFullscreen),
         "quit" | "exit" => Ok(Action::Quit),
         "workspace" | "switch_workspace" => {
             let workspace = parse_workspace_argument(parts.next(), line_no, name)?;
