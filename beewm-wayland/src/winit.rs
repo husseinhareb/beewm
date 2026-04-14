@@ -7,6 +7,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::glow::GlowRenderer;
 use smithay::backend::winit::{self, WinitEvent};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction};
@@ -137,8 +138,14 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("NIXOS_OZONE_WL", "1");
 
     tracing::info!("Starting winit event loop");
+    let mut applied_cursor_status_serial = u64::MAX;
 
     while data.calloop.state.running {
+        if applied_cursor_status_serial != data.calloop.state.cursor_status_serial {
+            apply_cursor(&winit_backend, &data.calloop.state.cursor_status);
+            applied_cursor_status_serial = data.calloop.state.cursor_status_serial;
+        }
+
         // Only render when something visual has changed.
         if data.calloop.state.needs_render {
             let output = data.calloop.state.space.outputs().next().cloned();
@@ -219,4 +226,23 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn apply_cursor(
+    backend: &smithay::backend::winit::WinitGraphicsBackend<GlowRenderer>,
+    status: &CursorImageStatus,
+) {
+    match status {
+        CursorImageStatus::Hidden => backend.window().set_cursor_visible(false),
+        CursorImageStatus::Named(icon) => {
+            backend.window().set_cursor_visible(true);
+            backend.window().set_cursor(*icon);
+        }
+        CursorImageStatus::Surface(_) => {
+            // wl_pointer cursor surfaces are not yet software-rendered in the nested backend,
+            // so fall back to a standard arrow instead of leaving the cursor blank.
+            backend.window().set_cursor_visible(true);
+            backend.window().set_cursor(smithay::input::pointer::CursorIcon::Default);
+        }
+    }
 }

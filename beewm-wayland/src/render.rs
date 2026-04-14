@@ -1,3 +1,4 @@
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
@@ -13,6 +14,7 @@ type SpaceElem = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<G
 pub enum OutputRenderElement {
     Space(Box<SpaceElem>),
     Border(SolidColorRenderElement),
+    Cursor(Box<MemoryRenderBufferRenderElement<GlesRenderer>>),
 }
 
 impl From<SpaceElem> for OutputRenderElement {
@@ -27,11 +29,18 @@ impl From<SolidColorRenderElement> for OutputRenderElement {
     }
 }
 
+impl From<MemoryRenderBufferRenderElement<GlesRenderer>> for OutputRenderElement {
+    fn from(e: MemoryRenderBufferRenderElement<GlesRenderer>) -> Self {
+        Self::Cursor(Box::new(e))
+    }
+}
+
 impl Element for OutputRenderElement {
     fn id(&self) -> &Id {
         match self {
             Self::Space(e) => e.id(),
             Self::Border(e) => e.id(),
+            Self::Cursor(e) => e.id(),
         }
     }
 
@@ -39,6 +48,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.current_commit(),
             Self::Border(e) => e.current_commit(),
+            Self::Cursor(e) => e.current_commit(),
         }
     }
 
@@ -46,6 +56,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.location(scale),
             Self::Border(e) => e.location(scale),
+            Self::Cursor(e) => e.location(scale),
         }
     }
 
@@ -53,6 +64,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.src(),
             Self::Border(e) => e.src(),
+            Self::Cursor(e) => e.src(),
         }
     }
 
@@ -60,6 +72,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.transform(),
             Self::Border(e) => e.transform(),
+            Self::Cursor(e) => e.transform(),
         }
     }
 
@@ -67,6 +80,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.geometry(scale),
             Self::Border(e) => e.geometry(scale),
+            Self::Cursor(e) => e.geometry(scale),
         }
     }
 
@@ -78,6 +92,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.damage_since(scale, commit),
             Self::Border(e) => e.damage_since(scale, commit),
+            Self::Cursor(e) => e.damage_since(scale, commit),
         }
     }
 
@@ -85,6 +100,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.opaque_regions(scale),
             Self::Border(e) => e.opaque_regions(scale),
+            Self::Cursor(e) => e.opaque_regions(scale),
         }
     }
 
@@ -92,6 +108,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.alpha(),
             Self::Border(e) => e.alpha(),
+            Self::Cursor(e) => e.alpha(),
         }
     }
 
@@ -99,6 +116,7 @@ impl Element for OutputRenderElement {
         match self {
             Self::Space(e) => e.kind(),
             Self::Border(e) => e.kind(),
+            Self::Cursor(e) => e.kind(),
         }
     }
 }
@@ -117,6 +135,9 @@ impl RenderElement<GlesRenderer> for OutputRenderElement {
                 RenderElement::<GlesRenderer>::draw(e.as_ref(), frame, src, dst, damage, opaque_regions)
             }
             Self::Border(e) => RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions),
+            Self::Cursor(e) => {
+                RenderElement::<GlesRenderer>::draw(e.as_ref(), frame, src, dst, damage, opaque_regions)
+            }
         }
     }
 
@@ -124,6 +145,7 @@ impl RenderElement<GlesRenderer> for OutputRenderElement {
         match self {
             Self::Space(e) => e.as_ref().underlying_storage(renderer),
             Self::Border(e) => e.underlying_storage(renderer),
+            Self::Cursor(e) => e.as_ref().underlying_storage(renderer),
         }
     }
 }

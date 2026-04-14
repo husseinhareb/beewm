@@ -317,7 +317,7 @@ fn render_frame(data: &mut UdevData) {
     };
 
     let border_elements = data.calloop.state.border_elements();
-    let cursor_elements = data.calloop.state.cursor_elements();
+    let cursor_elements = data.calloop.state.cursor_elements(&mut gpu.renderer);
 
     let mut elements: Vec<OutputRenderElement> = Vec::new();
     elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));

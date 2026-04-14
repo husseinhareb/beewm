@@ -121,6 +121,7 @@ dependencies = [
  "libc",
  "smithay",
  "tracing",
+ "xcursor",
 ]
 
 [[package]]

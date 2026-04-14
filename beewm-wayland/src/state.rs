@@ -6,17 +6,20 @@ use beewm_core::layout::Layout;
 use beewm_core::model::window::Geometry;
 use beewm_core::model::workspace::Workspace;
 
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::{Space, Window};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::keyboard::xkb;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, SERIAL_COUNTER};
 use smithay::wayland::compositor::{get_parent, CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
@@ -30,6 +33,8 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
+
+use crate::cursor::CursorThemeManager;
 
 /// Wrapper passed to calloop; holds compositor state + display handle.
 pub struct CalloopData {
@@ -74,8 +79,9 @@ pub struct Beewm {
 
     // Pointer
     pub pointer_location: Point<f64, Logical>,
-    pub cursor_id: Id,
-    pub cursor_serial: u64,
+    pub cursor_status_serial: u64,
+    pub cursor_status: CursorImageStatus,
+    pub cursor_theme: CursorThemeManager,
 
     // Session (for VT switching in TTY mode)
     pub session: Option<Box<dyn std::any::Any>>,
@@ -156,8 +162,9 @@ impl Beewm {
             seat_state,
             seat,
             pointer_location: Point::from((0.0, 0.0)),
-            cursor_id: Id::new(),
-            cursor_serial: 0,
+            cursor_status_serial: 0,
+            cursor_status: CursorImageStatus::default_named(),
+            cursor_theme: CursorThemeManager::new(),
             session: None,
             space: Space::default(),
             layout,
@@ -336,19 +343,50 @@ impl Beewm {
         elements
     }
 
-    /// Build a simple software cursor element (used by DRM backend).
-    pub fn cursor_elements(&self) -> Vec<SolidColorRenderElement> {
-        let commit = smithay::backend::renderer::utils::CommitCounter::from(self.cursor_serial as usize);
-        vec![SolidColorRenderElement::new(
-            self.cursor_id.clone(),
-            Rectangle::new(
-                (self.pointer_location.x as i32, self.pointer_location.y as i32).into(),
-                (16, 16).into(),
-            ),
-            commit,
-            Color32F::new(1.0, 1.0, 1.0, 1.0),
-            Kind::Unspecified,
-        )]
+    pub fn effective_cursor_icon(&self) -> Option<CursorIcon> {
+        match &self.cursor_status {
+            CursorImageStatus::Hidden => None,
+            CursorImageStatus::Named(icon) => Some(*icon),
+            CursorImageStatus::Surface(_) => Some(CursorIcon::Default),
+        }
+    }
+
+    pub fn set_cursor_status(&mut self, status: CursorImageStatus) {
+        self.cursor_status = status;
+        self.cursor_status_serial = self.cursor_status_serial.wrapping_add(1);
+        self.needs_render = true;
+    }
+
+    /// Build a themed software cursor element for the DRM backend.
+    pub fn cursor_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Vec<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        let Some(icon) = self.effective_cursor_icon() else {
+            return Vec::new();
+        };
+
+        let sprite = self.cursor_theme.sprite(icon);
+        let location = Point::<f64, Physical>::from((
+            self.pointer_location.x - sprite.hotspot.x as f64,
+            self.pointer_location.y - sprite.hotspot.y as f64,
+        ));
+
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location,
+            &sprite.buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        ) {
+            Ok(element) => vec![element],
+            Err(error) => {
+                tracing::warn!("Failed to build cursor element: {:?}", error);
+                Vec::new()
+            }
+        }
     }
 
     /// Re-tile all windows in the space using the current layout.

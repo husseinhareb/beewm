@@ -1,3 +1,4 @@
+mod cursor;
 mod handlers;
 mod input;
 mod render;

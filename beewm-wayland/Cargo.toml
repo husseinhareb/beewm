@@ -18,3 +18,4 @@ smithay = { version = "0.7", default-features = false, features = [
 ] }
 tracing = "0.1"
 libc = "0.2"
+xcursor = "0.3"

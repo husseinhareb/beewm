@@ -208,7 +208,6 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     new_pos.x = new_pos.x.clamp(0.0, output_geo.size.w as f64 - 1.0);
     new_pos.y = new_pos.y.clamp(0.0, output_geo.size.h as f64 - 1.0);
     state.pointer_location = new_pos;
-    state.cursor_serial = state.cursor_serial.wrapping_add(1);
     state.needs_render = true;
 
     let serial = SERIAL_COUNTER.next_serial();
@@ -266,7 +265,6 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
     let pos = event.position_transformed(output_geo.size);
 
     state.pointer_location = pos;
-    state.cursor_serial = state.cursor_serial.wrapping_add(1);
     state.needs_render = true;
 
     let serial = SERIAL_COUNTER.next_serial();
