@@ -17,6 +17,24 @@ use smithay::wayland::shell::wlr_layer::{
 
 use crate::state::Beewm;
 
+/// Returns `true` when keyboard focus is currently on a layer-shell surface
+/// (e.g. wofi).  In that case focus-follows-mouse must NOT steal focus away.
+fn layer_surface_has_keyboard_focus(state: &Beewm) -> bool {
+    let Some(focused) = state.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
+        return false;
+    };
+    // If the focused surface belongs to a mapped tiled window it is NOT a
+    // layer surface.
+    if state.mapped_window_for_surface(&focused).is_some() {
+        return false;
+    }
+    // Check whether any output's layer map contains this surface.
+    state
+        .space
+        .layer_for_surface(&focused, smithay::desktop::WindowSurfaceType::ALL)
+        .is_some()
+}
+
 /// Process an input event from any backend.
 pub fn handle_input<I: InputBackend>(state: &mut Beewm, event: InputEvent<I>) {
     match event {
@@ -290,8 +308,9 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
         },
     );
 
-    // Focus follows mouse — only change focus when the surface changes
-    if state.config.focus_follows_mouse {
+    // Focus follows mouse — only change focus when the surface changes.
+    // Never steal focus away from a layer-shell surface (e.g. wofi).
+    if state.config.focus_follows_mouse && !layer_surface_has_keyboard_focus(state) {
         if let Some((surface, _)) = under {
             let keyboard = state.seat.get_keyboard().unwrap();
             let already_focused = keyboard
@@ -336,8 +355,9 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
         },
     );
 
-    // Focus follows mouse — only change focus when the surface changes
-    if state.config.focus_follows_mouse {
+    // Focus follows mouse — only change focus when the surface changes.
+    // Never steal focus away from a layer-shell surface (e.g. wofi).
+    if state.config.focus_follows_mouse && !layer_surface_has_keyboard_focus(state) {
         if let Some((surface, _)) = under {
             let keyboard = state.seat.get_keyboard().unwrap();
             let already_focused = keyboard

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use smithay::desktop::layer_map_for_output;
+use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
+
 use beewm_core::config::{Config, Keybind, LayoutKind};
 use beewm_core::layout::dwindle::Dwindle;
 use beewm_core::layout::master_stack::MasterStack;
@@ -242,10 +245,27 @@ impl Beewm {
         }
     }
 
+    /// Returns `true` when an overlay or top-layer surface is mapped on the
+    /// primary output.  Layer-shell clients like wofi, waybar-overlay panels,
+    /// etc. sit above regular tiled windows, so we must suppress window
+    /// borders while they are visible to avoid z-fighting.
+    pub fn has_active_layer_surface(&self) -> bool {
+        let Some(output) = self.space.outputs().next() else {
+            return false;
+        };
+        let layer_map = layer_map_for_output(output);
+        for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+            if layer_map.layers_on(layer).next().is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Build border render elements for all visible windows.
     pub fn border_elements(&mut self) -> Vec<SolidColorRenderElement> {
         let bw = self.config.border_width as i32;
-        if bw == 0 {
+        if bw == 0 || self.has_active_layer_surface() {
             return Vec::new();
         }
 
