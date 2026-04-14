@@ -62,8 +62,8 @@ impl CursorThemeManager {
 
         Some(CursorSprite {
             buffer: MemoryRenderBuffer::from_slice(
-                &image.pixels_argb,
-                Fourcc::Argb8888,
+                &image.pixels_rgba,
+                Fourcc::Abgr8888,
                 (image.width as i32, image.height as i32),
                 1,
                 Transform::Normal,
@@ -114,15 +114,15 @@ fn fallback_arrow_sprite(size: u32) -> CursorSprite {
                 .any(|neighbor| !fill[neighbor]);
             let base = idx * 4;
             if is_outline {
-                pixels[base] = 0xFF;
+                pixels[base] = 0x00;
                 pixels[base + 1] = 0x00;
                 pixels[base + 2] = 0x00;
-                pixels[base + 3] = 0x00;
+                pixels[base + 3] = 0xFF;
             } else {
-                pixels[base] = 0xFF;
                 pixels[base + 1] = 0xFF;
                 pixels[base + 2] = 0xFF;
                 pixels[base + 3] = 0xFF;
+                pixels[base] = 0xFF;
             }
         }
     }
@@ -130,7 +130,7 @@ fn fallback_arrow_sprite(size: u32) -> CursorSprite {
     CursorSprite {
         buffer: MemoryRenderBuffer::from_slice(
             &pixels,
-            Fourcc::Argb8888,
+            Fourcc::Abgr8888,
             (width as i32, height as i32),
             1,
             Transform::Normal,

@@ -5,11 +5,15 @@ use smithay::backend::input::{
 };
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
-use smithay::desktop::WindowSurfaceType;
+use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
+use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::wlr_layer::{
+    KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
+};
 
 use crate::state::Beewm;
 
@@ -186,11 +190,61 @@ fn surface_under(
     state: &Beewm,
     pos: smithay::utils::Point<f64, smithay::utils::Logical>,
 ) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+    let output = state
+        .space
+        .output_under(pos)
+        .next()
+        .cloned()
+        .or_else(|| state.space.outputs().next().cloned())?;
+
+    {
+        let layer_map = layer_map_for_output(&output);
+        for layer in [
+            WlrLayer::Overlay,
+            WlrLayer::Top,
+            WlrLayer::Bottom,
+            WlrLayer::Background,
+        ] {
+            let Some(layer_surface) = layer_map.layer_under(layer, pos).cloned() else {
+                continue;
+            };
+            let Some(layer_geometry) = layer_map.layer_geometry(&layer_surface) else {
+                continue;
+            };
+
+            let local = pos - layer_geometry.loc.to_f64();
+            if let Some((surface, surface_loc)) =
+                layer_surface.surface_under(local, WindowSurfaceType::ALL)
+            {
+                return Some((surface, layer_geometry.loc.to_f64() + surface_loc.to_f64()));
+            }
+        }
+    }
+
     state.space.element_under(pos).and_then(|(window, loc)| {
         let local = pos - loc.to_f64();
         window
             .surface_under(local, WindowSurfaceType::ALL)
             .map(|(surface, surface_loc)| (surface, loc.to_f64() + surface_loc.to_f64()))
+    })
+}
+
+fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
+    if state.mapped_window_for_surface(surface).is_some() {
+        return true;
+    }
+
+    let Some(layer) = state.space.layer_for_surface(surface, WindowSurfaceType::ALL) else {
+        return false;
+    };
+
+    with_states(layer.wl_surface(), |states| {
+        states
+            .cached_state
+            .get::<LayerSurfaceCachedState>()
+            .current()
+            .keyboard_interactivity
+            != KeyboardInteractivity::None
     })
 }
 
@@ -245,7 +299,7 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
                 .as_ref()
                 .map(|f| *f == surface)
                 .unwrap_or(false);
-            if !already_focused {
+            if !already_focused && surface_accepts_keyboard_focus(state, &surface) {
                 keyboard.set_focus(state, Some(surface), serial);
             }
         }
@@ -291,7 +345,7 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
                 .as_ref()
                 .map(|f| *f == surface)
                 .unwrap_or(false);
-            if !already_focused {
+            if !already_focused && surface_accepts_keyboard_focus(state, &surface) {
                 keyboard.set_focus(state, Some(surface), serial);
             }
         }
