@@ -4,11 +4,11 @@ A tiling window manager written in Rust.
 
 ## Features
 
-- X11 support (via x11rb)
-- Wayland support (planned)
-- Master-stack tiling layout
+- Wayland compositor backend
+- Dwindle tiling layout
+- Optional master-stack layout
 - i3-style numbered workspaces
-- TOML configuration
+- i3-style text configuration
 
 ## Building
 
@@ -18,4 +18,5 @@ cargo build --release
 
 ## Configuration
 
-Configuration is loaded from `~/.config/beewm/config.toml`.
+Configuration is loaded from `~/.config/beewm/config`.
+If the file does not exist, beewm writes a starter config automatically.

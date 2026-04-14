@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use beewm_core::config::{Config, Keybind};
+use beewm_core::config::{Config, Keybind, LayoutKind};
+use beewm_core::layout::dwindle::Dwindle;
 use beewm_core::layout::master_stack::MasterStack;
 use beewm_core::layout::Layout;
 use beewm_core::model::window::Geometry;
@@ -135,9 +136,7 @@ impl Beewm {
         seat.add_pointer();
 
         let num_ws = config.num_workspaces;
-        let layout = Box::new(MasterStack {
-            master_ratio: config.master_ratio,
-        });
+        let layout = build_layout(&config);
         let resolved_keybinds = resolve_keybinds(&config.keybinds);
         let border_color_focused = hex_to_color32f(config.border_color_focused);
         let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
@@ -519,6 +518,17 @@ impl Beewm {
         } else {
             self.set_keyboard_focus(None);
         }
+    }
+}
+
+fn build_layout(config: &Config) -> Box<dyn Layout> {
+    match config.layout {
+        LayoutKind::Dwindle => Box::new(Dwindle {
+            split_ratio: config.split_ratio,
+        }),
+        LayoutKind::MasterStack => Box::new(MasterStack {
+            master_ratio: config.split_ratio,
+        }),
     }
 }
 
