@@ -66,14 +66,18 @@ fn parses_i3_style_config() {
 #[test]
 fn fills_default_keybinds_for_custom_workspace_count() {
     let config = Config::parse("workspaces 4\n").unwrap();
-    assert!(config
-        .keybinds
-        .iter()
-        .all(|bind| !matches!(bind.action, Action::SwitchWorkspace(index) if index >= 4)));
-    assert!(config
-        .keybinds
-        .iter()
-        .all(|bind| !matches!(bind.action, Action::MoveToWorkspace(index) if index >= 4)));
+    assert!(
+        config
+            .keybinds
+            .iter()
+            .all(|bind| !matches!(bind.action, Action::SwitchWorkspace(index) if index >= 4))
+    );
+    assert!(
+        config
+            .keybinds
+            .iter()
+            .all(|bind| !matches!(bind.action, Action::MoveToWorkspace(index) if index >= 4))
+    );
 }
 
 #[test]

@@ -1,19 +1,13 @@
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::CommitCounter;
-use smithay::desktop::{layer_map_for_output, Window};
+use smithay::desktop::{Window, layer_map_for_output};
 use smithay::utils::{Coordinate, Logical, Rectangle};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use super::Beewm;
 
-fn border_rectangles<Kind>(
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    bw: i32,
-) -> [Rectangle<i32, Kind>; 4]
+fn border_rectangles<Kind>(x: i32, y: i32, w: i32, h: i32, bw: i32) -> [Rectangle<i32, Kind>; 4]
 where
     i32: Coordinate,
 {
@@ -41,8 +35,8 @@ fn window_border_overlaps_layer(
         window_geo.size.h,
         bw,
     )
-        .into_iter()
-        .any(|border_geo| border_geo.overlaps(layer_geo))
+    .into_iter()
+    .any(|border_geo| border_geo.overlaps(layer_geo))
 }
 
 impl Beewm {
@@ -138,13 +132,8 @@ impl Beewm {
             };
 
             let commit = CommitCounter::from(self.border_commit_serial as usize);
-            let [top_geo, bottom_geo, left_geo, right_geo] = border_rectangles(
-                geo.loc.x,
-                geo.loc.y,
-                geo.size.w,
-                geo.size.h,
-                bw,
-            );
+            let [top_geo, bottom_geo, left_geo, right_geo] =
+                border_rectangles(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, bw);
 
             // Use stable pre-allocated IDs so the DRM compositor's damage
             // tracker can recognise unchanged elements across frames.

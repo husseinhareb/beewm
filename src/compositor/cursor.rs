@@ -4,7 +4,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point, Transform};
-use xcursor::{parser::parse_xcursor, CursorTheme};
+use xcursor::{CursorTheme, parser::parse_xcursor};
 
 #[derive(Debug, Clone)]
 pub struct CursorSprite {

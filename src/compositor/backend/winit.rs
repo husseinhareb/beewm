@@ -16,7 +16,7 @@ use smithay::utils::Transform;
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::spawn_startup_commands;
+use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -131,24 +131,13 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-    std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    // Keep compositor-specific env on child processes instead of mutating the
+    // global process environment, which is unsafe in Rust 2024.
+    let mut child_env = ChildEnvironment::wayland(socket_name);
+    child_env.set_sanitize_display(true);
+    data.state.child_env = child_env;
 
-    // Declare this as a Wayland session — GTK, Qt, and Electron all check
-    // XDG_SESSION_TYPE and auto-select their Wayland backends from it.
-    // Do NOT set GDK_BACKEND or QT_QPA_PLATFORM directly: those override
-    // auto-detection and crash apps when optional protocols are missing.
-    std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    // Force Electron/Chromium onto native Wayland so they exercise the nested
-    // compositor instead of falling back to the host X11 session.
-    std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
-    std::env::set_var("NIXOS_OZONE_WL", "1");
-
-    data.state.sanitize_display_for_children = true;
-
-    spawn_startup_commands(
-        &data.state.config.autostart_commands,
-        data.state.sanitize_display_for_children,
-    );
+    spawn_startup_commands(&data.state.config.autostart_commands, &data.state.child_env);
 
     tracing::info!("Starting winit event loop");
     let mut applied_cursor_status_serial = u64::MAX;

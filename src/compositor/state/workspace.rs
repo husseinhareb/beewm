@@ -4,7 +4,7 @@ use smithay::utils::{Point, Size};
 
 use crate::model::window::Geometry;
 
-use super::{root_surface, Beewm};
+use super::{Beewm, root_surface};
 
 impl Beewm {
     /// Toggle the floating state of the currently focused window.
@@ -187,7 +187,10 @@ impl Beewm {
                     .unwrap_or(false);
                 let is_floating = w
                     .toplevel()
-                    .map(|t| self.floating_windows.contains_key(&root_surface(t.wl_surface())))
+                    .map(|t| {
+                        self.floating_windows
+                            .contains_key(&root_surface(t.wl_surface()))
+                    })
                     .unwrap_or(false);
                 !is_fullscreen && !is_floating
             })

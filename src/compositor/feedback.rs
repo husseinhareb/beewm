@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use smithay::backend::renderer::element::{
-    default_primary_scanout_output_compare, RenderElementStates,
+    RenderElementStates, default_primary_scanout_output_compare,
 };
 use smithay::desktop::{
     layer_map_for_output,
     utils::{
-        surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
-        update_surface_primary_scanout_output, OutputPresentationFeedback,
+        OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
+        surface_primary_scanout_output, update_surface_primary_scanout_output,
     },
 };
 use smithay::output::Output;

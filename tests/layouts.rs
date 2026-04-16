@@ -1,6 +1,6 @@
+use beewm::layout::Layout;
 use beewm::layout::dwindle::Dwindle;
 use beewm::layout::master_stack::MasterStack;
-use beewm::layout::Layout;
 use beewm::model::window::Geometry;
 
 #[test]

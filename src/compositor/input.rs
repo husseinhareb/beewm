@@ -4,7 +4,7 @@ use smithay::backend::input::{
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::session::Session;
-use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
+use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -118,7 +118,7 @@ fn execute_action(state: &mut Beewm, action: Action) {
     match action {
         Action::Spawn(cmd) => {
             tracing::info!("Spawning: {}", cmd);
-            if let Err(e) = spawn_shell_command(&cmd, state.sanitize_display_for_children) {
+            if let Err(e) = spawn_shell_command(&cmd, &state.child_env) {
                 tracing::error!("Failed to spawn '{}': {}", cmd, e);
             }
         }

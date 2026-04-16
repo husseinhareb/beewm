@@ -4,38 +4,38 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Format;
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::AsRenderElements;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Event as SessionEvent;
 use smithay::backend::session::Session;
+use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
-use smithay::desktop::space::{space_render_elements, SpaceRenderElements};
+use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
-use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
+use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::ScrollMethod;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::utils::{Monotonic, Time};
-use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::spawn_startup_commands;
+use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -58,8 +58,7 @@ struct GpuData {
     output: Output,
     /// True when a vblank has fired and we may render the next frame.
     can_render: bool,
-    pending_presentation_feedback:
-        Option<smithay::desktop::utils::OutputPresentationFeedback>,
+    pending_presentation_feedback: Option<smithay::desktop::utils::OutputPresentationFeedback>,
 }
 
 /// Top-level calloop data for the DRM/udev backend —
@@ -96,15 +95,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     data.state
         .install_syncobj_blocker_source(Box::new(move |source, client| {
             let client = client.clone();
-            if let Err(error) = loop_handle.insert_source(source, move |(), _, data: &mut UdevData| {
-                if let Some(client_state) = client.get_data::<ClientState>() {
-                    let display_handle = data.state.display_handle.clone();
-                    client_state
-                        .compositor_state
-                        .blocker_cleared(&mut data.state, &display_handle);
-                }
-                Ok(())
-            }) {
+            if let Err(error) =
+                loop_handle.insert_source(source, move |(), _, data: &mut UdevData| {
+                    if let Some(client_state) = client.get_data::<ClientState>() {
+                        let display_handle = data.state.display_handle.clone();
+                        client_state
+                            .compositor_state
+                            .blocker_cleared(&mut data.state, &display_handle);
+                    }
+                    Ok(())
+                })
+            {
                 tracing::warn!("Failed to install explicit-sync fence source: {}", error);
             }
         }));
@@ -148,17 +149,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_os_string();
     tracing::info!("Wayland socket: {:?}", socket_name);
-    std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-
-    // Declare this as a Wayland session — GTK, Qt, and Electron all check
-    // XDG_SESSION_TYPE and auto-select their Wayland backends from it.
-    // Do NOT set GDK_BACKEND or QT_QPA_PLATFORM directly: those override
-    // auto-detection and crash apps when optional protocols are missing.
-    std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    // Force Electron/Chromium onto native Wayland so they do not silently
-    // fall back to X11/Xwayland and bypass the compositor-side pacing fixes.
-    std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
-    std::env::set_var("NIXOS_OZONE_WL", "1");
+    // Keep compositor-specific env on child processes instead of mutating the
+    // global process environment, which is unsafe in Rust 2024.
+    let mut child_env = ChildEnvironment::wayland(socket_name);
 
     // Ensure XDG_RUNTIME_DIR is set — required by Wayland clients like kitty.
     // seatd/logind normally sets this; provide a fallback for bare TTY sessions.
@@ -166,10 +159,11 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let uid = unsafe { libc::getuid() };
         let path = format!("/run/user/{}", uid);
         if std::path::Path::new(&path).exists() {
-            std::env::set_var("XDG_RUNTIME_DIR", &path);
+            child_env.set("XDG_RUNTIME_DIR", &path);
             tracing::info!("Set XDG_RUNTIME_DIR to {}", path);
         }
     }
+    data.state.child_env = child_env;
 
     event_loop
         .handle()
@@ -302,10 +296,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Start autostart clients only after an output exists. Layer-shell
     // clients like beebar need an output-backed initial configure; spawning
     // them earlier races output creation and leaves them unmapped/blank.
-    spawn_startup_commands(
-        &data.state.config.autostart_commands,
-        data.state.sanitize_display_for_children,
-    );
+    spawn_startup_commands(&data.state.config.autostart_commands, &data.state.child_env);
 
     tracing::info!("Starting udev event loop");
 
@@ -438,8 +429,11 @@ fn render_frame(data: &mut UdevData) {
                 let elapsed = data.state.start_time.elapsed();
                 send_frame_callbacks(&data.state, &output, elapsed, None);
             } else {
-                gpu.pending_presentation_feedback =
-                    Some(collect_presentation_feedback(&data.state, &output, &render_states));
+                gpu.pending_presentation_feedback = Some(collect_presentation_feedback(
+                    &data.state,
+                    &output,
+                    &render_states,
+                ));
             }
             // For the normal non-empty case, frame callbacks are sent from the
             // VBlank handler once the hardware confirms the frame is on screen.
@@ -582,7 +576,10 @@ fn init_gpu(
     )?;
 
     let syncobj_state = if supports_syncobj_eventfd(&drm_fd) {
-        Some(DrmSyncobjState::new::<Beewm>(display_handle, drm_fd.clone()))
+        Some(DrmSyncobjState::new::<Beewm>(
+            display_handle,
+            drm_fd.clone(),
+        ))
     } else {
         tracing::info!("DRM syncobj eventfd unsupported on {}", path.display());
         None

@@ -6,8 +6,8 @@ mod workspace;
 use std::collections::HashMap;
 use std::fs;
 
-use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::sync::Fence;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::{PopupManager, Space, Window};
@@ -19,8 +19,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Clock, Logical, Monotonic, Point};
 use smithay::wayland::compositor::{
-    add_blocker, add_pre_commit_hook, get_parent, with_states, CompositorClientState,
-    CompositorState,
+    CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
+    with_states,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -31,17 +31,19 @@ use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
-use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::config::{Action, Config, Keybind, LayoutKind};
+use crate::layout::Layout;
 use crate::layout::dwindle::Dwindle;
 use crate::layout::master_stack::MasterStack;
-use crate::layout::Layout;
 use crate::model::workspace::Workspace;
+
+use super::commands::ChildEnvironment;
 
 use super::cursor::CursorThemeManager;
 
@@ -145,8 +147,8 @@ pub struct Beewm {
     pub border_color_unfocused: Color32F,
     /// Installs acquire-fence event sources into the active backend loop.
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
-    /// Remove inherited X11 env when spawning child processes from nested mode.
-    pub sanitize_display_for_children: bool,
+    /// Compositor-specific environment for spawned child processes.
+    pub(crate) child_env: ChildEnvironment,
 }
 
 impl Beewm {
@@ -232,17 +234,14 @@ impl Beewm {
             border_color_focused,
             border_color_unfocused,
             syncobj_blocker_installer: None,
-            sanitize_display_for_children: false,
+            child_env: ChildEnvironment::default(),
         };
 
         state.publish_active_workspace_state();
         state
     }
 
-    pub fn install_syncobj_blocker_source(
-        &mut self,
-        installer: Box<SyncobjBlockerInstaller>,
-    ) {
+    pub fn install_syncobj_blocker_source(&mut self, installer: Box<SyncobjBlockerInstaller>) {
         self.syncobj_blocker_installer = Some(installer);
     }
 
