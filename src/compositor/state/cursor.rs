@@ -1,5 +1,5 @@
-use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::utils::{Physical, Point};
@@ -80,8 +80,8 @@ fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
         return Some(grab.edges.cursor_icon());
     }
 
-    // During a floating-window move grab always show the grabbing hand.
-    if state.move_grab.is_some() {
+    // During window drag grabs always show the grabbing hand.
+    if state.move_grab.is_some() || state.tiled_swap_grab.is_some() {
         return Some(CursorIcon::Grabbing);
     }
 

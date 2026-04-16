@@ -4,43 +4,44 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use smithay::backend::allocator::Format;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::Format;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::AsRenderElements;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Event as SessionEvent;
 use smithay::backend::session::Session;
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
-use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
-use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::ScrollMethod;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::utils::{Monotonic, Time};
-use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 use smithay::wayland::presentation::Refresh;
-use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
+use crate::compositor::commands::{spawn_startup_commands, ChildEnvironment};
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
 };
-use crate::compositor::render::OutputRenderElement;
+use crate::compositor::ipc;
+use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
+use crate::compositor::render::{
+    layer_render_elements, window_render_elements, OutputRenderElement,
+};
 use crate::compositor::state::{Beewm, ClientState};
 
 /// Per-GPU state for the DRM backend.
@@ -77,6 +78,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let display_handle = display.handle();
 
     let state = Beewm::new(&display, config);
+    let (_ipc_server, ipc_channel) = ipc::start()?;
 
     // Clone the display fd before moving display into UdevData — used to
     // wake calloop when clients send data.
@@ -193,6 +195,15 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Ok(PostAction::Continue)
         },
     )?;
+
+    event_loop
+        .handle()
+        .insert_source(ipc_channel, |event, _, data| match event {
+            ChannelEvent::Msg(command) => ipc::apply_command(&mut data.state, command),
+            ChannelEvent::Closed => {
+                tracing::warn!("Workspace IPC channel closed");
+            }
+        })?;
 
     // --- Libinput ---
     let mut libinput_context =
@@ -327,14 +338,8 @@ fn render_frame(data: &mut UdevData) {
     };
     gpu.can_render = false;
 
-    let space_elements =
-        match space_render_elements(&mut gpu.renderer, [&data.state.space], &gpu.output, 1.0) {
-            Ok(elems) => elems,
-            Err(e) => {
-                tracing::error!("space_render_elements failed: {:?}", e);
-                Vec::new()
-            }
-        };
+    let window_elements =
+        window_render_elements(&mut gpu.renderer, &data.state.space, &gpu.output, 1.0);
 
     let border_elements = data.state.border_elements();
     let cursor_elements = data.state.cursor_elements(&mut gpu.renderer);
@@ -342,54 +347,28 @@ fn render_frame(data: &mut UdevData) {
     // Render layer-shell surfaces (waybar, beebar, etc.) at the correct Z-order.
     // Clone output so we can borrow it for layer_map while also using gpu.renderer.
     let output = gpu.output.clone();
-    let scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
-    let layer_map = smithay::desktop::layer_map_for_output(&output);
+    let fullscreen_active = data.state.fullscreen_window.is_some();
 
-    // Background + Bottom layers render *behind* windows.
-    let mut layers_below: Vec<OutputRenderElement> = Vec::new();
-    for layer in layer_map
-        .layers_on(WlrLayer::Background)
-        .chain(layer_map.layers_on(WlrLayer::Bottom))
-    {
-        if let Some(geo) = layer_map.layer_geometry(layer) {
-            let location = geo.loc.to_physical_precise_round(scale);
-            let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                layer.render_elements(&mut gpu.renderer, location, scale, 1.0);
-            for elem in elems {
-                layers_below.push(OutputRenderElement::Space(Box::new(
-                    SpaceRenderElements::Surface(elem),
-                )));
-            }
-        }
-    }
+    let layers_below = layer_render_elements(
+        &mut gpu.renderer,
+        &output,
+        layers_rendered_below_windows(fullscreen_active),
+        1.0,
+    );
+    let layers_above = layer_render_elements(
+        &mut gpu.renderer,
+        &output,
+        layers_rendered_above_windows(fullscreen_active),
+        1.0,
+    );
 
-    // Top + Overlay layers render *above* windows (but below cursor).
-    let mut layers_above: Vec<OutputRenderElement> = Vec::new();
-    for layer in layer_map
-        .layers_on(WlrLayer::Top)
-        .chain(layer_map.layers_on(WlrLayer::Overlay))
-    {
-        if let Some(geo) = layer_map.layer_geometry(layer) {
-            let location = geo.loc.to_physical_precise_round(scale);
-            let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                layer.render_elements(&mut gpu.renderer, location, scale, 1.0);
-            for elem in elems {
-                layers_above.push(OutputRenderElement::Space(Box::new(
-                    SpaceRenderElements::Surface(elem),
-                )));
-            }
-        }
-    }
-    drop(layer_map);
-
-    // Build final element list front-to-back (first = topmost):
-    //   cursor > overlay/top > borders > windows > bottom/background
+    // Build final element list front-to-back (first = topmost).
     let mut elements: Vec<OutputRenderElement> = Vec::new();
     elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));
-    elements.extend(layers_above);
+    elements.extend(layers_above.into_iter().map(OutputRenderElement::from));
     elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
-    elements.extend(space_elements.into_iter().map(OutputRenderElement::from));
-    elements.extend(layers_below);
+    elements.extend(window_elements.into_iter().map(OutputRenderElement::from));
+    elements.extend(layers_below.into_iter().map(OutputRenderElement::from));
 
     let gpu = data.gpu.as_mut().unwrap();
 

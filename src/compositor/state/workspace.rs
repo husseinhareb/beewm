@@ -4,7 +4,7 @@ use smithay::utils::{Point, Size};
 
 use crate::model::window::Geometry;
 
-use super::{Beewm, root_surface};
+use super::{root_surface, Beewm};
 
 impl Beewm {
     /// Toggle the floating state of the currently focused window.
@@ -56,6 +56,85 @@ impl Beewm {
             self.relayout();
             self.needs_render = true;
         }
+    }
+
+    /// Swap two tiled windows within a workspace.
+    pub fn swap_tiled_windows(
+        &mut self,
+        workspace_idx: usize,
+        first_surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        second_surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> bool {
+        if workspace_idx >= self.workspace_windows.len() {
+            return false;
+        }
+
+        let first_root = root_surface(first_surface);
+        let second_root = root_surface(second_surface);
+        if first_root == second_root
+            || self.is_root_floating(&first_root)
+            || self.is_root_floating(&second_root)
+            || self.is_root_fullscreen(&first_root)
+            || self.is_root_fullscreen(&second_root)
+        {
+            return false;
+        }
+
+        if self.config.layout == crate::config::LayoutKind::Dwindle
+            && !self.dwindle_trees[workspace_idx].swap(&first_root, &second_root)
+        {
+            return false;
+        }
+
+        let Some(first_idx) = self.window_index_for_surface(workspace_idx, &first_root) else {
+            return false;
+        };
+        let Some(second_idx) = self.window_index_for_surface(workspace_idx, &second_root) else {
+            return false;
+        };
+
+        self.workspace_windows[workspace_idx].swap(first_idx, second_idx);
+        self.workspaces[workspace_idx].swap_windows(first_idx, second_idx);
+
+        if workspace_idx == self.active_workspace {
+            self.relayout();
+        } else {
+            self.needs_render = true;
+        }
+
+        true
+    }
+
+    /// Float a newly-mapped window centered on the screen using its own
+    /// natural size. Called at map time for transient/dialog windows that
+    /// should not participate in tiling.
+    pub fn map_as_floating_centered(&mut self, window: &Window) {
+        let root = match window.toplevel().map(|t| root_surface(t.wl_surface())) {
+            Some(r) => r,
+            None => return,
+        };
+        let output = match self.space.outputs().next().cloned() {
+            Some(o) => o,
+            None => return,
+        };
+        let output_geo = self.space.output_geometry(&output).unwrap();
+        let win_size = window.geometry().size;
+        let win_w = if win_size.w > 0 {
+            win_size.w
+        } else {
+            output_geo.size.w / 2
+        };
+        let win_h = if win_size.h > 0 {
+            win_size.h
+        } else {
+            output_geo.size.h / 2
+        };
+        let pos = Point::from((
+            output_geo.loc.x + (output_geo.size.w - win_w) / 2,
+            output_geo.loc.y + (output_geo.size.h - win_h) / 2,
+        ));
+        self.floating_windows.insert(root, pos);
+        self.space.map_element(window.clone(), pos, true);
     }
 
     /// Re-place all floating windows on the active workspace back into the

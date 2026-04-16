@@ -4,20 +4,22 @@ use smithay::backend::input::{
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::session::Session;
-use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
+use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, SERIAL_COUNTER, Size};
+use smithay::utils::{Logical, Point, Size, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
 };
 
 use super::commands::spawn_shell_command;
+use super::layering::{layers_hit_tested_after_windows, layers_hit_tested_before_windows};
 use super::state::{
     Beewm, MoveGrab, ResizeEdges, ResizeGrab, ResizeHorizontalEdge, ResizeVerticalEdge,
+    TiledSwapGrab,
 };
 
 const BTN_LEFT: u32 = 0x110;
@@ -203,11 +205,10 @@ fn surface_under(
         .next()
         .cloned()
         .or_else(|| state.space.outputs().next().cloned())?;
+    let fullscreen_active = state.fullscreen_window.is_some();
 
-    // Hit-test in z-order: Overlay and Top sit above windows, Bottom and
-    // Background sit below.  Checking Background/Bottom before windows caused
-    // full-screen background layer surfaces (e.g. wallpaper daemons) to absorb
-    // every pointer event, making windows unclickable.
+    // Hit-test in z-order. Fullscreen windows suppress layer-shell hit-testing
+    // so bars cannot steal pointer events while visually behind the client.
     let layer_hit = |layer: WlrLayer| -> Option<(
         WlSurface,
         smithay::utils::Point<f64, smithay::utils::Logical>,
@@ -220,17 +221,13 @@ fn surface_under(
         Some((surface, layer_geometry.loc.to_f64() + surface_loc.to_f64()))
     };
 
-    // 1. Overlay (topmost)
-    if let Some(hit) = layer_hit(WlrLayer::Overlay) {
-        return Some(hit);
+    for &layer in layers_hit_tested_before_windows(fullscreen_active) {
+        if let Some(hit) = layer_hit(layer) {
+            return Some(hit);
+        }
     }
 
-    // 2. Top layer (panels, bars)
-    if let Some(hit) = layer_hit(WlrLayer::Top) {
-        return Some(hit);
-    }
-
-    // 3. Regular windows
+    // Regular windows
     if let Some(hit) = state.space.element_under(pos).and_then(|(window, loc)| {
         let local = pos - loc.to_f64();
         window
@@ -240,13 +237,13 @@ fn surface_under(
         return Some(hit);
     }
 
-    // 4. Bottom layer
-    if let Some(hit) = layer_hit(WlrLayer::Bottom) {
-        return Some(hit);
+    for &layer in layers_hit_tested_after_windows(fullscreen_active) {
+        if let Some(hit) = layer_hit(layer) {
+            return Some(hit);
+        }
     }
 
-    // 5. Background layer (wallpapers — rarely receive pointer events)
-    layer_hit(WlrLayer::Background)
+    None
 }
 
 fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
@@ -287,7 +284,7 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     state.pointer_location = new_pos;
     state.needs_render = true;
 
-    if handle_active_floating_grab(state, new_pos) {
+    if handle_active_grab(state, new_pos) {
         return;
     }
 
@@ -352,7 +349,7 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
     state.pointer_location = pos;
     state.needs_render = true;
 
-    if handle_active_floating_grab(state, pos) {
+    if handle_active_grab(state, pos) {
         return;
     }
 
@@ -401,6 +398,9 @@ fn handle_pointer_button<I: InputBackend>(state: &mut Beewm, event: I::PointerBu
         if try_start_move_grab(state) {
             return;
         }
+        if try_start_tiled_swap_grab(state) {
+            return;
+        }
     }
 
     // LMB release → end move grab.
@@ -409,6 +409,9 @@ fn handle_pointer_button<I: InputBackend>(state: &mut Beewm, event: I::PointerBu
             // Grab ended; restore compositor cursor (was Grabbing during drag).
             state.refresh_compositor_cursor();
             // Don't forward the release to the client.
+            return;
+        }
+        if finish_tiled_swap_grab(state) {
             return;
         }
     }
@@ -482,7 +485,7 @@ fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxis
     pointer.frame(state);
 }
 
-fn handle_active_floating_grab(state: &mut Beewm, pointer: Point<f64, Logical>) -> bool {
+fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>) -> bool {
     if let Some(grab) = state.move_grab.clone() {
         apply_move_grab(state, &grab, pointer);
         return true;
@@ -490,6 +493,11 @@ fn handle_active_floating_grab(state: &mut Beewm, pointer: Point<f64, Logical>) 
 
     if let Some(grab) = state.resize_grab.clone() {
         apply_resize_grab(state, &grab, pointer);
+        return true;
+    }
+
+    if state.tiled_swap_grab.is_some() {
+        update_tiled_swap_target(state);
         return true;
     }
 
@@ -551,6 +559,22 @@ fn try_start_move_grab(state: &mut Beewm) -> bool {
     true
 }
 
+fn try_start_tiled_swap_grab(state: &mut Beewm) -> bool {
+    let Some(window) = tiled_window_under_pointer_with_logo(state) else {
+        return false;
+    };
+
+    focus_and_raise_window(state, &window);
+    state.tiled_swap_grab = Some(TiledSwapGrab {
+        window,
+        workspace_idx: state.active_workspace,
+    });
+    state.tiled_swap_target = None;
+    state.invalidate_borders();
+    state.refresh_compositor_cursor();
+    true
+}
+
 fn try_start_resize_grab(state: &mut Beewm) -> bool {
     let Some(window) = floating_window_under_pointer_with_logo(state) else {
         return false;
@@ -582,6 +606,55 @@ fn try_start_resize_grab(state: &mut Beewm) -> bool {
     });
     state.refresh_compositor_cursor();
     true
+}
+
+fn finish_tiled_swap_grab(state: &mut Beewm) -> bool {
+    let Some(grab) = state.tiled_swap_grab.take() else {
+        return false;
+    };
+
+    let Some(source_root) = Beewm::window_root_surface(&grab.window) else {
+        state.tiled_swap_target = None;
+        state.invalidate_borders();
+        state.refresh_compositor_cursor();
+        return true;
+    };
+
+    let target_root = state.tiled_swap_target.take();
+    if let Some(target_root) = target_root {
+        state.swap_tiled_windows(grab.workspace_idx, &source_root, &target_root);
+    }
+
+    state.invalidate_borders();
+    state.refresh_compositor_cursor();
+    true
+}
+
+fn update_tiled_swap_target(state: &mut Beewm) {
+    let new_target = candidate_tiled_swap_target(state);
+    if state.tiled_swap_target != new_target {
+        state.tiled_swap_target = new_target;
+        state.invalidate_borders();
+    }
+}
+
+fn candidate_tiled_swap_target(state: &Beewm) -> Option<WlSurface> {
+    let grab = state.tiled_swap_grab.as_ref()?;
+    let source_root = Beewm::window_root_surface(&grab.window)?;
+    let (surface, _) = surface_under(state, state.pointer_location)?;
+    let window = state.mapped_window_for_surface(&surface)?;
+    let target_root = Beewm::window_root_surface(&window)?;
+    if target_root == source_root
+        || state.is_root_floating(&target_root)
+        || state.is_root_fullscreen(&target_root)
+        || state
+            .window_index_for_surface(grab.workspace_idx, &target_root)
+            .is_none()
+    {
+        None
+    } else {
+        Some(target_root)
+    }
 }
 
 fn finish_resize_grab(state: &mut Beewm) -> bool {
@@ -621,6 +694,19 @@ fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<smithay:
     let window = state.mapped_window_for_surface(&surface)?;
     let root = Beewm::window_root_surface(&window)?;
     state.floating_windows.contains_key(&root).then_some(window)
+}
+
+fn tiled_window_under_pointer_with_logo(state: &mut Beewm) -> Option<smithay::desktop::Window> {
+    let keyboard = state.seat.get_keyboard().unwrap();
+    let modifiers = keyboard.modifier_state();
+    if !modifiers.logo {
+        return None;
+    }
+
+    let (surface, _) = surface_under(state, state.pointer_location)?;
+    let window = state.mapped_window_for_surface(&surface)?;
+    let root = Beewm::window_root_surface(&window)?;
+    (!state.is_root_floating(&root) && !state.is_root_fullscreen(&root)).then_some(window)
 }
 
 fn focus_and_raise_window(state: &mut Beewm, window: &smithay::desktop::Window) {
@@ -714,8 +800,8 @@ fn resized_window_geometry_from_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge, resize_edges_for_pointer,
-        resized_window_geometry_from_start,
+        resize_edges_for_pointer, resized_window_geometry_from_start, ResizeEdges,
+        ResizeHorizontalEdge, ResizeVerticalEdge,
     };
     use smithay::utils::{Logical, Point, Size};
 

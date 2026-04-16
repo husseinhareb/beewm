@@ -6,7 +6,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::config::LayoutKind;
 use crate::model::window::Geometry;
 
-use super::{Beewm, root_surface};
+use super::{root_surface, Beewm};
 
 #[derive(Debug, Clone, Copy)]
 enum SplitAxis {
@@ -54,6 +54,23 @@ impl<T: Clone + Eq> DwindleTree<T> {
 
     pub(crate) fn remove(&mut self, target: &T) {
         self.root = self.root.take().and_then(|root| root.remove(target));
+    }
+
+    pub(crate) fn swap(&mut self, first: &T, second: &T) -> bool {
+        if first == second {
+            return false;
+        }
+
+        let Some(root) = self.root.as_mut() else {
+            return false;
+        };
+
+        if !root.contains(first) || !root.contains(second) {
+            return false;
+        }
+
+        root.swap(first, second);
+        true
     }
 
     pub(crate) fn geometries(&self, screen: &Geometry, split_ratio: f64) -> Vec<(T, Geometry)> {
@@ -124,6 +141,22 @@ impl<T: Clone + Eq> DwindleNode<T> {
                     (None, Some(second)) => Some(second),
                     (None, None) => None,
                 }
+            }
+        }
+    }
+
+    fn swap(&mut self, first: &T, second: &T) {
+        match self {
+            Self::Leaf(window) if *window == *first => *window = second.clone(),
+            Self::Leaf(window) if *window == *second => *window = first.clone(),
+            Self::Leaf(_) => {}
+            Self::Split {
+                first: a,
+                second: b,
+                ..
+            } => {
+                a.swap(first, second);
+                b.swap(first, second);
             }
         }
     }
@@ -304,5 +337,22 @@ mod tests {
         assert_eq!(geometries[&2], Geometry::new(50, 0, 50, 50));
         assert_eq!(geometries[&3], Geometry::new(0, 50, 50, 50));
         assert_eq!(geometries[&4], Geometry::new(50, 50, 50, 50));
+    }
+
+    #[test]
+    fn swapping_two_leaves_exchanges_their_geometries() {
+        let mut tree = DwindleTree::default();
+        let screen = Geometry::new(0, 0, 100, 100);
+
+        tree.insert(None, 1);
+        tree.insert(Some(&1), 2);
+        tree.insert(Some(&1), 3);
+        assert!(tree.swap(&1, &2));
+
+        let geometries = geometry_map(tree.geometries(&screen, 0.5));
+
+        assert_eq!(geometries[&1], Geometry::new(50, 0, 50, 100));
+        assert_eq!(geometries[&2], Geometry::new(0, 0, 50, 50));
+        assert_eq!(geometries[&3], Geometry::new(0, 50, 50, 50));
     }
 }

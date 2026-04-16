@@ -3,6 +3,8 @@ mod parser;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_WORKSPACE_KEYS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+
 /// A keybinding definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keybind {
@@ -68,7 +70,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let num_workspaces = 9;
+        let num_workspaces = 10;
         Self {
             layout: LayoutKind::Dwindle,
             split_ratio: 0.50,
@@ -163,19 +165,29 @@ impl Config {
             },
         ];
 
-        for workspace in 1..=num_workspaces.min(9) {
+        for (index, key) in DEFAULT_WORKSPACE_KEYS
+            .iter()
+            .copied()
+            .enumerate()
+            .take(num_workspaces.min(DEFAULT_WORKSPACE_KEYS.len()))
+        {
             binds.push(Keybind {
                 modifiers: vec!["mod4".into()],
-                key: workspace.to_string(),
-                action: Action::SwitchWorkspace(workspace - 1),
+                key: key.into(),
+                action: Action::SwitchWorkspace(index),
             });
         }
 
-        for workspace in 1..=num_workspaces.min(9) {
+        for (index, key) in DEFAULT_WORKSPACE_KEYS
+            .iter()
+            .copied()
+            .enumerate()
+            .take(num_workspaces.min(DEFAULT_WORKSPACE_KEYS.len()))
+        {
             binds.push(Keybind {
                 modifiers: vec!["mod4".into(), "shift".into()],
-                key: workspace.to_string(),
-                action: Action::MoveToWorkspace(workspace - 1),
+                key: key.into(),
+                action: Action::MoveToWorkspace(index),
             });
         }
 
@@ -247,16 +259,24 @@ impl Config {
         text.push_str("bindsym $mod+Shift+e exit\n");
         text.push_str("bindsym $mod+f fullscreen\n");
         text.push_str("bindsym $mod+v float\n");
-        for workspace in 1..=default.num_workspaces.min(9) {
-            text.push_str(&format!(
-                "bindsym $mod+{} workspace {}\n",
-                workspace, workspace
-            ));
+        for (index, key) in DEFAULT_WORKSPACE_KEYS
+            .iter()
+            .copied()
+            .enumerate()
+            .take(default.num_workspaces.min(DEFAULT_WORKSPACE_KEYS.len()))
+        {
+            text.push_str(&format!("bindsym $mod+{} workspace {}\n", key, index + 1));
         }
-        for workspace in 1..=default.num_workspaces.min(9) {
+        for (index, key) in DEFAULT_WORKSPACE_KEYS
+            .iter()
+            .copied()
+            .enumerate()
+            .take(default.num_workspaces.min(DEFAULT_WORKSPACE_KEYS.len()))
+        {
             text.push_str(&format!(
                 "bindsym $mod+Shift+{} move_to_workspace {}\n",
-                workspace, workspace
+                key,
+                index + 1
             ));
         }
         text

@@ -7,9 +7,9 @@ mod workspace;
 use std::collections::HashMap;
 use std::fs;
 
-use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::sync::Fence;
+use smithay::backend::renderer::Color32F;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::xkb;
@@ -20,8 +20,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Clock, Logical, Monotonic, Point, Size};
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
-    with_states,
+    add_blocker, add_pre_commit_hook, get_parent, with_states, CompositorClientState,
+    CompositorState,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -32,16 +32,16 @@ use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
-use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::config::{Action, Config, Keybind, LayoutKind};
-use crate::layout::Layout;
 use crate::layout::dwindle::Dwindle;
 use crate::layout::master_stack::MasterStack;
+use crate::layout::Layout;
 use crate::model::workspace::Workspace;
 
 use self::tiling::DwindleTree;
@@ -75,6 +75,15 @@ pub struct MoveGrab {
     pub start_pointer: Point<f64, Logical>,
     /// Window position when the grab started.
     pub start_window_pos: Point<i32, Logical>,
+}
+
+/// State for an in-progress tiled-window swap grab (Super + LMB drag).
+#[derive(Debug, Clone)]
+pub struct TiledSwapGrab {
+    /// The tiled window being dragged.
+    pub window: Window,
+    /// Workspace that owns the dragged tiled window.
+    pub workspace_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +185,7 @@ pub struct Beewm {
     pub pending_windows: Vec<Window>,
     /// Root wl_surface -> mapped window lookup for commit-time surface routing.
     pub window_lookup: HashMap<WlSurface, Window>,
-    /// Pre-allocated stable IDs for border elements (4 per window slot).
+    /// Pre-allocated stable IDs for border element fragments.
     /// Reused across frames so the DRM damage tracker sees unchanged geometry.
     pub border_ids: Vec<Id>,
     /// Global commit version for border elements; bumped whenever focus visuals change.
@@ -192,6 +201,10 @@ pub struct Beewm {
     pub floating_windows: HashMap<WlSurface, Point<i32, Logical>>,
     /// Active floating-window move grab (Super + left-click drag).
     pub move_grab: Option<MoveGrab>,
+    /// Active tiled-window swap grab (Super + left-click drag).
+    pub tiled_swap_grab: Option<TiledSwapGrab>,
+    /// Current tiled-window swap drop target, if the pointer is over one.
+    pub tiled_swap_target: Option<WlSurface>,
     /// Active floating-window resize grab (Super + right-click drag).
     pub resize_grab: Option<ResizeGrab>,
     /// Pre-resolved keybindings (no per-keypress string allocs).
@@ -285,6 +298,8 @@ impl Beewm {
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
             move_grab: None,
+            tiled_swap_grab: None,
+            tiled_swap_target: None,
             resize_grab: None,
             resolved_keybinds,
             border_color_focused,

@@ -27,6 +27,26 @@ impl Workspace {
         }
     }
 
+    pub fn swap_windows(&mut self, first_idx: usize, second_idx: usize) {
+        if self.window_count == 0
+            || first_idx >= self.window_count
+            || second_idx >= self.window_count
+            || first_idx == second_idx
+        {
+            return;
+        }
+
+        if let Some(focused_idx) = self.focused_idx {
+            self.focused_idx = Some(if focused_idx == first_idx {
+                second_idx
+            } else if focused_idx == second_idx {
+                first_idx
+            } else {
+                focused_idx
+            });
+        }
+    }
+
     pub fn focus_next(&mut self) {
         if self.window_count == 0 {
             return;

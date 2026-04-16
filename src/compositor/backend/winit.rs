@@ -5,28 +5,166 @@ use crate::config::Config;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::glow::GlowRenderer;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::gles::GlesError;
+use smithay::backend::renderer::glow::{GlowFrame, GlowRenderer};
+use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction};
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::Transform;
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
+use crate::compositor::commands::{spawn_startup_commands, ChildEnvironment};
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
 };
+use crate::compositor::ipc;
+use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
+use crate::compositor::render::{layer_render_elements, window_render_elements};
 use crate::compositor::state::{Beewm, ClientState};
 
 struct WinitData {
     state: Beewm,
     display: Display<Beewm>,
     presentation_sequence: u64,
+}
+
+enum WinitRenderElement {
+    Surface(Box<WaylandSurfaceRenderElement<GlowRenderer>>),
+    Border(SolidColorRenderElement),
+}
+
+impl From<WaylandSurfaceRenderElement<GlowRenderer>> for WinitRenderElement {
+    fn from(value: WaylandSurfaceRenderElement<GlowRenderer>) -> Self {
+        Self::Surface(Box::new(value))
+    }
+}
+
+impl From<SolidColorRenderElement> for WinitRenderElement {
+    fn from(value: SolidColorRenderElement) -> Self {
+        Self::Border(value)
+    }
+}
+
+impl Element for WinitRenderElement {
+    fn id(&self) -> &Id {
+        match self {
+            Self::Surface(element) => element.id(),
+            Self::Border(element) => element.id(),
+        }
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        match self {
+            Self::Surface(element) => element.current_commit(),
+            Self::Border(element) => element.current_commit(),
+        }
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        match self {
+            Self::Surface(element) => element.location(scale),
+            Self::Border(element) => element.location(scale),
+        }
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        match self {
+            Self::Surface(element) => element.src(),
+            Self::Border(element) => element.src(),
+        }
+    }
+
+    fn transform(&self) -> Transform {
+        match self {
+            Self::Surface(element) => element.transform(),
+            Self::Border(element) => element.transform(),
+        }
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        match self {
+            Self::Surface(element) => element.geometry(scale),
+            Self::Border(element) => element.geometry(scale),
+        }
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        match self {
+            Self::Surface(element) => element.damage_since(scale, commit),
+            Self::Border(element) => element.damage_since(scale, commit),
+        }
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        match self {
+            Self::Surface(element) => element.opaque_regions(scale),
+            Self::Border(element) => element.opaque_regions(scale),
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        match self {
+            Self::Surface(element) => element.alpha(),
+            Self::Border(element) => element.alpha(),
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Surface(element) => element.kind(),
+            Self::Border(element) => element.kind(),
+        }
+    }
+}
+
+impl RenderElement<GlowRenderer> for WinitRenderElement {
+    fn draw(
+        &self,
+        frame: &mut GlowFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        match self {
+            Self::Surface(element) => RenderElement::<GlowRenderer>::draw(
+                element.as_ref(),
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
+            Self::Border(element) => RenderElement::<GlowRenderer>::draw(
+                element,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
+        }
+    }
+
+    fn underlying_storage(&self, renderer: &mut GlowRenderer) -> Option<UnderlyingStorage<'_>> {
+        match self {
+            Self::Surface(element) => element.as_ref().underlying_storage(renderer),
+            Self::Border(element) => element.underlying_storage(renderer),
+        }
+    }
 }
 
 /// Run the compositor using the winit backend (nested inside an existing session).
@@ -37,6 +175,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Beewm::new(&display, config);
     let display_fd = display.as_fd().try_clone_to_owned()?;
+    let (_ipc_server, ipc_channel) = ipc::start()?;
 
     let mut data = WinitData {
         state,
@@ -76,6 +215,15 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Ok(PostAction::Continue)
         },
     )?;
+
+    event_loop
+        .handle()
+        .insert_source(ipc_channel, |event, _, data| match event {
+            ChannelEvent::Msg(command) => ipc::apply_command(&mut data.state, command),
+            ChannelEvent::Closed => {
+                tracing::warn!("Workspace IPC channel closed");
+            }
+        })?;
 
     // Initialize winit backend
     let (mut winit_backend, winit_evt) = winit::init::<GlowRenderer>()?;
@@ -157,20 +305,33 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                 let render_result = match winit_backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
-                        Some(smithay::desktop::space::render_output::<
-                            _,
-                            SolidColorRenderElement,
-                            _,
-                            _,
-                        >(
+                        let fullscreen_active = data.state.fullscreen_window.is_some();
+                        let window_elements =
+                            window_render_elements(renderer, &data.state.space, output, 1.0);
+                        let layers_above = layer_render_elements(
+                            renderer,
                             output,
+                            layers_rendered_above_windows(fullscreen_active),
+                            1.0,
+                        );
+                        let layers_below = layer_render_elements(
+                            renderer,
+                            output,
+                            layers_rendered_below_windows(fullscreen_active),
+                            1.0,
+                        );
+
+                        let mut elements: Vec<WinitRenderElement> = Vec::new();
+                        elements.extend(layers_above.into_iter().map(WinitRenderElement::from));
+                        elements.extend(border_elements.into_iter().map(WinitRenderElement::from));
+                        elements.extend(window_elements.into_iter().map(WinitRenderElement::from));
+                        elements.extend(layers_below.into_iter().map(WinitRenderElement::from));
+
+                        Some(damage_tracker.render_output(
                             renderer,
                             &mut framebuffer,
-                            1.0,
                             0,
-                            [&data.state.space],
-                            &border_elements,
-                            &mut damage_tracker,
+                            &elements,
                             [0.1, 0.1, 0.1, 1.0],
                         ))
                     }

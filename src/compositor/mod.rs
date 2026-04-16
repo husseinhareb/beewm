@@ -4,6 +4,8 @@ mod cursor;
 mod feedback;
 mod handlers;
 mod input;
+mod ipc;
+mod layering;
 mod render;
 mod state;
 

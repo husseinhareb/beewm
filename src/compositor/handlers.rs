@@ -53,8 +53,31 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::utils::Size;
 
 use super::state::{Beewm, ClientState};
+
+fn is_fixed_size(size: Size<i32, smithay::utils::Logical>) -> bool {
+    size.w > 0 && size.h > 0
+}
+
+fn should_map_toplevel_floating(window: &Window) -> bool {
+    let Some(toplevel) = window.toplevel() else {
+        return false;
+    };
+
+    if toplevel.parent().is_some() {
+        return true;
+    }
+
+    smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+        let mut cached = states
+            .cached_state
+            .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+        let current = *cached.current();
+        is_fixed_size(current.min_size) && current.min_size == current.max_size
+    })
+}
 
 impl CompositorHandler for Beewm {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -85,14 +108,22 @@ impl CompositorHandler for Beewm {
         }) {
             let window = self.pending_windows.remove(pos);
             let ws_idx = self.active_workspace;
+            // Dialogs and fixed-size splash/loading windows should float
+            // centered instead of being tiled or inheriting a (0, 0) origin.
+            let should_float = should_map_toplevel_floating(&window);
             let split_target = self.focused_tiled_window_root(ws_idx);
             self.workspace_windows[ws_idx].push(window.clone());
             self.workspaces[ws_idx].add_window();
             self.track_window(&window);
-            self.insert_tiled_window(ws_idx, &window, split_target.as_ref());
             // Propagate the first commit through the window's surface tree.
             window.on_commit();
-            self.relayout();
+            if should_float {
+                self.map_as_floating_centered(&window);
+                self.relayout();
+            } else {
+                self.insert_tiled_window(ws_idx, &window, split_target.as_ref());
+                self.relayout();
+            }
 
             // Focus the new window
             if let Some(toplevel) = window.toplevel() {
@@ -168,6 +199,24 @@ impl CompositorHandler for Beewm {
                 self.needs_render = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::{Logical, Size};
+
+    use super::is_fixed_size;
+
+    #[test]
+    fn zero_size_is_not_treated_as_fixed() {
+        assert!(!is_fixed_size(Size::<i32, Logical>::from((0, 480))));
+        assert!(!is_fixed_size(Size::<i32, Logical>::from((640, 0))));
+    }
+
+    #[test]
+    fn non_zero_size_can_be_treated_as_fixed() {
+        assert!(is_fixed_size(Size::<i32, Logical>::from((640, 480))));
     }
 }
 

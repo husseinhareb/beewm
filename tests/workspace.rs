@@ -79,6 +79,32 @@ fn removing_a_window_after_focus_keeps_focus_on_the_same_index() {
 }
 
 #[test]
+fn swapping_windows_moves_focus_with_the_focused_window() {
+    let mut workspace = Workspace::default();
+    for _ in 0..4 {
+        workspace.add_window();
+    }
+    workspace.focused_idx = Some(1);
+
+    workspace.swap_windows(1, 3);
+
+    assert_eq!(workspace.focused_idx, Some(3));
+}
+
+#[test]
+fn swapping_windows_is_a_noop_for_out_of_bounds_indices() {
+    let mut workspace = Workspace::default();
+    for _ in 0..2 {
+        workspace.add_window();
+    }
+    workspace.focused_idx = Some(1);
+
+    workspace.swap_windows(1, 4);
+
+    assert_eq!(workspace.focused_idx, Some(1));
+}
+
+#[test]
 fn focus_navigation_wraps_in_both_directions() {
     let mut workspace = Workspace::default();
     for _ in 0..3 {

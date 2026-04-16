@@ -3,9 +3,14 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::seat::WaylandFocus;
 
-use super::{Beewm, root_surface};
+use super::{root_surface, Beewm};
 
 impl Beewm {
+    pub fn invalidate_borders(&mut self) {
+        self.border_commit_serial = self.border_commit_serial.wrapping_add(1);
+        self.needs_render = true;
+    }
+
     pub fn window_index_for_surface(
         &self,
         workspace_idx: usize,
@@ -57,8 +62,7 @@ impl Beewm {
             }
         }
 
-        self.border_commit_serial = self.border_commit_serial.wrapping_add(1);
-        self.needs_render = true;
+        self.invalidate_borders();
     }
 
     pub fn set_keyboard_focus(&mut self, focused: Option<WlSurface>) {

@@ -81,7 +81,7 @@ fn fills_default_keybinds_for_custom_workspace_count() {
 }
 
 #[test]
-fn default_keybinds_are_capped_to_single_digit_workspaces() {
+fn default_keybinds_include_zero_for_workspace_ten() {
     let config = Config::parse("workspaces 12\n").unwrap();
 
     let switch_bind_count = config
@@ -95,19 +95,31 @@ fn default_keybinds_are_capped_to_single_digit_workspaces() {
         .filter(|bind| matches!(bind.action, Action::MoveToWorkspace(_)))
         .count();
 
-    assert_eq!(switch_bind_count, 9);
-    assert_eq!(move_bind_count, 9);
+    assert_eq!(switch_bind_count, 10);
+    assert_eq!(move_bind_count, 10);
     assert!(
         config
             .keybinds
             .iter()
-            .all(|bind| !matches!(bind.action, Action::SwitchWorkspace(index) if index >= 9))
+            .any(|bind| { bind.key == "0" && matches!(bind.action, Action::SwitchWorkspace(9)) })
     );
     assert!(
         config
             .keybinds
             .iter()
-            .all(|bind| !matches!(bind.action, Action::MoveToWorkspace(index) if index >= 9))
+            .any(|bind| { bind.key == "0" && matches!(bind.action, Action::MoveToWorkspace(9)) })
+    );
+    assert!(
+        config
+            .keybinds
+            .iter()
+            .all(|bind| !matches!(bind.action, Action::SwitchWorkspace(index) if index >= 10))
+    );
+    assert!(
+        config
+            .keybinds
+            .iter()
+            .all(|bind| !matches!(bind.action, Action::MoveToWorkspace(index) if index >= 10))
     );
 }
 
@@ -209,9 +221,13 @@ fn writes_default_config_file_when_missing() {
     let written = std::fs::read_to_string(&path).unwrap();
 
     assert_eq!(config.layout, LayoutKind::Dwindle);
+    assert_eq!(config.num_workspaces, 10);
     assert!(written.contains("layout dwindle"));
+    assert!(written.contains("workspaces 10"));
     assert!(written.contains("# exec waybar"));
     assert!(written.contains("bindsym $mod+Return exec $terminal"));
+    assert!(written.contains("bindsym $mod+0 workspace 10"));
+    assert!(written.contains("bindsym $mod+Shift+0 move_to_workspace 10"));
 
     remove_dir_all_if_exists(&root);
 }
