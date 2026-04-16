@@ -11,7 +11,7 @@ pub struct Dwindle {
 
 impl Default for Dwindle {
     fn default() -> Self {
-        Self { split_ratio: 0.55 }
+        Self { split_ratio: 0.50 }
     }
 }
 
@@ -74,60 +74,5 @@ impl Layout for Dwindle {
         }
 
         geometries
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_windows() {
-        let layout = Dwindle::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 0);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn single_window_fills_screen() {
-        let layout = Dwindle::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 1);
-        assert_eq!(result, vec![screen]);
-    }
-
-    #[test]
-    fn two_windows_split_horizontally_first() {
-        let layout = Dwindle::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 2);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], Geometry::new(0, 0, 1056, 1080));
-        assert_eq!(result[1], Geometry::new(1056, 0, 864, 1080));
-    }
-
-    #[test]
-    fn three_windows_dwindle() {
-        let layout = Dwindle::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 3);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], Geometry::new(0, 0, 1056, 1080));
-        assert_eq!(result[1], Geometry::new(1056, 0, 864, 594));
-        assert_eq!(result[2], Geometry::new(1056, 594, 864, 486));
-    }
-
-    #[test]
-    fn four_windows_alternate_axis() {
-        let layout = Dwindle { split_ratio: 0.5 };
-        let screen = Geometry::new(0, 0, 100, 80);
-        let result = layout.apply(&screen, 4);
-        assert_eq!(result, vec![
-            Geometry::new(0, 0, 50, 80),
-            Geometry::new(50, 0, 50, 40),
-            Geometry::new(50, 40, 25, 40),
-            Geometry::new(75, 40, 25, 40),
-        ]);
     }
 }

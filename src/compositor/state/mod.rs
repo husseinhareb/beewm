@@ -1,0 +1,369 @@
+mod cursor;
+mod decorations;
+mod focus;
+mod workspace;
+
+use std::collections::HashMap;
+use std::fs;
+
+use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::sync::Fence;
+use smithay::backend::session::libseat::LibSeatSession;
+use smithay::desktop::{PopupManager, Space, Window};
+use smithay::input::keyboard::xkb;
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+use smithay::input::{Seat, SeatState};
+use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
+use smithay::utils::{Clock, Logical, Monotonic, Point};
+use smithay::wayland::compositor::{
+    add_blocker, add_pre_commit_hook, get_parent, with_states, CompositorClientState,
+    CompositorState,
+};
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::drm_syncobj::{DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjState};
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::viewporter::ViewporterState;
+
+use crate::config::{Action, Config, Keybind, LayoutKind};
+use crate::layout::dwindle::Dwindle;
+use crate::layout::master_stack::MasterStack;
+use crate::layout::Layout;
+use crate::model::workspace::Workspace;
+
+use super::cursor::CursorThemeManager;
+
+const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
+
+type SyncobjBlockerInstaller = dyn Fn(DrmSyncPointSource, Client);
+
+/// A keybinding pre-resolved at startup so the hot-path avoids string
+/// allocations and repeated `xkb::keysym_from_name` lookups.
+#[derive(Debug, Clone)]
+pub struct ResolvedKeybind {
+    pub logo: bool,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub keysym: xkb::Keysym,
+    pub action: Action,
+}
+
+/// State for an in-progress floating window move (Super + LMB drag).
+#[derive(Debug, Clone)]
+pub struct MoveGrab {
+    /// The window being moved.
+    pub window: Window,
+    /// Pointer position when the grab started.
+    pub start_pointer: Point<f64, Logical>,
+    /// Window position when the grab started.
+    pub start_window_pos: Point<i32, Logical>,
+}
+
+/// The main compositor state.
+pub struct Beewm {
+    pub running: bool,
+    pub config: Config,
+    pub start_time: std::time::Instant,
+    pub display_handle: DisplayHandle,
+
+    // Smithay protocol state
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub _xdg_decoration_state: XdgDecorationState,
+    pub layer_shell_state: WlrLayerShellState,
+    pub shm_state: ShmState,
+    pub _output_manager_state: OutputManagerState,
+    pub _viewporter_state: ViewporterState,
+    pub _fractional_scale_manager_state: FractionalScaleManagerState,
+    pub _single_pixel_buffer_state: SinglePixelBufferState,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub dmabuf_state: DmabufState,
+    pub _dmabuf_global: Option<DmabufGlobal>,
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
+    pub _presentation_state: PresentationState,
+    pub presentation_clock: Clock<Monotonic>,
+    pub seat_state: SeatState<Self>,
+    pub seat: Seat<Self>,
+
+    // Pointer
+    pub pointer_location: Point<f64, Logical>,
+    pub cursor_status_serial: u64,
+    pub cursor_status: CursorImageStatus,
+    pub cursor_theme: CursorThemeManager,
+    /// Cursor icon override set by the compositor (borders, move grab).
+    /// When `Some`, takes priority over the client-requested `cursor_status`.
+    pub compositor_cursor_icon: Option<CursorIcon>,
+    pub _cursor_shape_manager_state: CursorShapeManagerState,
+
+    // Session (for VT switching in TTY mode)
+    pub session: Option<LibSeatSession>,
+
+    // Desktop management
+    pub space: Space<Window>,
+    pub layout: Box<dyn Layout>,
+    pub workspaces: Vec<Workspace>,
+    pub workspace_windows: Vec<Vec<Window>>,
+    pub active_workspace: usize,
+    /// Windows that have been created but not yet committed their first buffer.
+    pub pending_windows: Vec<Window>,
+    /// Root wl_surface -> mapped window lookup for commit-time surface routing.
+    pub window_lookup: HashMap<WlSurface, Window>,
+    /// Pre-allocated stable IDs for border elements (4 per window slot).
+    /// Reused across frames so the DRM damage tracker sees unchanged geometry.
+    pub border_ids: Vec<Id>,
+    /// Global commit version for border elements; bumped whenever focus visuals change.
+    pub border_commit_serial: u64,
+    /// Set when visual state changed and a new frame should be rendered.
+    pub needs_render: bool,
+    /// The window currently occupying the full screen, if any.
+    pub fullscreen_window: Option<Window>,
+    /// Tracks popup surfaces and provides grab support.
+    pub popup_manager: PopupManager,
+    /// Floating windows (not subject to tiling) mapped to their last position.
+    /// The key is the root WlSurface; the value is where the window is placed.
+    pub floating_windows: HashMap<WlSurface, Point<i32, Logical>>,
+    /// Active floating-window move grab (Super + left-click drag).
+    pub move_grab: Option<MoveGrab>,
+    /// Pre-resolved keybindings (no per-keypress string allocs).
+    pub resolved_keybinds: Vec<ResolvedKeybind>,
+    /// Cached border colours derived from config (avoid per-frame conversion).
+    pub border_color_focused: Color32F,
+    pub border_color_unfocused: Color32F,
+    /// Installs acquire-fence event sources into the active backend loop.
+    pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
+    /// Remove inherited X11 env when spawning child processes from nested mode.
+    pub sanitize_display_for_children: bool,
+}
+
+impl Beewm {
+    pub fn new(display: &Display<Self>, config: Config) -> Self {
+        let display_handle = display.handle();
+
+        let compositor_state = CompositorState::new::<Self>(&display_handle);
+        let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
+        let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
+        let fractional_scale_manager_state =
+            FractionalScaleManagerState::new::<Self>(&display_handle);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        let dmabuf_state = DmabufState::new();
+        let presentation_clock = Clock::<Monotonic>::new();
+        let presentation_state =
+            PresentationState::new::<Self>(&display_handle, presentation_clock.id() as u32);
+        let mut seat_state = SeatState::new();
+        let mut seat = seat_state.new_wl_seat(&display_handle, "beewm");
+
+        // Initialize keyboard and pointer on the seat
+        seat.add_keyboard(Default::default(), 200, 25)
+            .expect("Failed to add keyboard");
+        seat.add_pointer();
+
+        let num_ws = config.num_workspaces;
+        let layout = build_layout(&config);
+        let resolved_keybinds = resolve_keybinds(&config.keybinds);
+        let border_color_focused = hex_to_color32f(config.border_color_focused);
+        let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
+        let cursor_shape_manager_state_ = CursorShapeManagerState::new::<Self>(&display_handle);
+
+        let state = Self {
+            running: true,
+            config,
+            start_time: std::time::Instant::now(),
+            display_handle: display_handle.clone(),
+            compositor_state,
+            xdg_shell_state,
+            _xdg_decoration_state: xdg_decoration_state,
+            layer_shell_state,
+            shm_state,
+            _output_manager_state: output_manager_state,
+            _viewporter_state: viewporter_state,
+            _fractional_scale_manager_state: fractional_scale_manager_state,
+            _single_pixel_buffer_state: single_pixel_buffer_state,
+            data_device_state,
+            primary_selection_state,
+            dmabuf_state,
+            _dmabuf_global: None,
+            drm_syncobj_state: None,
+            _presentation_state: presentation_state,
+            presentation_clock,
+            seat_state,
+            seat,
+            pointer_location: Point::from((0.0, 0.0)),
+            cursor_status_serial: 0,
+            cursor_status: CursorImageStatus::default_named(),
+            cursor_theme: CursorThemeManager::new(),
+            compositor_cursor_icon: None,
+            _cursor_shape_manager_state: cursor_shape_manager_state_,
+            session: None,
+            space: Space::default(),
+            layout,
+            workspaces: (0..num_ws).map(|_| Workspace::default()).collect(),
+            workspace_windows: (0..num_ws).map(|_| Vec::new()).collect(),
+            active_workspace: 0,
+            pending_windows: Vec::new(),
+            window_lookup: HashMap::new(),
+            border_ids: Vec::new(),
+            border_commit_serial: 0,
+            needs_render: true,
+            fullscreen_window: None,
+            popup_manager: PopupManager::default(),
+            floating_windows: HashMap::new(),
+            move_grab: None,
+            resolved_keybinds,
+            border_color_focused,
+            border_color_unfocused,
+            syncobj_blocker_installer: None,
+            sanitize_display_for_children: false,
+        };
+
+        state.publish_active_workspace_state();
+        state
+    }
+
+    pub fn install_syncobj_blocker_source(
+        &mut self,
+        installer: Box<SyncobjBlockerInstaller>,
+    ) {
+        self.syncobj_blocker_installer = Some(installer);
+    }
+
+    pub fn install_explicit_sync_hook(surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            let acquire_point = with_states(surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                cached.pending().acquire_point.clone()
+            });
+
+            let Some(acquire_point) = acquire_point else {
+                return;
+            };
+
+            if acquire_point.is_signaled() {
+                return;
+            }
+
+            let Some(client) = surface.client() else {
+                return;
+            };
+
+            let Some(installer) = state.syncobj_blocker_installer.as_ref() else {
+                return;
+            };
+
+            match acquire_point.generate_blocker() {
+                Ok((blocker, source)) => {
+                    add_blocker(surface, blocker);
+                    installer(source, client);
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to install explicit-sync blocker: {}", error);
+                }
+            }
+        });
+    }
+
+    fn publish_active_workspace_state(&self) {
+        let workspace = (self.active_workspace + 1).to_string();
+        if let Err(error) = fs::write(ACTIVE_WORKSPACE_STATE_PATH, workspace) {
+            tracing::warn!(
+                "Failed to publish active workspace to {}: {}",
+                ACTIVE_WORKSPACE_STATE_PATH,
+                error
+            );
+        }
+    }
+}
+
+fn build_layout(config: &Config) -> Box<dyn Layout> {
+    match config.layout {
+        LayoutKind::Dwindle => Box::new(Dwindle {
+            split_ratio: config.split_ratio,
+        }),
+        LayoutKind::MasterStack => Box::new(MasterStack {
+            master_ratio: config.split_ratio,
+        }),
+    }
+}
+
+/// Convert a 0xRRGGBB hex color to smithay's Color32F (with alpha=1.0).
+fn hex_to_color32f(hex: u32) -> Color32F {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    Color32F::new(r, g, b, 1.0)
+}
+
+pub(super) fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+    root
+}
+
+/// Pre-resolve keybinds so the hot-path is a simple integer comparison.
+fn resolve_keybinds(keybinds: &[Keybind]) -> Vec<ResolvedKeybind> {
+    keybinds
+        .iter()
+        .map(|bind| {
+            let mut logo = false;
+            let mut shift = false;
+            let mut ctrl = false;
+            let mut alt = false;
+            for m in &bind.modifiers {
+                match m.to_lowercase().as_str() {
+                    "super" | "mod4" | "logo" => logo = true,
+                    "shift" => shift = true,
+                    "ctrl" | "control" => ctrl = true,
+                    "alt" | "mod1" => alt = true,
+                    _ => {}
+                }
+            }
+            let keysym = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_CASE_INSENSITIVE);
+            ResolvedKeybind {
+                logo,
+                shift,
+                ctrl,
+                alt,
+                keysym,
+                action: bind.action.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Per-client state required by smithay.
+#[derive(Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
+}
+
+impl ClientData for ClientState {
+    fn initialized(&self, _client_id: smithay::reexports::wayland_server::backend::ClientId) {}
+
+    fn disconnected(
+        &self,
+        _client_id: smithay::reexports::wayland_server::backend::ClientId,
+        _reason: smithay::reexports::wayland_server::backend::DisconnectReason,
+    ) {
+    }
+}

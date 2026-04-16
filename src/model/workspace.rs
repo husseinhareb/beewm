@@ -6,10 +6,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn add_window(&mut self) {
         self.focused_idx = Some(self.window_count);
         self.window_count += 1;

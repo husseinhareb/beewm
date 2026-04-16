@@ -1,15 +1,15 @@
-use beewm_core::config::Config;
+use beewm::{config::Config, run_udev, run_winit};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // When running from a bare TTY (DRM backend) stdout/stderr aren't visible,
     // so write logs to /tmp/beewm.log for post-hoc debugging.
-    let has_display_early = std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("DISPLAY").is_some();
+    let has_display =
+        std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
 
-    if has_display_early {
+    if has_display {
         // Interactive session: honour RUST_LOG, default to debug for beewm crates.
-        let filter = tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("beewm=debug".parse()?);
+        let filter =
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("beewm=debug".parse()?);
         tracing_subscriber::fmt().with_env_filter(filter).init();
     } else {
         // DRM/TTY session: write to /tmp/beewm.log with a hardcoded conservative
@@ -30,20 +30,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration
     let config = Config::load()?;
-    tracing::info!("Config loaded: {} workspaces, border_width={}, gap={}", 
-        config.num_workspaces, config.border_width, config.gap);
-
-    // Auto-detect backend: if WAYLAND_DISPLAY or DISPLAY is set, use winit (nested).
-    // Otherwise, run on DRM/TTY directly.
-    let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("DISPLAY").is_some();
+    tracing::info!(
+        "Config loaded: {} workspaces, border_width={}, gap={}",
+        config.num_workspaces,
+        config.border_width,
+        config.gap
+    );
 
     if has_display {
         tracing::info!("Detected existing session, using winit backend");
-        beewm_wayland::run_winit(config)?;
+        run_winit(config)?;
     } else {
         tracing::info!("No display session detected, using DRM/udev backend");
-        beewm_wayland::run_udev(config)?;
+        run_udev(config)?;
     }
 
     tracing::info!("beewm exited");

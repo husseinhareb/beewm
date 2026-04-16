@@ -131,13 +131,25 @@ impl RenderElement<GlesRenderer> for OutputRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
         match self {
-            Self::Space(e) => {
-                RenderElement::<GlesRenderer>::draw(e.as_ref(), frame, src, dst, damage, opaque_regions)
+            Self::Space(e) => RenderElement::<GlesRenderer>::draw(
+                e.as_ref(),
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
+            Self::Border(e) => {
+                RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions)
             }
-            Self::Border(e) => RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions),
-            Self::Cursor(e) => {
-                RenderElement::<GlesRenderer>::draw(e.as_ref(), frame, src, dst, damage, opaque_regions)
-            }
+            Self::Cursor(e) => RenderElement::<GlesRenderer>::draw(
+                e.as_ref(),
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
         }
     }
 

@@ -1,9 +1,8 @@
-use beewm_core::config::Action;
+use crate::config::Action;
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisSource, Event, InputBackend, InputEvent, KeyState,
-    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
 use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
@@ -15,7 +14,8 @@ use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
 };
 
-use crate::state::Beewm;
+use super::commands::spawn_shell_command;
+use super::state::{Beewm, MoveGrab};
 
 /// Returns `true` when keyboard focus is currently on a layer-shell surface
 /// (e.g. wofi).  In that case focus-follows-mouse must NOT steal focus away.
@@ -70,9 +70,9 @@ fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEven
                 let raw = keysym.raw();
                 if (0x1008FE01..=0x1008FE0C).contains(&raw) {
                     let vt = (raw - 0x1008FE01 + 1) as i32;
-                    if let Some(ref mut session) = state.session {
-                        if let Some(session) = session.downcast_mut::<LibSeatSession>() {
-                            let _ = session.change_vt(vt);
+                    if let Some(session) = state.session.as_mut() {
+                        if let Err(error) = session.change_vt(vt) {
+                            tracing::warn!("Failed to switch to VT {}: {}", vt, error);
                         }
                     }
                     return FilterResult::Intercept(());
@@ -118,33 +118,7 @@ fn execute_action(state: &mut Beewm, action: Action) {
     match action {
         Action::Spawn(cmd) => {
             tracing::info!("Spawning: {}", cmd);
-            let mut command = std::process::Command::new("sh");
-            command.arg("-c").arg(&cmd);
-
-            // Ensure critical env vars are forwarded to the child.
-            // When running from a bare TTY these may be missing.
-            if let Ok(val) = std::env::var("WAYLAND_DISPLAY") {
-                command.env("WAYLAND_DISPLAY", val);
-            }
-            if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-                command.env("XDG_RUNTIME_DIR", val);
-            }
-            if let Ok(val) = std::env::var("HOME") {
-                command.env("HOME", val);
-            }
-            // Forward DISPLAY so X11 apps can connect to XWayland when available
-            // (e.g. when running nested inside another compositor).
-            if let Ok(val) = std::env::var("DISPLAY") {
-                command.env("DISPLAY", val);
-            }
-
-            // Detach from compositor's stdio so the child doesn't block
-            command
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-
-            if let Err(e) = command.spawn() {
+            if let Err(e) = spawn_shell_command(&cmd, state.sanitize_display_for_children) {
                 tracing::error!("Failed to spawn '{}': {}", cmd, e);
             }
         }
@@ -159,7 +133,7 @@ fn execute_action(state: &mut Beewm, action: Action) {
             focus_current_window(state);
         }
         Action::CloseWindow => {
-            if let Some(window) = focused_window(state) {
+            if let Some(window) = state.active_workspace_focused_window() {
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.send_close();
                 }
@@ -167,6 +141,9 @@ fn execute_action(state: &mut Beewm, action: Action) {
         }
         Action::ToggleFullscreen => {
             state.toggle_fullscreen();
+        }
+        Action::ToggleFloat => {
+            state.toggle_float();
         }
         Action::Quit => {
             tracing::info!("Quit requested");
@@ -181,10 +158,6 @@ fn execute_action(state: &mut Beewm, action: Action) {
     }
 }
 
-fn focused_window(state: &Beewm) -> Option<&smithay::desktop::Window> {
-    state.active_workspace_focused_window()
-}
-
 fn focus_current_window(state: &mut Beewm) {
     let ws = &state.workspaces[state.active_workspace];
     let idx = match ws.focused_idx {
@@ -192,7 +165,10 @@ fn focus_current_window(state: &mut Beewm) {
         None => return,
     };
 
-    let window = match state.workspace_windows[state.active_workspace].get(idx).cloned() {
+    let window = match state.workspace_windows[state.active_workspace]
+        .get(idx)
+        .cloned()
+    {
         Some(w) => w,
         None => return,
     };
@@ -210,7 +186,10 @@ fn focus_current_window(state: &mut Beewm) {
 fn surface_under(
     state: &Beewm,
     pos: smithay::utils::Point<f64, smithay::utils::Logical>,
-) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+) -> Option<(
+    WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
     let output = state
         .space
         .output_under(pos)
@@ -218,36 +197,49 @@ fn surface_under(
         .cloned()
         .or_else(|| state.space.outputs().next().cloned())?;
 
-    {
+    // Hit-test in z-order: Overlay and Top sit above windows, Bottom and
+    // Background sit below.  Checking Background/Bottom before windows caused
+    // full-screen background layer surfaces (e.g. wallpaper daemons) to absorb
+    // every pointer event, making windows unclickable.
+    let layer_hit = |layer: WlrLayer| -> Option<(
+        WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )> {
         let layer_map = layer_map_for_output(&output);
-        for layer in [
-            WlrLayer::Overlay,
-            WlrLayer::Top,
-            WlrLayer::Bottom,
-            WlrLayer::Background,
-        ] {
-            let Some(layer_surface) = layer_map.layer_under(layer, pos).cloned() else {
-                continue;
-            };
-            let Some(layer_geometry) = layer_map.layer_geometry(&layer_surface) else {
-                continue;
-            };
+        let layer_surface = layer_map.layer_under(layer, pos)?.clone();
+        let layer_geometry = layer_map.layer_geometry(&layer_surface)?;
+        let local = pos - layer_geometry.loc.to_f64();
+        let (surface, surface_loc) = layer_surface.surface_under(local, WindowSurfaceType::ALL)?;
+        Some((surface, layer_geometry.loc.to_f64() + surface_loc.to_f64()))
+    };
 
-            let local = pos - layer_geometry.loc.to_f64();
-            if let Some((surface, surface_loc)) =
-                layer_surface.surface_under(local, WindowSurfaceType::ALL)
-            {
-                return Some((surface, layer_geometry.loc.to_f64() + surface_loc.to_f64()));
-            }
-        }
+    // 1. Overlay (topmost)
+    if let Some(hit) = layer_hit(WlrLayer::Overlay) {
+        return Some(hit);
     }
 
-    state.space.element_under(pos).and_then(|(window, loc)| {
+    // 2. Top layer (panels, bars)
+    if let Some(hit) = layer_hit(WlrLayer::Top) {
+        return Some(hit);
+    }
+
+    // 3. Regular windows
+    if let Some(hit) = state.space.element_under(pos).and_then(|(window, loc)| {
         let local = pos - loc.to_f64();
         window
             .surface_under(local, WindowSurfaceType::ALL)
             .map(|(surface, surface_loc)| (surface, loc.to_f64() + surface_loc.to_f64()))
-    })
+    }) {
+        return Some(hit);
+    }
+
+    // 4. Bottom layer
+    if let Some(hit) = layer_hit(WlrLayer::Bottom) {
+        return Some(hit);
+    }
+
+    // 5. Background layer (wallpapers — rarely receive pointer events)
+    layer_hit(WlrLayer::Background)
 }
 
 fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
@@ -255,7 +247,10 @@ fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
         return true;
     }
 
-    let Some(layer) = state.space.layer_for_surface(surface, WindowSurfaceType::ALL) else {
+    let Some(layer) = state
+        .space
+        .layer_for_surface(surface, WindowSurfaceType::ALL)
+    else {
         return false;
     };
 
@@ -284,6 +279,32 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     new_pos.y = new_pos.y.clamp(0.0, output_geo.size.h as f64 - 1.0);
     state.pointer_location = new_pos;
     state.needs_render = true;
+
+    // If we are in a floating-window move grab, move the window and skip
+    // normal pointer dispatch so the client doesn't see spurious leave events.
+    if let Some(ref grab) = state.move_grab.clone() {
+        let dx = (new_pos.x - grab.start_pointer.x) as i32;
+        let dy = (new_pos.y - grab.start_pointer.y) as i32;
+        let new_win_pos = smithay::utils::Point::from((
+            grab.start_window_pos.x + dx,
+            grab.start_window_pos.y + dy,
+        ));
+        state
+            .space
+            .map_element(grab.window.clone(), new_win_pos, true);
+        // Update the stored floating position so relayout doesn't revert it.
+        if let Some(toplevel) = grab.window.toplevel() {
+            let root = {
+                let mut r = toplevel.wl_surface().clone();
+                while let Some(p) = smithay::wayland::compositor::get_parent(&r) {
+                    r = p;
+                }
+                r
+            };
+            state.floating_windows.insert(root, new_win_pos);
+        }
+        return;
+    }
 
     let serial = SERIAL_COUNTER.next_serial();
     let pointer = state.seat.get_pointer().unwrap();
@@ -326,6 +347,9 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
             }
         }
     }
+
+    // Update the compositor-driven cursor shape (border resize arrows, etc.).
+    state.refresh_compositor_cursor();
 }
 
 fn handle_pointer_motion_absolute<I: InputBackend>(
@@ -373,17 +397,68 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
             }
         }
     }
+
+    // Update the compositor-driven cursor shape (border resize arrows, etc.).
+    state.refresh_compositor_cursor();
 }
 
 fn handle_pointer_button<I: InputBackend>(state: &mut Beewm, event: I::PointerButtonEvent) {
     let serial = SERIAL_COUNTER.next_serial();
-    let pointer = state.seat.get_pointer().unwrap();
+    let button = event.button_code();
+    let btn_state = event.state();
 
+    // BTN_LEFT = 0x110 = 272
+    const BTN_LEFT: u32 = 0x110;
+
+    // Super + LMB press on a floating window → start move grab.
+    if button == BTN_LEFT && btn_state == ButtonState::Pressed {
+        let keyboard = state.seat.get_keyboard().unwrap();
+        let modifiers = keyboard.modifier_state();
+        if modifiers.logo {
+            if let Some((surface, _)) = surface_under(state, state.pointer_location) {
+                if let Some(window) = state.mapped_window_for_surface(&surface) {
+                    let root = {
+                        let mut r = surface.clone();
+                        while let Some(p) = smithay::wayland::compositor::get_parent(&r) {
+                            r = p;
+                        }
+                        r
+                    };
+                    if state.floating_windows.contains_key(&root) {
+                        let win_pos = state
+                            .space
+                            .element_geometry(&window)
+                            .map(|g| g.loc)
+                            .unwrap_or_default();
+                        state.move_grab = Some(MoveGrab {
+                            window: window.clone(),
+                            start_pointer: state.pointer_location,
+                            start_window_pos: win_pos,
+                        });
+                        // Don't forward this button press to the client.
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // LMB release → end move grab.
+    if button == BTN_LEFT && btn_state == ButtonState::Released {
+        if state.move_grab.take().is_some() {
+            // Grab ended; restore compositor cursor (was Grabbing during drag).
+            state.refresh_compositor_cursor();
+            // Don't forward the release to the client.
+            return;
+        }
+    }
+
+    let pointer = state.seat.get_pointer().unwrap();
     pointer.button(
         state,
         &ButtonEvent {
-            button: event.button_code(),
-            state: event.state(),
+            button,
+            state: btn_state,
             serial,
             time: Event::time_msec(&event),
         },

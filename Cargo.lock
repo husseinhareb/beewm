@@ -98,27 +98,10 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "beewm"
 version = "0.1.0"
 dependencies = [
- "beewm-core",
- "beewm-wayland",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "beewm-core"
-version = "0.1.0"
-dependencies = [
- "tracing",
-]
-
-[[package]]
-name = "beewm-wayland"
-version = "0.1.0"
-dependencies = [
- "beewm-core",
  "libc",
  "smithay",
  "tracing",
+ "tracing-subscriber",
  "xcursor",
 ]
 

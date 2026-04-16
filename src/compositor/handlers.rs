@@ -1,9 +1,13 @@
 use smithay::delegate_compositor;
+use smithay::delegate_cursor_shape;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::delegate_data_device;
+use smithay::delegate_drm_syncobj;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_layer_shell;
 use smithay::delegate_output;
+use smithay::delegate_presentation;
 use smithay::delegate_primary_selection;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
@@ -11,26 +15,29 @@ use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
-use smithay::desktop::layer_map_for_output;
-use smithay::desktop::LayerSurface as DesktopLayerSurface;
-use smithay::desktop::Window;
-use smithay::input::pointer::CursorImageStatus;
+use smithay::desktop::{
+    find_popup_root_surface, layer_map_for_output, LayerSurface as DesktopLayerSurface,
+    PopupKeyboardGrab, PopupKind, PopupPointerGrab, Window, WindowSurfaceType,
+};
+use smithay::input::pointer::{CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
-use smithay::wayland::selection::data_device::{
+use smithay::wayland::selection::data_device::{set_data_device_focus,
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
-use smithay::wayland::selection::primary_selection::{
+use smithay::wayland::selection::primary_selection::{set_primary_focus,
     PrimarySelectionHandler, PrimarySelectionState,
 };
 use smithay::wayland::selection::SelectionHandler;
@@ -47,7 +54,7 @@ use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
-use crate::state::{Beewm, ClientState};
+use super::state::{Beewm, ClientState};
 
 impl CompositorHandler for Beewm {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -59,6 +66,10 @@ impl CompositorHandler for Beewm {
         client: &'a smithay::reexports::wayland_server::Client,
     ) -> &'a CompositorClientState {
         &client.get_data::<ClientState>().unwrap().compositor_state
+    }
+
+    fn new_surface(&mut self, surface: &WlSurface) {
+        Beewm::install_explicit_sync_hook(surface);
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -105,9 +116,14 @@ impl CompositorHandler for Beewm {
             // Single borrow: find layer, arrange, read keyboard_interactivity.
             let (is_layer, focus_wl_surface) = {
                 let mut lm = layer_map_for_output(&output);
-                // Bind the find result so the iterator temporary is dropped
-                // before we call lm.arrange() (which needs &mut).
-                let layer = lm.layers().find(|l| l.wl_surface() == surface).cloned();
+                // Use layer_for_surface so subsurface commits (e.g. bar content
+                // updates) also trigger re-renders, not just root-surface commits.
+                let layer = lm
+                    .layer_for_surface(
+                        surface,
+                        WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                    )
+                    .cloned();
                 match layer {
                     Some(layer) => {
                         // arrange() sends the configure event to the layer surface.
@@ -201,7 +217,11 @@ impl XdgShellHandler for Beewm {
             }) {
                 let window = self.workspace_windows[ws_idx].remove(pos);
                 let should_restore_focus = if ws_idx == self.active_workspace {
-                    match self.seat.get_keyboard().and_then(|keyboard| keyboard.current_focus()) {
+                    match self
+                        .seat
+                        .get_keyboard()
+                        .and_then(|keyboard| keyboard.current_focus())
+                    {
                         Some(current_focus) => {
                             let mut root = current_focus;
                             while let Some(parent) = get_parent(&root) {
@@ -215,24 +235,33 @@ impl XdgShellHandler for Beewm {
                     false
                 };
                 self.untrack_window_for_surface(target_surface);
-                // If this window was fullscreened, clear the state so relayout
-                // works correctly and the next window gets a proper tiled size.
-                if self
+                // Clean up fullscreen state if this was the fullscreen window.
+                let was_fullscreen = self
                     .fullscreen_window
                     .as_ref()
                     .and_then(|w| w.toplevel())
                     .map(|t| t.wl_surface() == target_surface)
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if was_fullscreen {
                     self.fullscreen_window = None;
+                    // Remap siblings that were unmapped while fullscreen was active.
+                    for sibling in &self.workspace_windows[ws_idx] {
+                        if self.space.element_geometry(sibling).is_none() {
+                            self.space.map_element(sibling.clone(), (0, 0), false);
+                        }
+                    }
                 }
+                // Clean up floating state if this was a floating window.
+                self.floating_windows.remove(target_surface);
                 self.space.unmap_elem(&window);
                 self.workspaces[ws_idx].remove_window(pos);
                 if ws_idx == self.active_workspace {
                     if should_restore_focus {
                         let focus = self.workspaces[self.active_workspace]
                             .focused_idx
-                            .and_then(|focus_idx| self.workspace_windows[self.active_workspace].get(focus_idx))
+                            .and_then(|focus_idx| {
+                                self.workspace_windows[self.active_workspace].get(focus_idx)
+                            })
                             .and_then(|window| window.toplevel())
                             .map(|toplevel| toplevel.wl_surface().clone());
                         self.set_keyboard_focus(focus);
@@ -247,10 +276,43 @@ impl XdgShellHandler for Beewm {
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         // Send initial configure so the popup can render
-        let _ = surface.send_configure();
+        if let Err(error) = surface.send_configure() {
+            tracing::warn!("Failed to configure popup: {:?}", error);
+        }
+        // Track the popup so PopupManager can manage its lifetime and grabs.
+        if let Err(error) = self.popup_manager.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!("Failed to track popup: {:?}", error);
+        }
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let seat = match Seat::from_resource(&seat) {
+            Some(s) => s,
+            None => return,
+        };
+        let popup = PopupKind::Xdg(surface);
+        let root = match find_popup_root_surface(&popup) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let grab = match self.popup_manager.grab_popup(root, popup, &seat, serial) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Popup grab denied: {:?}", e);
+                return;
+            }
+        };
+        if let Some(pointer) = seat.get_pointer() {
+            if !pointer.is_grabbed() {
+                pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Clear);
+            }
+        }
+        if let Some(keyboard) = seat.get_keyboard() {
+            if !keyboard.is_grabbed() {
+                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+            }
+        }
+    }
 
     fn reposition_request(
         &mut self,
@@ -274,8 +336,12 @@ impl SeatHandler for Beewm {
         self.set_cursor_status(image);
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         self.note_keyboard_focus_change(focused);
+        // Deliver the current clipboard/primary selection to the newly focused client.
+        let client = focused.and_then(|s| s.client());
+        set_data_device_focus::<Self>(&self.display_handle, seat, client.clone());
+        set_primary_focus::<Self>(&self.display_handle, seat, client);
     }
 }
 
@@ -309,7 +375,21 @@ impl WlrLayerShellHandler for Beewm {
         let mut layer_map = layer_map_for_output(&output);
         if let Err(e) = layer_map.map_layer(&desktop_layer) {
             tracing::error!("Failed to map layer surface: {}", e);
+            return;
         }
+        // arrange() computes geometry and sets server_pending size, but does NOT
+        // send the initial configure (it guards on initial_configure_sent being true).
+        // We must call send_pending_configure() explicitly to send the initial configure;
+        // without this the bar client waits forever and never draws.
+        layer_map.arrange();
+        if desktop_layer
+            .layer_surface()
+            .send_pending_configure()
+            .is_none()
+        {
+            tracing::warn!("Layer surface had no pending configure after arrange");
+        }
+        self.needs_render = true;
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
@@ -379,7 +459,18 @@ impl XdgDecorationHandler for Beewm {
     }
 }
 
+// TabletSeatHandler is required by delegate_cursor_shape! even though we have
+// no tablet hardware; the trait provides default no-op implementations.
+impl TabletSeatHandler for Beewm {}
+
+impl DrmSyncobjHandler for Beewm {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
+    }
+}
+
 delegate_compositor!(Beewm);
+delegate_cursor_shape!(Beewm);
 delegate_shm!(Beewm);
 delegate_xdg_shell!(Beewm);
 delegate_xdg_decoration!(Beewm);
@@ -388,9 +479,11 @@ delegate_data_device!(Beewm);
 delegate_primary_selection!(Beewm);
 delegate_seat!(Beewm);
 delegate_output!(Beewm);
+delegate_presentation!(Beewm);
 delegate_viewporter!(Beewm);
 delegate_fractional_scale!(Beewm);
 delegate_single_pixel_buffer!(Beewm);
+delegate_drm_syncobj!(Beewm);
 
 impl FractionalScaleHandler for Beewm {}
 
@@ -406,7 +499,9 @@ impl DmabufHandler for Beewm {
         notifier: ImportNotifier,
     ) {
         // Accept all dmabufs — actual import happens at render time.
-        let _ = notifier.successful::<Beewm>();
+        if let Err(error) = notifier.successful::<Beewm>() {
+            tracing::warn!("Failed to acknowledge dmabuf import: {:?}", error);
+        }
     }
 }
 

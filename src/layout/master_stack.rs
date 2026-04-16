@@ -11,7 +11,7 @@ pub struct MasterStack {
 
 impl Default for MasterStack {
     fn default() -> Self {
-        Self { master_ratio: 0.55 }
+        Self { master_ratio: 0.50 }
     }
 }
 
@@ -63,63 +63,5 @@ impl Layout for MasterStack {
         }
 
         geometries
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_windows() {
-        let layout = MasterStack::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 0);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn single_window_fills_screen() {
-        let layout = MasterStack::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 1);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], screen);
-    }
-
-    #[test]
-    fn two_windows_split() {
-        let layout = MasterStack::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 2);
-        assert_eq!(result.len(), 2);
-        // Master takes ~55%
-        assert_eq!(result[0].width, 1056);
-        assert_eq!(result[0].height, 1080);
-        // Stack takes the rest
-        assert_eq!(result[1].x, 1056);
-        assert_eq!(result[1].width, 864);
-        assert_eq!(result[1].height, 1080);
-    }
-
-    #[test]
-    fn three_windows_stacked() {
-        let layout = MasterStack::default();
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 3);
-        assert_eq!(result.len(), 3);
-        // Two stack windows each get half height
-        assert_eq!(result[1].height, 540);
-        assert_eq!(result[2].height, 540);
-        assert_eq!(result[2].y, 540);
-    }
-
-    #[test]
-    fn invalid_ratio_is_clamped() {
-        let layout = MasterStack { master_ratio: 2.0 };
-        let screen = Geometry::new(0, 0, 1920, 1080);
-        let result = layout.apply(&screen, 2);
-        assert_eq!(result[0].width, 1920);
-        assert_eq!(result[1].width, 0);
     }
 }

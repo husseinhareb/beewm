@@ -51,10 +51,11 @@ impl CursorThemeManager {
     }
 
     fn load_sprite(&self, icon: CursorIcon) -> Option<CursorSprite> {
-        let icon_path = self
-            .theme
-            .load_icon(icon.name())
-            .or_else(|| icon.alt_names().iter().find_map(|name| self.theme.load_icon(name)))?;
+        let icon_path = self.theme.load_icon(icon.name()).or_else(|| {
+            icon.alt_names()
+                .iter()
+                .find_map(|name| self.theme.load_icon(name))
+        })?;
 
         let contents = std::fs::read(icon_path).ok()?;
         let images = parse_xcursor(&contents)?;
@@ -74,8 +75,13 @@ impl CursorThemeManager {
     }
 }
 
-fn pick_best_image(images: &[xcursor::parser::Image], desired_size: u32) -> Option<&xcursor::parser::Image> {
-    images.iter().min_by_key(|image| image.size.abs_diff(desired_size))
+fn pick_best_image(
+    images: &[xcursor::parser::Image],
+    desired_size: u32,
+) -> Option<&xcursor::parser::Image> {
+    images
+        .iter()
+        .min_by_key(|image| image.size.abs_diff(desired_size))
 }
 
 fn fallback_arrow_sprite(size: u32) -> CursorSprite {
@@ -110,8 +116,7 @@ fn fallback_arrow_sprite(size: u32) -> CursorSprite {
                 continue;
             }
 
-            let is_outline = neighbors(x, y, width, height)
-                .any(|neighbor| !fill[neighbor]);
+            let is_outline = neighbors(x, y, width, height).any(|neighbor| !fill[neighbor]);
             let base = idx * 4;
             if is_outline {
                 pixels[base] = 0x00;
@@ -147,8 +152,7 @@ fn point_in_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
     for &current in points {
         let (x1, y1) = current;
         let (x2, y2) = previous;
-        let intersects = ((y1 > y) != (y2 > y))
-            && (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1);
+        let intersects = ((y1 > y) != (y2 > y)) && (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1);
         if intersects {
             inside = !inside;
         }
@@ -158,12 +162,7 @@ fn point_in_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
     inside
 }
 
-fn neighbors(
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-) -> impl Iterator<Item = usize> {
+fn neighbors(x: usize, y: usize, width: usize, height: usize) -> impl Iterator<Item = usize> {
     let min_y = y.saturating_sub(1);
     let max_y = (y + 1).min(height - 1);
     let min_x = x.saturating_sub(1);

@@ -2,35 +2,46 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
 
-use beewm_core::config::Config;
+use crate::config::Config;
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Format;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Event as SessionEvent;
 use smithay::backend::session::Session;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
-use smithay::desktop::space::space_render_elements;
+use smithay::desktop::space::{space_render_elements, SpaceRenderElements};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
 use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
 use smithay::reexports::input::Libinput;
-use smithay::backend::input::InputEvent;
 use smithay::reexports::input::ScrollMethod;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{Monotonic, Time};
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::presentation::Refresh;
+use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::render::OutputRenderElement;
-use crate::state::{Beewm, CalloopData, ClientState};
+use crate::compositor::commands::spawn_startup_commands;
+use crate::compositor::feedback::{
+    collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
+    update_primary_scanout_output,
+};
+use crate::compositor::render::OutputRenderElement;
+use crate::compositor::state::{Beewm, ClientState};
 
 /// Per-GPU state for the DRM backend.
 struct GpuData {
@@ -45,15 +56,16 @@ struct GpuData {
         DrmDeviceFd,
     >,
     output: Output,
-    dmabuf_formats: Vec<Format>,
     /// True when a vblank has fired and we may render the next frame.
     can_render: bool,
+    pending_presentation_feedback:
+        Option<smithay::desktop::utils::OutputPresentationFeedback>,
 }
 
 /// Top-level calloop data for the DRM/udev backend —
 /// combines compositor state with GPU state so VBlank handlers can reach both.
 struct UdevData {
-    calloop: CalloopData,
+    state: Beewm,
     gpu: Option<GpuData>,
     /// Owned so we can call flush_clients() anywhere in the main loop.
     display: Display<Beewm>,
@@ -69,17 +81,33 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Clone the display fd before moving display into UdevData — used to
     // wake calloop when clients send data.
-    let display_fd = display.as_fd().try_clone_to_owned()
+    let display_fd = display
+        .as_fd()
+        .try_clone_to_owned()
         .expect("Failed to clone wayland display fd");
 
     let mut data = UdevData {
-        calloop: CalloopData {
-            state,
-            display_handle: display_handle.clone(),
-        },
+        state,
         gpu: None,
         display,
     };
+
+    let loop_handle = event_loop.handle();
+    data.state
+        .install_syncobj_blocker_source(Box::new(move |source, client| {
+            let client = client.clone();
+            if let Err(error) = loop_handle.insert_source(source, move |(), _, data: &mut UdevData| {
+                if let Some(client_state) = client.get_data::<ClientState>() {
+                    let display_handle = data.state.display_handle.clone();
+                    client_state
+                        .compositor_state
+                        .blocker_cleared(&mut data.state, &display_handle);
+                }
+                Ok(())
+            }) {
+                tracing::warn!("Failed to install explicit-sync fence source: {}", error);
+            }
+        }));
 
     // --- Session ---
     let (mut session, notifier) = LibSeatSession::new()?;
@@ -94,7 +122,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     gpu._drm_device.pause();
                     gpu.can_render = false;
                 }
-                data.calloop.state.needs_render = false;
+                data.state.needs_render = false;
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("Session activated");
@@ -105,11 +133,14 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                     if let Err(err) = gpu.compositor.reset_state() {
-                        tracing::error!("Failed to reset compositor state after reactivation: {}", err);
+                        tracing::error!(
+                            "Failed to reset compositor state after reactivation: {}",
+                            err
+                        );
                     }
                     gpu.can_render = true;
                 }
-                data.calloop.state.needs_render = true;
+                data.state.needs_render = true;
             }
         })?;
 
@@ -124,8 +155,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Do NOT set GDK_BACKEND or QT_QPA_PLATFORM directly: those override
     // auto-detection and crash apps when optional protocols are missing.
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    // Electron/Chromium (VS Code, etc.).
-    std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "auto");
+    // Force Electron/Chromium onto native Wayland so they do not silently
+    // fall back to X11/Xwayland and bypass the compositor-side pacing fixes.
+    std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
     std::env::set_var("NIXOS_OZONE_WL", "1");
 
     // Ensure XDG_RUNTIME_DIR is set — required by Wayland clients like kitty.
@@ -139,17 +171,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    event_loop.handle().insert_source(
-        listening_socket,
-        |client_stream, _, data| {
-            if let Err(e) = data.calloop.display_handle.insert_client(
-                client_stream,
-                std::sync::Arc::new(ClientState::default()),
-            ) {
+    event_loop
+        .handle()
+        .insert_source(listening_socket, |client_stream, _, data| {
+            if let Err(e) = data
+                .state
+                .display_handle
+                .insert_client(client_stream, std::sync::Arc::new(ClientState::default()))
+            {
                 tracing::error!("Failed to insert client: {}", e);
             }
-        },
-    )?;
+        })?;
 
     // Register the display fd so calloop wakes up when clients send data.
     // dispatch_clients + flush_clients are called via data.display below.
@@ -161,7 +193,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         ),
         |_, _, data: &mut UdevData| {
             data.display
-                .dispatch_clients(&mut data.calloop.state)
+                .dispatch_clients(&mut data.state)
                 .map_err(std::io::Error::other)?;
             data.display.flush_clients()?;
             Ok(PostAction::Continue)
@@ -185,7 +217,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let is_touchpad = device.config_tap_finger_count() > 0;
                 if is_touchpad {
                     // Tap-to-click
-                    let tap = data.calloop.state.config.tap_to_click;
+                    let tap = data.state.config.tap_to_click;
                     let r = device.config_tap_set_enabled(tap);
                     tracing::info!(
                         "libinput: tap-to-click {} on '{}' ({:?})",
@@ -207,7 +239,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Natural (reversed) scroll direction
                     if device.config_scroll_has_natural_scroll() {
-                        let natural = data.calloop.state.config.natural_scroll;
+                        let natural = data.state.config.natural_scroll;
                         let r = device.config_scroll_set_natural_scroll_enabled(natural);
                         tracing::info!(
                             "libinput: natural scroll {} on '{}' ({:?})",
@@ -219,7 +251,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return;
             }
-            crate::input::handle_input(&mut data.calloop.state, event);
+            crate::compositor::input::handle_input(&mut data.state, event);
         })?;
 
     // --- Udev: enumerate GPUs ---
@@ -228,15 +260,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     for (device_id, path) in udev.device_list() {
         tracing::info!("Found DRM device: {} at {}", device_id, path.display());
         if data.gpu.is_none() {
-            match init_gpu(
-                &mut session,
-                &event_loop,
-                &display_handle,
-                path,
-            ) {
-                Ok(gd) => {
-                    data.calloop.state.space.map_output(&gd.output, (0, 0));
+            match init_gpu(&mut session, &event_loop, &display_handle, path) {
+                Ok((gd, dmabuf_formats, syncobj_state)) => {
+                    data.state.space.map_output(&gd.output, (0, 0));
                     data.gpu = Some(gd);
+                    data.state.drm_syncobj_state = syncobj_state;
+                    let display_handle = data.state.display_handle.clone();
+                    data.state._dmabuf_global = Some(
+                        data.state
+                            .dmabuf_state
+                            .create_global::<Beewm>(&display_handle, dmabuf_formats),
+                    );
                 }
                 Err(e) => tracing::warn!("Failed to init GPU {}: {}", path.display(), e),
             }
@@ -244,8 +278,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Insert udev for hotplug (we don't handle hotplug in detail yet)
-    event_loop.handle().insert_source(udev, |event, _, _data| {
-        match event {
+    event_loop
+        .handle()
+        .insert_source(udev, |event, _, _data| match event {
             UdevEvent::Added { device_id, path } => {
                 tracing::info!("DRM device added: {} at {}", device_id, path.display());
             }
@@ -255,31 +290,29 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             UdevEvent::Removed { device_id } => {
                 tracing::info!("DRM device removed: {}", device_id);
             }
-        }
-    })?;
+        })?;
 
     if data.gpu.is_none() {
         return Err("No usable GPU found".into());
     }
 
     // Store session for VT switching
-    data.calloop.state.session = Some(Box::new(session.clone()));
+    data.state.session = Some(session.clone());
 
-    // Create DMABUF global with renderer formats
-    let dmabuf_formats = data.gpu.as_ref().unwrap().dmabuf_formats.clone();
-    data.calloop.state._dmabuf_global = Some(
-        data.calloop
-            .state
-            .dmabuf_state
-            .create_global::<Beewm>(&data.calloop.display_handle, dmabuf_formats),
+    // Start autostart clients only after an output exists. Layer-shell
+    // clients like beebar need an output-backed initial configure; spawning
+    // them earlier races output creation and leaves them unmapped/blank.
+    spawn_startup_commands(
+        &data.state.config.autostart_commands,
+        data.state.sanitize_display_for_children,
     );
 
     tracing::info!("Starting udev event loop");
 
-    while data.calloop.state.running {
+    while data.state.running {
         // Only render when the previous frame has been presented (VBlank fired)
         // AND something visual has actually changed.
-        if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.calloop.state.needs_render {
+        if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.state.needs_render {
             render_frame(&mut data);
         }
         event_loop.dispatch(Some(Duration::from_millis(20)), &mut data)?;
@@ -289,7 +322,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = data.display.flush_clients() {
             tracing::warn!("Failed to flush Wayland clients: {}", err);
         }
-        data.calloop.state.space.refresh();
+        data.state.space.refresh();
     }
 
     Ok(())
@@ -303,26 +336,69 @@ fn render_frame(data: &mut UdevData) {
     };
     gpu.can_render = false;
 
-    let space_elements = match space_render_elements(
-        &mut gpu.renderer,
-        [&data.calloop.state.space],
-        &gpu.output,
-        1.0,
-    ) {
-        Ok(elems) => elems,
-        Err(e) => {
-            tracing::error!("space_render_elements failed: {:?}", e);
-            Vec::new()
+    let space_elements =
+        match space_render_elements(&mut gpu.renderer, [&data.state.space], &gpu.output, 1.0) {
+            Ok(elems) => elems,
+            Err(e) => {
+                tracing::error!("space_render_elements failed: {:?}", e);
+                Vec::new()
+            }
+        };
+
+    let border_elements = data.state.border_elements();
+    let cursor_elements = data.state.cursor_elements(&mut gpu.renderer);
+
+    // Render layer-shell surfaces (waybar, beebar, etc.) at the correct Z-order.
+    // Clone output so we can borrow it for layer_map while also using gpu.renderer.
+    let output = gpu.output.clone();
+    let scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
+    let layer_map = smithay::desktop::layer_map_for_output(&output);
+
+    // Background + Bottom layers render *behind* windows.
+    let mut layers_below: Vec<OutputRenderElement> = Vec::new();
+    for layer in layer_map
+        .layers_on(WlrLayer::Background)
+        .chain(layer_map.layers_on(WlrLayer::Bottom))
+    {
+        if let Some(geo) = layer_map.layer_geometry(layer) {
+            let location = geo.loc.to_physical_precise_round(scale);
+            let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                layer.render_elements(&mut gpu.renderer, location, scale, 1.0);
+            for elem in elems {
+                layers_below.push(OutputRenderElement::Space(Box::new(
+                    SpaceRenderElements::Surface(elem),
+                )));
+            }
         }
-    };
+    }
 
-    let border_elements = data.calloop.state.border_elements();
-    let cursor_elements = data.calloop.state.cursor_elements(&mut gpu.renderer);
+    // Top + Overlay layers render *above* windows (but below cursor).
+    let mut layers_above: Vec<OutputRenderElement> = Vec::new();
+    for layer in layer_map
+        .layers_on(WlrLayer::Top)
+        .chain(layer_map.layers_on(WlrLayer::Overlay))
+    {
+        if let Some(geo) = layer_map.layer_geometry(layer) {
+            let location = geo.loc.to_physical_precise_round(scale);
+            let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                layer.render_elements(&mut gpu.renderer, location, scale, 1.0);
+            for elem in elems {
+                layers_above.push(OutputRenderElement::Space(Box::new(
+                    SpaceRenderElements::Surface(elem),
+                )));
+            }
+        }
+    }
+    drop(layer_map);
 
+    // Build final element list front-to-back (first = topmost):
+    //   cursor > overlay/top > borders > windows > bottom/background
     let mut elements: Vec<OutputRenderElement> = Vec::new();
     elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));
+    elements.extend(layers_above);
     elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
     elements.extend(space_elements.into_iter().map(OutputRenderElement::from));
+    elements.extend(layers_below);
 
     let gpu = data.gpu.as_mut().unwrap();
 
@@ -335,37 +411,47 @@ fn render_frame(data: &mut UdevData) {
 
     match result {
         Ok(result) => {
+            let render_states = result.states.clone();
+            update_primary_scanout_output(&data.state, &output, &render_states);
+
             if result.is_empty {
                 // No damage — nothing to scan out.  Clear the render request
                 // so we don't spin; the next surface commit / relayout will
                 // set `needs_render = true` again.
-                data.calloop.state.needs_render = false;
+                data.state.needs_render = false;
                 gpu.can_render = true;
+                gpu.pending_presentation_feedback = None;
+                // No VBlank will fire, so send frame callbacks now to keep
+                // clients from stalling.
+                let elapsed = data.state.start_time.elapsed();
+                send_frame_callbacks(
+                    &data.state,
+                    &output,
+                    elapsed,
+                    Some(output_frame_interval(&output)),
+                );
             } else if let Err(e) = gpu.compositor.queue_frame(()) {
                 tracing::error!("Failed to queue frame: {:?}", e);
                 gpu.can_render = true;
+                gpu.pending_presentation_feedback = None;
+                // Frame was never queued — no VBlank coming; unblock clients.
+                let elapsed = data.state.start_time.elapsed();
+                send_frame_callbacks(&data.state, &output, elapsed, None);
+            } else {
+                gpu.pending_presentation_feedback =
+                    Some(collect_presentation_feedback(&data.state, &output, &render_states));
             }
+            // For the normal non-empty case, frame callbacks are sent from the
+            // VBlank handler once the hardware confirms the frame is on screen.
         }
         Err(e) => {
             tracing::error!("Render error: {:?}", e);
             gpu.can_render = true;
+            gpu.pending_presentation_feedback = None;
+            // Render failed — no VBlank coming; unblock clients.
+            let elapsed = data.state.start_time.elapsed();
+            send_frame_callbacks(&data.state, &output, elapsed, None);
         }
-    }
-
-    // Always send frame callbacks so clients can submit their next buffer,
-    // even when the compositor had no damage or hit a render error.
-    let elapsed = data.calloop.state.start_time.elapsed();
-    let output = data.gpu.as_ref().unwrap().output.clone();
-    data.calloop.state.space.elements().for_each(|window| {
-        window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
-    });
-    let layer_map = smithay::desktop::layer_map_for_output(&output);
-    for layer in layer_map.layers() {
-        layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
     }
 }
 
@@ -374,7 +460,7 @@ fn init_gpu(
     event_loop: &EventLoop<UdevData>,
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     path: &Path,
-) -> Result<GpuData, Box<dyn std::error::Error>> {
+) -> Result<(GpuData, Vec<Format>, Option<DrmSyncobjState>), Box<dyn std::error::Error>> {
     // Open DRM device via session
     let fd = session.open(path, OFlags::RDWR | OFlags::CLOEXEC)?;
     let device_fd: DeviceFd = fd.into();
@@ -412,16 +498,14 @@ fn init_gpu(
         }
     }
 
-    let connector_handle =
-        selected_connector.ok_or("No connected display found")?;
+    let connector_handle = selected_connector.ok_or("No connected display found")?;
     let drm_mode = selected_mode.ok_or("No display mode available")?;
 
     // Find a suitable CRTC for this connector
     let crtc_handle = find_crtc_for_connector(&drm_fd, &resources, connector_handle)?;
 
     // Create DRM surface
-    let drm_surface =
-        drm_device.create_surface(crtc_handle, drm_mode, &[connector_handle])?;
+    let drm_surface = drm_device.create_surface(crtc_handle, drm_mode, &[connector_handle])?;
 
     // Create GBM device
     let gbm_device = GbmDevice::new(drm_fd.clone())?;
@@ -497,32 +581,75 @@ fn init_gpu(
         Some(gbm_device.clone()),
     )?;
 
+    let syncobj_state = if supports_syncobj_eventfd(&drm_fd) {
+        Some(DrmSyncobjState::new::<Beewm>(display_handle, drm_fd.clone()))
+    } else {
+        tracing::info!("DRM syncobj eventfd unsupported on {}", path.display());
+        None
+    };
+
     // VBlank: frame was presented — acknowledge it and allow the next render.
     let drm_notifier_token = event_loop.handle().insert_source(
         drm_notifier,
-        |event, _, data: &mut UdevData| match event {
+        |event, metadata, data: &mut UdevData| match event {
             DrmEvent::VBlank(_crtc) => {
                 if let Some(gpu) = data.gpu.as_mut() {
                     if let Err(e) = gpu.compositor.frame_submitted() {
                         tracing::error!("frame_submitted error: {:?}", e);
                     }
                     gpu.can_render = true;
+                    let refresh = Refresh::fixed(output_frame_interval(&gpu.output));
+                    let presentation_time = metadata
+                        .as_ref()
+                        .and_then(|meta| match meta.time {
+                            DrmEventTime::Monotonic(duration) => Some(Time::<Monotonic>::from(duration)),
+                            DrmEventTime::Realtime(_) => None,
+                        })
+                        .unwrap_or_else(|| data.state.presentation_clock.now());
+                    let sequence = metadata
+                        .as_ref()
+                        .map(|meta| meta.sequence as u64)
+                        .unwrap_or(0);
+                    if let Some(mut feedback) = gpu.pending_presentation_feedback.take() {
+                        feedback.presented(
+                            presentation_time,
+                            refresh,
+                            sequence,
+                            smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+                        );
+                    }
+                }
+
+                // Frame is now on screen — send frame callbacks so clients
+                // render their next frame in sync with the display VBlank.
+                let elapsed = data.state.start_time.elapsed();
+                if let Some(gpu) = data.gpu.as_ref() {
+                    send_frame_callbacks(
+                        &data.state,
+                        &gpu.output,
+                        elapsed,
+                        Some(output_frame_interval(&gpu.output)),
+                    );
                 }
             }
             DrmEvent::Error(e) => tracing::error!("DRM error: {:?}", e),
         },
     )?;
 
-    Ok(GpuData {
-        _drm_device: drm_device,
-        _drm_notifier_token: drm_notifier_token,
-        _gbm_device: gbm_device,
-        renderer,
-        compositor,
-        output,
+    Ok((
+        GpuData {
+            _drm_device: drm_device,
+            _drm_notifier_token: drm_notifier_token,
+            _gbm_device: gbm_device,
+            renderer,
+            compositor,
+            output,
+            can_render: true, // allow first frame immediately
+            pending_presentation_feedback: None,
+        },
         dmabuf_formats,
-        can_render: true, // allow first frame immediately
-    })
+        syncobj_state,
+    ))
 }
 
 /// Find a CRTC that can drive the given connector.
