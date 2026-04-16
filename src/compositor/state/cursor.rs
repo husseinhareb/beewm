@@ -76,6 +76,10 @@ impl Beewm {
 /// position and grab state. Returns `Some(icon)` when the compositor
 /// itself should override the client cursor, `None` to fall through.
 fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
+    if let Some(grab) = state.resize_grab.as_ref() {
+        return Some(grab.edges.cursor_icon());
+    }
+
     // During a floating-window move grab always show the grabbing hand.
     if state.move_grab.is_some() {
         return Some(CursorIcon::Grabbing);
@@ -97,6 +101,13 @@ fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
             .map(|fs| fs == window)
             .unwrap_or(false)
         {
+            continue;
+        }
+
+        let Some(root) = Beewm::window_root_surface(window) else {
+            continue;
+        };
+        if !state.is_root_floating(&root) {
             continue;
         }
 

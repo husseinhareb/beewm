@@ -57,6 +57,28 @@ fn dwindle_four_windows_alternate_axis() {
 }
 
 #[test]
+fn dwindle_invalid_ratio_falls_back_to_default() {
+    let layout = Dwindle {
+        split_ratio: f64::NAN,
+    };
+    let screen = Geometry::new(0, 0, 100, 80);
+    let result = layout.apply(&screen, 2);
+
+    assert_eq!(result[0], Geometry::new(0, 0, 50, 80));
+    assert_eq!(result[1], Geometry::new(50, 0, 50, 80));
+}
+
+#[test]
+fn dwindle_negative_ratio_is_clamped_to_zero() {
+    let layout = Dwindle { split_ratio: -1.0 };
+    let screen = Geometry::new(0, 0, 100, 80);
+    let result = layout.apply(&screen, 2);
+
+    assert_eq!(result[0], Geometry::new(0, 0, 0, 80));
+    assert_eq!(result[1], Geometry::new(0, 0, 100, 80));
+}
+
+#[test]
 fn master_stack_empty_windows() {
     let layout = MasterStack::default();
     let screen = Geometry::new(0, 0, 1920, 1080);
@@ -104,4 +126,27 @@ fn master_stack_invalid_ratio_is_clamped() {
     let result = layout.apply(&screen, 2);
     assert_eq!(result[0].width, 1920);
     assert_eq!(result[1].width, 0);
+}
+
+#[test]
+fn master_stack_invalid_ratio_falls_back_to_default() {
+    let layout = MasterStack {
+        master_ratio: f64::NAN,
+    };
+    let screen = Geometry::new(0, 0, 100, 80);
+    let result = layout.apply(&screen, 2);
+
+    assert_eq!(result[0], Geometry::new(0, 0, 50, 80));
+    assert_eq!(result[1], Geometry::new(50, 0, 50, 80));
+}
+
+#[test]
+fn master_stack_last_window_gets_the_rounding_remainder() {
+    let layout = MasterStack { master_ratio: 0.5 };
+    let screen = Geometry::new(0, 0, 100, 100);
+    let result = layout.apply(&screen, 4);
+
+    assert_eq!(result[1], Geometry::new(50, 0, 50, 33));
+    assert_eq!(result[2], Geometry::new(50, 33, 50, 33));
+    assert_eq!(result[3], Geometry::new(50, 66, 50, 34));
 }

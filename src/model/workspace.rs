@@ -12,7 +12,7 @@ impl Workspace {
     }
 
     pub fn remove_window(&mut self, idx: usize) {
-        if self.window_count == 0 {
+        if self.window_count == 0 || idx >= self.window_count {
             return;
         }
         self.window_count -= 1;

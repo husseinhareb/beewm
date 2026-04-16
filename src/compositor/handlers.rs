@@ -85,9 +85,11 @@ impl CompositorHandler for Beewm {
         }) {
             let window = self.pending_windows.remove(pos);
             let ws_idx = self.active_workspace;
+            let split_target = self.focused_tiled_window_root(ws_idx);
             self.workspace_windows[ws_idx].push(window.clone());
             self.workspaces[ws_idx].add_window();
             self.track_window(&window);
+            self.insert_tiled_window(ws_idx, &window, split_target.as_ref());
             // Propagate the first commit through the window's surface tree.
             window.on_commit();
             self.relayout();
@@ -253,6 +255,7 @@ impl XdgShellHandler for Beewm {
                 }
                 // Clean up floating state if this was a floating window.
                 self.floating_windows.remove(target_surface);
+                self.remove_tiled_window(ws_idx, target_surface);
                 self.space.unmap_elem(&window);
                 self.workspaces[ws_idx].remove_window(pos);
                 if ws_idx == self.active_workspace {

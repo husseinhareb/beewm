@@ -1,6 +1,7 @@
 mod cursor;
 mod decorations;
 mod focus;
+mod tiling;
 mod workspace;
 
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
-use smithay::utils::{Clock, Logical, Monotonic, Point};
+use smithay::utils::{Clock, Logical, Monotonic, Point, Size};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
     with_states,
@@ -42,6 +43,8 @@ use crate::layout::Layout;
 use crate::layout::dwindle::Dwindle;
 use crate::layout::master_stack::MasterStack;
 use crate::model::workspace::Workspace;
+
+use self::tiling::DwindleTree;
 
 use super::commands::ChildEnvironment;
 
@@ -72,6 +75,54 @@ pub struct MoveGrab {
     pub start_pointer: Point<f64, Logical>,
     /// Window position when the grab started.
     pub start_window_pos: Point<i32, Logical>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeHorizontalEdge {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeVerticalEdge {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeEdges {
+    pub horizontal: ResizeHorizontalEdge,
+    pub vertical: ResizeVerticalEdge,
+}
+
+impl ResizeEdges {
+    pub fn cursor_icon(self) -> CursorIcon {
+        match (self.vertical, self.horizontal) {
+            (ResizeVerticalEdge::Top, ResizeHorizontalEdge::Left) => CursorIcon::NwResize,
+            (ResizeVerticalEdge::Top, ResizeHorizontalEdge::Right) => CursorIcon::NeResize,
+            (ResizeVerticalEdge::Bottom, ResizeHorizontalEdge::Left) => CursorIcon::SwResize,
+            (ResizeVerticalEdge::Bottom, ResizeHorizontalEdge::Right) => CursorIcon::SeResize,
+        }
+    }
+}
+
+/// State for an in-progress floating window resize (Super + RMB drag).
+#[derive(Debug, Clone)]
+pub struct ResizeGrab {
+    /// The window being resized.
+    pub window: Window,
+    /// Pointer position when the resize started.
+    pub start_pointer: Point<f64, Logical>,
+    /// Window position when the resize started.
+    pub start_window_pos: Point<i32, Logical>,
+    /// Window size when the resize started.
+    pub start_window_size: Size<i32, Logical>,
+    /// Which edges of the window are following the pointer.
+    pub edges: ResizeEdges,
+    /// Latest requested window position during the interactive resize.
+    pub current_window_pos: Point<i32, Logical>,
+    /// Latest requested window size during the interactive resize.
+    pub current_window_size: Size<i32, Logical>,
 }
 
 /// The main compositor state.
@@ -119,6 +170,7 @@ pub struct Beewm {
     pub layout: Box<dyn Layout>,
     pub workspaces: Vec<Workspace>,
     pub workspace_windows: Vec<Vec<Window>>,
+    pub(crate) dwindle_trees: Vec<DwindleTree<WlSurface>>,
     pub active_workspace: usize,
     /// Windows that have been created but not yet committed their first buffer.
     pub pending_windows: Vec<Window>,
@@ -140,6 +192,8 @@ pub struct Beewm {
     pub floating_windows: HashMap<WlSurface, Point<i32, Logical>>,
     /// Active floating-window move grab (Super + left-click drag).
     pub move_grab: Option<MoveGrab>,
+    /// Active floating-window resize grab (Super + right-click drag).
+    pub resize_grab: Option<ResizeGrab>,
     /// Pre-resolved keybindings (no per-keypress string allocs).
     pub resolved_keybinds: Vec<ResolvedKeybind>,
     /// Cached border colours derived from config (avoid per-frame conversion).
@@ -220,6 +274,7 @@ impl Beewm {
             layout,
             workspaces: (0..num_ws).map(|_| Workspace::default()).collect(),
             workspace_windows: (0..num_ws).map(|_| Vec::new()).collect(),
+            dwindle_trees: (0..num_ws).map(|_| DwindleTree::default()).collect(),
             active_workspace: 0,
             pending_windows: Vec::new(),
             window_lookup: HashMap::new(),
@@ -230,6 +285,7 @@ impl Beewm {
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
             move_grab: None,
+            resize_grab: None,
             resolved_keybinds,
             border_color_focused,
             border_color_unfocused,

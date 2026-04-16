@@ -27,6 +27,8 @@ impl Beewm {
                 });
                 toplevel.send_configure();
             }
+            let split_target = self.focused_tiled_window_root(self.active_workspace);
+            self.insert_tiled_window(self.active_workspace, &window, split_target.as_ref());
             self.relayout();
         } else {
             // Tile → float: resize to half the screen and center.
@@ -47,6 +49,7 @@ impl Beewm {
                 });
                 toplevel.send_configure();
             }
+            self.remove_tiled_window(self.active_workspace, &root);
             self.space.map_element(window.clone(), pos, true);
             self.floating_windows.insert(root, pos);
             // Relayout the remaining tiled windows.
@@ -180,17 +183,14 @@ impl Beewm {
         let tiled_windows: Vec<Window> = windows
             .iter()
             .filter(|w| {
-                let is_fullscreen = self
-                    .fullscreen_window
+                let root = Self::window_root_surface(w);
+                let is_fullscreen = root
                     .as_ref()
-                    .map(|fs| *fs == **w)
+                    .map(|root| self.is_root_fullscreen(root))
                     .unwrap_or(false);
-                let is_floating = w
-                    .toplevel()
-                    .map(|t| {
-                        self.floating_windows
-                            .contains_key(&root_surface(t.wl_surface()))
-                    })
+                let is_floating = root
+                    .as_ref()
+                    .map(|root| self.is_root_floating(root))
                     .unwrap_or(false);
                 !is_fullscreen && !is_floating
             })
@@ -198,12 +198,25 @@ impl Beewm {
             .collect();
         let tile_count = tiled_windows.len();
         if tile_count == 0 {
+            self.remap_floating_windows();
             return;
         }
 
-        let geos = self.layout.apply(&usable, tile_count);
+        let dwindle_geometries = self.dwindle_geometries(self.active_workspace, &usable);
+        let fallback_geos = (self.config.layout != crate::config::LayoutKind::Dwindle)
+            .then(|| self.layout.apply(&usable, tile_count));
 
-        for (window, geo) in tiled_windows.iter().zip(geos.iter()) {
+        for (index, window) in tiled_windows.iter().enumerate() {
+            let geo = Self::window_root_surface(window)
+                .and_then(|root| dwindle_geometries.get(&root).copied())
+                .or_else(|| {
+                    fallback_geos
+                        .as_ref()
+                        .and_then(|geos| geos.get(index).copied())
+                });
+            let Some(geo) = geo else {
+                continue;
+            };
             let x = geo.x + gap;
             let y = geo.y + gap;
             let w = (geo.width as i32 - gap * 2 - bw * 2).max(1);
@@ -290,8 +303,24 @@ impl Beewm {
         self.space.unmap_elem(&window);
 
         // Add to target workspace
+        let split_target = self.focused_tiled_window_root(target);
+        let window_root = Self::window_root_surface(&window);
+        let is_floating = window_root
+            .as_ref()
+            .map(|root| self.is_root_floating(root))
+            .unwrap_or(false);
+        if let Some(root) = window_root.as_ref() {
+            self.remove_tiled_window(current, root);
+        }
         self.workspace_windows[target].push(window);
         self.workspaces[target].add_window();
+        if !is_floating {
+            let inserted = self.workspace_windows[target]
+                .last()
+                .cloned()
+                .expect("just pushed a window");
+            self.insert_tiled_window(target, &inserted, split_target.as_ref());
+        }
 
         tracing::info!(
             "Moved window from workspace {} to {}",

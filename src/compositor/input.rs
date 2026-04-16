@@ -7,15 +7,22 @@ use smithay::backend::session::Session;
 use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::{Logical, Point, SERIAL_COUNTER, Size};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
 };
 
 use super::commands::spawn_shell_command;
-use super::state::{Beewm, MoveGrab};
+use super::state::{
+    Beewm, MoveGrab, ResizeEdges, ResizeGrab, ResizeHorizontalEdge, ResizeVerticalEdge,
+};
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const MIN_FLOATING_WINDOW_SIZE: i32 = 1;
 
 /// Returns `true` when keyboard focus is currently on a layer-shell surface
 /// (e.g. wofi).  In that case focus-follows-mouse must NOT steal focus away.
@@ -280,29 +287,7 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     state.pointer_location = new_pos;
     state.needs_render = true;
 
-    // If we are in a floating-window move grab, move the window and skip
-    // normal pointer dispatch so the client doesn't see spurious leave events.
-    if let Some(ref grab) = state.move_grab.clone() {
-        let dx = (new_pos.x - grab.start_pointer.x) as i32;
-        let dy = (new_pos.y - grab.start_pointer.y) as i32;
-        let new_win_pos = smithay::utils::Point::from((
-            grab.start_window_pos.x + dx,
-            grab.start_window_pos.y + dy,
-        ));
-        state
-            .space
-            .map_element(grab.window.clone(), new_win_pos, true);
-        // Update the stored floating position so relayout doesn't revert it.
-        if let Some(toplevel) = grab.window.toplevel() {
-            let root = {
-                let mut r = toplevel.wl_surface().clone();
-                while let Some(p) = smithay::wayland::compositor::get_parent(&r) {
-                    r = p;
-                }
-                r
-            };
-            state.floating_windows.insert(root, new_win_pos);
-        }
+    if handle_active_floating_grab(state, new_pos) {
         return;
     }
 
@@ -367,6 +352,10 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
     state.pointer_location = pos;
     state.needs_render = true;
 
+    if handle_active_floating_grab(state, pos) {
+        return;
+    }
+
     let serial = SERIAL_COUNTER.next_serial();
     let pointer = state.seat.get_pointer().unwrap();
 
@@ -407,39 +396,10 @@ fn handle_pointer_button<I: InputBackend>(state: &mut Beewm, event: I::PointerBu
     let button = event.button_code();
     let btn_state = event.state();
 
-    // BTN_LEFT = 0x110 = 272
-    const BTN_LEFT: u32 = 0x110;
-
     // Super + LMB press on a floating window → start move grab.
     if button == BTN_LEFT && btn_state == ButtonState::Pressed {
-        let keyboard = state.seat.get_keyboard().unwrap();
-        let modifiers = keyboard.modifier_state();
-        if modifiers.logo {
-            if let Some((surface, _)) = surface_under(state, state.pointer_location) {
-                if let Some(window) = state.mapped_window_for_surface(&surface) {
-                    let root = {
-                        let mut r = surface.clone();
-                        while let Some(p) = smithay::wayland::compositor::get_parent(&r) {
-                            r = p;
-                        }
-                        r
-                    };
-                    if state.floating_windows.contains_key(&root) {
-                        let win_pos = state
-                            .space
-                            .element_geometry(&window)
-                            .map(|g| g.loc)
-                            .unwrap_or_default();
-                        state.move_grab = Some(MoveGrab {
-                            window: window.clone(),
-                            start_pointer: state.pointer_location,
-                            start_window_pos: win_pos,
-                        });
-                        // Don't forward this button press to the client.
-                        return;
-                    }
-                }
-            }
+        if try_start_move_grab(state) {
+            return;
         }
     }
 
@@ -449,6 +409,20 @@ fn handle_pointer_button<I: InputBackend>(state: &mut Beewm, event: I::PointerBu
             // Grab ended; restore compositor cursor (was Grabbing during drag).
             state.refresh_compositor_cursor();
             // Don't forward the release to the client.
+            return;
+        }
+    }
+
+    // Super + RMB press on a floating window → start resize grab.
+    if button == BTN_RIGHT && btn_state == ButtonState::Pressed {
+        if try_start_resize_grab(state) {
+            return;
+        }
+    }
+
+    // RMB release → end resize grab.
+    if button == BTN_RIGHT && btn_state == ButtonState::Released {
+        if finish_resize_grab(state) {
             return;
         }
     }
@@ -506,4 +480,319 @@ fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxis
 
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+fn handle_active_floating_grab(state: &mut Beewm, pointer: Point<f64, Logical>) -> bool {
+    if let Some(grab) = state.move_grab.clone() {
+        apply_move_grab(state, &grab, pointer);
+        return true;
+    }
+
+    if let Some(grab) = state.resize_grab.clone() {
+        apply_resize_grab(state, &grab, pointer);
+        return true;
+    }
+
+    false
+}
+
+fn apply_move_grab(state: &mut Beewm, grab: &MoveGrab, pointer: Point<f64, Logical>) {
+    let dx = (pointer.x - grab.start_pointer.x) as i32;
+    let dy = (pointer.y - grab.start_pointer.y) as i32;
+    let new_window_pos = Point::from((grab.start_window_pos.x + dx, grab.start_window_pos.y + dy));
+    state
+        .space
+        .map_element(grab.window.clone(), new_window_pos, true);
+    if let Some(root) = Beewm::window_root_surface(&grab.window) {
+        state.floating_windows.insert(root, new_window_pos);
+    }
+}
+
+fn apply_resize_grab(state: &mut Beewm, grab: &ResizeGrab, pointer: Point<f64, Logical>) {
+    let (new_window_pos, new_window_size) = resized_window_geometry(grab, pointer);
+    state
+        .space
+        .map_element(grab.window.clone(), new_window_pos, true);
+
+    if let Some(root) = Beewm::window_root_surface(&grab.window) {
+        state.floating_windows.insert(root, new_window_pos);
+    }
+
+    if let Some(toplevel) = grab.window.toplevel() {
+        toplevel.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Resizing);
+            state.size = Some(Size::from((new_window_size.w, new_window_size.h)));
+        });
+        toplevel.send_pending_configure();
+    }
+
+    if let Some(active_grab) = state.resize_grab.as_mut() {
+        active_grab.current_window_pos = new_window_pos;
+        active_grab.current_window_size = new_window_size;
+    }
+}
+
+fn try_start_move_grab(state: &mut Beewm) -> bool {
+    let Some(window) = floating_window_under_pointer_with_logo(state) else {
+        return false;
+    };
+
+    let Some(window_geo) = state.space.element_geometry(&window) else {
+        return false;
+    };
+
+    focus_and_raise_window(state, &window);
+    state.move_grab = Some(MoveGrab {
+        window,
+        start_pointer: state.pointer_location,
+        start_window_pos: window_geo.loc,
+    });
+    state.refresh_compositor_cursor();
+    true
+}
+
+fn try_start_resize_grab(state: &mut Beewm) -> bool {
+    let Some(window) = floating_window_under_pointer_with_logo(state) else {
+        return false;
+    };
+
+    let Some(window_geo) = state.space.element_geometry(&window) else {
+        return false;
+    };
+
+    let edges = resize_edges_for_pointer(window_geo.loc, window_geo.size, state.pointer_location);
+    focus_and_raise_window(state, &window);
+
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Resizing);
+            state.size = Some(Size::from((window_geo.size.w, window_geo.size.h)));
+        });
+        toplevel.send_pending_configure();
+    }
+
+    state.resize_grab = Some(ResizeGrab {
+        window,
+        start_pointer: state.pointer_location,
+        start_window_pos: window_geo.loc,
+        start_window_size: window_geo.size,
+        edges,
+        current_window_pos: window_geo.loc,
+        current_window_size: window_geo.size,
+    });
+    state.refresh_compositor_cursor();
+    true
+}
+
+fn finish_resize_grab(state: &mut Beewm) -> bool {
+    let Some(grab) = state.resize_grab.take() else {
+        return false;
+    };
+
+    if let Some(toplevel) = grab.window.toplevel() {
+        toplevel.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Resizing);
+            state.size = Some(Size::from((
+                grab.current_window_size.w,
+                grab.current_window_size.h,
+            )));
+        });
+        toplevel.send_configure();
+    }
+
+    state
+        .space
+        .map_element(grab.window.clone(), grab.current_window_pos, true);
+    if let Some(root) = Beewm::window_root_surface(&grab.window) {
+        state.floating_windows.insert(root, grab.current_window_pos);
+    }
+    state.refresh_compositor_cursor();
+    true
+}
+
+fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<smithay::desktop::Window> {
+    let keyboard = state.seat.get_keyboard().unwrap();
+    let modifiers = keyboard.modifier_state();
+    if !modifiers.logo {
+        return None;
+    }
+
+    let (surface, _) = surface_under(state, state.pointer_location)?;
+    let window = state.mapped_window_for_surface(&surface)?;
+    let root = Beewm::window_root_surface(&window)?;
+    state.floating_windows.contains_key(&root).then_some(window)
+}
+
+fn focus_and_raise_window(state: &mut Beewm, window: &smithay::desktop::Window) {
+    if let Some(toplevel) = window.toplevel() {
+        state.set_keyboard_focus(Some(toplevel.wl_surface().clone()));
+    }
+    state.space.raise_element(window, true);
+    state.needs_render = true;
+}
+
+fn resize_edges_for_pointer(
+    window_pos: Point<i32, Logical>,
+    window_size: Size<i32, Logical>,
+    pointer: Point<f64, Logical>,
+) -> ResizeEdges {
+    let center_x = window_pos.x as f64 + window_size.w as f64 / 2.0;
+    let center_y = window_pos.y as f64 + window_size.h as f64 / 2.0;
+
+    ResizeEdges {
+        horizontal: if pointer.x < center_x {
+            ResizeHorizontalEdge::Left
+        } else {
+            ResizeHorizontalEdge::Right
+        },
+        vertical: if pointer.y < center_y {
+            ResizeVerticalEdge::Top
+        } else {
+            ResizeVerticalEdge::Bottom
+        },
+    }
+}
+
+fn resized_window_geometry(
+    grab: &ResizeGrab,
+    pointer: Point<f64, Logical>,
+) -> (Point<i32, Logical>, Size<i32, Logical>) {
+    resized_window_geometry_from_start(
+        grab.start_window_pos,
+        grab.start_window_size,
+        grab.start_pointer,
+        pointer,
+        grab.edges,
+    )
+}
+
+fn resized_window_geometry_from_start(
+    start_window_pos: Point<i32, Logical>,
+    start_window_size: Size<i32, Logical>,
+    start_pointer: Point<f64, Logical>,
+    pointer: Point<f64, Logical>,
+    edges: ResizeEdges,
+) -> (Point<i32, Logical>, Size<i32, Logical>) {
+    let dx = (pointer.x - start_pointer.x) as i32;
+    let dy = (pointer.y - start_pointer.y) as i32;
+
+    let start_left = start_window_pos.x;
+    let start_top = start_window_pos.y;
+    let start_right = start_left + start_window_size.w.max(MIN_FLOATING_WINDOW_SIZE);
+    let start_bottom = start_top + start_window_size.h.max(MIN_FLOATING_WINDOW_SIZE);
+
+    let (new_x, new_width) = match edges.horizontal {
+        ResizeHorizontalEdge::Left => {
+            let new_x = (start_left + dx).min(start_right - MIN_FLOATING_WINDOW_SIZE);
+            let new_width = (start_right - new_x).max(MIN_FLOATING_WINDOW_SIZE);
+            (new_x, new_width)
+        }
+        ResizeHorizontalEdge::Right => {
+            let new_width = (start_window_size.w + dx).max(MIN_FLOATING_WINDOW_SIZE);
+            (start_left, new_width)
+        }
+    };
+
+    let (new_y, new_height) = match edges.vertical {
+        ResizeVerticalEdge::Top => {
+            let new_y = (start_top + dy).min(start_bottom - MIN_FLOATING_WINDOW_SIZE);
+            let new_height = (start_bottom - new_y).max(MIN_FLOATING_WINDOW_SIZE);
+            (new_y, new_height)
+        }
+        ResizeVerticalEdge::Bottom => {
+            let new_height = (start_window_size.h + dy).max(MIN_FLOATING_WINDOW_SIZE);
+            (start_top, new_height)
+        }
+    };
+
+    (
+        Point::from((new_x, new_y)),
+        Size::from((new_width, new_height)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge, resize_edges_for_pointer,
+        resized_window_geometry_from_start,
+    };
+    use smithay::utils::{Logical, Point, Size};
+
+    #[test]
+    fn resize_edges_use_the_window_center_as_the_anchor_split() {
+        let edges = resize_edges_for_pointer(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 200)),
+            Point::<f64, Logical>::from((120.0, 220.0)),
+        );
+        assert_eq!(
+            edges,
+            ResizeEdges {
+                horizontal: ResizeHorizontalEdge::Left,
+                vertical: ResizeVerticalEdge::Top,
+            }
+        );
+
+        let edges = resize_edges_for_pointer(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 200)),
+            Point::<f64, Logical>::from((399.0, 399.0)),
+        );
+        assert_eq!(
+            edges,
+            ResizeEdges {
+                horizontal: ResizeHorizontalEdge::Right,
+                vertical: ResizeVerticalEdge::Bottom,
+            }
+        );
+    }
+
+    #[test]
+    fn resizing_from_the_bottom_right_grows_width_and_height_only() {
+        let (pos, size) = resized_window_geometry_from_start(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 150)),
+            Point::<f64, Logical>::from((400.0, 350.0)),
+            Point::<f64, Logical>::from((460.0, 390.0)),
+            ResizeEdges {
+                horizontal: ResizeHorizontalEdge::Right,
+                vertical: ResizeVerticalEdge::Bottom,
+            },
+        );
+        assert_eq!(pos, Point::from((100, 200)));
+        assert_eq!(size, Size::from((360, 190)));
+    }
+
+    #[test]
+    fn resizing_from_the_top_left_keeps_the_bottom_right_corner_fixed() {
+        let (pos, size) = resized_window_geometry_from_start(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 150)),
+            Point::<f64, Logical>::from((100.0, 200.0)),
+            Point::<f64, Logical>::from((70.0, 170.0)),
+            ResizeEdges {
+                horizontal: ResizeHorizontalEdge::Left,
+                vertical: ResizeVerticalEdge::Top,
+            },
+        );
+        assert_eq!(pos, Point::from((70, 170)));
+        assert_eq!(size, Size::from((330, 180)));
+    }
+
+    #[test]
+    fn resizing_from_left_and_top_clamps_at_one_pixel() {
+        let (pos, size) = resized_window_geometry_from_start(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 150)),
+            Point::<f64, Logical>::from((100.0, 200.0)),
+            Point::<f64, Logical>::from((500.0, 500.0)),
+            ResizeEdges {
+                horizontal: ResizeHorizontalEdge::Left,
+                vertical: ResizeVerticalEdge::Top,
+            },
+        );
+        assert_eq!(pos, Point::from((399, 349)));
+        assert_eq!(size, Size::from((1, 1)));
+    }
 }
