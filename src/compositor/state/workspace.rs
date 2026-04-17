@@ -6,6 +6,27 @@ use crate::model::window::Geometry;
 
 use super::{root_surface, Beewm};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatToggleTransition {
+    SinkToTiling,
+    KeepFloating,
+    MakeFloating,
+}
+
+fn float_toggle_transition(is_fullscreen: bool, is_floating: bool) -> FloatToggleTransition {
+    if is_fullscreen {
+        if is_floating {
+            FloatToggleTransition::KeepFloating
+        } else {
+            FloatToggleTransition::MakeFloating
+        }
+    } else if is_floating {
+        FloatToggleTransition::SinkToTiling
+    } else {
+        FloatToggleTransition::MakeFloating
+    }
+}
+
 impl Beewm {
     /// Toggle the floating state of the currently focused window.
     pub fn toggle_float(&mut self) {
@@ -19,42 +40,34 @@ impl Beewm {
         };
         let root = root_surface(&surface);
 
-        if self.floating_windows.remove(&root).is_some() {
-            // Was floating — sink back into tiling.
-            if let Some(toplevel) = window.toplevel() {
-                toplevel.with_pending_state(|s| {
-                    s.states.unset(xdg_toplevel::State::Resizing);
-                });
-                toplevel.send_configure();
+        let is_fullscreen = self.is_root_fullscreen(&root);
+        let is_floating = self.is_root_floating(&root);
+
+        if is_fullscreen {
+            self.exit_fullscreen_internal(false);
+        }
+
+        match float_toggle_transition(is_fullscreen, is_floating) {
+            FloatToggleTransition::SinkToTiling => {
+                self.floating_windows.remove(&root);
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|s| {
+                        s.states.unset(xdg_toplevel::State::Resizing);
+                    });
+                    toplevel.send_configure();
+                }
+                let split_target = self.focused_tiled_window_root(self.active_workspace);
+                self.insert_tiled_window(self.active_workspace, &window, split_target.as_ref());
+                self.relayout();
             }
-            let split_target = self.focused_tiled_window_root(self.active_workspace);
-            self.insert_tiled_window(self.active_workspace, &window, split_target.as_ref());
-            self.relayout();
-        } else {
-            // Tile → float: resize to half the screen and center.
-            let output = match self.space.outputs().next().cloned() {
-                Some(o) => o,
-                None => return,
-            };
-            let output_geo = self.space.output_geometry(&output).unwrap();
-            let float_w = output_geo.size.w / 2;
-            let float_h = output_geo.size.h / 2;
-            let pos = Point::from((
-                output_geo.loc.x + (output_geo.size.w - float_w) / 2,
-                output_geo.loc.y + (output_geo.size.h - float_h) / 2,
-            ));
-            if let Some(toplevel) = window.toplevel() {
-                toplevel.with_pending_state(|s| {
-                    s.size = Some(Size::from((float_w, float_h)));
-                });
-                toplevel.send_configure();
+            FloatToggleTransition::KeepFloating => {
+                self.relayout();
+                self.space.raise_element(&window, true);
+                self.needs_render = true;
             }
-            self.remove_tiled_window(self.active_workspace, &root);
-            self.space.map_element(window.clone(), pos, true);
-            self.floating_windows.insert(root, pos);
-            // Relayout the remaining tiled windows.
-            self.relayout();
-            self.needs_render = true;
+            FloatToggleTransition::MakeFloating => {
+                self.float_window(window);
+            }
         }
     }
 
@@ -137,6 +150,36 @@ impl Beewm {
         self.space.map_element(window.clone(), pos, true);
     }
 
+    fn float_window(&mut self, window: Window) {
+        let root = match window.toplevel().map(|t| root_surface(t.wl_surface())) {
+            Some(r) => r,
+            None => return,
+        };
+        let output = match self.space.outputs().next().cloned() {
+            Some(o) => o,
+            None => return,
+        };
+        let output_geo = self.space.output_geometry(&output).unwrap();
+        let float_w = output_geo.size.w / 2;
+        let float_h = output_geo.size.h / 2;
+        let pos = Point::from((
+            output_geo.loc.x + (output_geo.size.w - float_w) / 2,
+            output_geo.loc.y + (output_geo.size.h - float_h) / 2,
+        ));
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|s| {
+                s.states.unset(xdg_toplevel::State::Fullscreen);
+                s.size = Some(Size::from((float_w, float_h)));
+            });
+            toplevel.send_configure();
+        }
+        self.remove_tiled_window(self.active_workspace, &root);
+        self.space.map_element(window.clone(), pos, true);
+        self.floating_windows.insert(root, pos);
+        self.relayout();
+        self.needs_render = true;
+    }
+
     /// Re-place all floating windows on the active workspace back into the
     /// space at their stored positions. Called after relayout so they sit
     /// on top of tiled windows.
@@ -155,23 +198,8 @@ impl Beewm {
 
     /// Toggle fullscreen for the currently focused window.
     pub fn toggle_fullscreen(&mut self) {
-        if let Some(fs_window) = self.fullscreen_window.take() {
-            // Tell the client it is no longer fullscreen.
-            if let Some(toplevel) = fs_window.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Fullscreen);
-                    state.size = None;
-                });
-                toplevel.send_configure();
-            }
-            // Remap all sibling windows that were hidden behind the fullscreen one.
-            let ws_idx = self.active_workspace;
-            for window in self.workspace_windows[ws_idx].clone() {
-                if self.space.element_geometry(&window).is_none() {
-                    self.space.map_element(window, (0, 0), false);
-                }
-            }
-            self.relayout();
+        if self.fullscreen_window.is_some() {
+            self.exit_fullscreen_internal(true);
         } else {
             let window = match self.active_workspace_focused_window().cloned() {
                 Some(w) => w,
@@ -206,24 +234,35 @@ impl Beewm {
     /// Exit fullscreen (if any) and restore the tiled layout.
     /// Used when switching workspaces so siblings are remapped correctly.
     pub fn restore_fullscreen(&mut self) {
-        if let Some(fs_window) = self.fullscreen_window.take() {
-            if let Some(toplevel) = fs_window.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Fullscreen);
-                    state.size = None;
-                });
-                toplevel.send_configure();
-            }
-            // Remap hidden siblings before the workspace is unmapped.
-            let ws_idx = self.active_workspace;
-            for window in self.workspace_windows[ws_idx].clone() {
-                if self.space.element_geometry(&window).is_none() {
-                    self.space.map_element(window, (0, 0), false);
-                }
-            }
-            self.relayout();
-            // relayout calls remap_floating_windows internally.
+        self.exit_fullscreen_internal(true);
+        // relayout calls remap_floating_windows internally.
+    }
+
+    fn exit_fullscreen_internal(&mut self, relayout: bool) -> Option<Window> {
+        let fs_window = self.fullscreen_window.take()?;
+
+        if let Some(toplevel) = fs_window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                state.size = None;
+            });
+            toplevel.send_configure();
         }
+
+        let ws_idx = self.active_workspace;
+        for window in self.workspace_windows[ws_idx].clone() {
+            if self.space.element_geometry(&window).is_none() {
+                self.space.map_element(window, (0, 0), false);
+            }
+        }
+
+        if relayout {
+            self.relayout();
+        } else {
+            self.needs_render = true;
+        }
+
+        Some(fs_window)
     }
 
     /// Re-tile all windows in the space using the current layout.
@@ -420,5 +459,34 @@ impl Beewm {
         } else {
             self.set_keyboard_focus(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{float_toggle_transition, FloatToggleTransition};
+
+    #[test]
+    fn fullscreened_floating_window_stays_floating_when_toggling_float() {
+        assert_eq!(
+            float_toggle_transition(true, true),
+            FloatToggleTransition::KeepFloating
+        );
+    }
+
+    #[test]
+    fn fullscreened_tiled_window_becomes_floating_when_toggling_float() {
+        assert_eq!(
+            float_toggle_transition(true, false),
+            FloatToggleTransition::MakeFloating
+        );
+    }
+
+    #[test]
+    fn non_fullscreen_floating_window_sinks_back_to_tiling() {
+        assert_eq!(
+            float_toggle_transition(false, true),
+            FloatToggleTransition::SinkToTiling
+        );
     }
 }
