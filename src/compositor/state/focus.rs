@@ -3,7 +3,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::seat::WaylandFocus;
 
-use super::{root_surface, Beewm};
+use super::{Beewm, root_surface};
 
 impl Beewm {
     pub fn invalidate_borders(&mut self) {

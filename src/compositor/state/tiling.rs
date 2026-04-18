@@ -6,7 +6,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::config::LayoutKind;
 use crate::model::window::Geometry;
 
-use super::{root_surface, Beewm};
+use super::{Beewm, root_surface};
 
 #[derive(Debug, Clone, Copy)]
 enum SplitAxis {

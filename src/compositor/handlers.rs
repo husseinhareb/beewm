@@ -96,6 +96,8 @@ impl CompositorHandler for Beewm {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        self.popup_manager.commit(surface);
+
         // Process buffer attachment for the surface tree — required for
         // the renderer to see committed wl_buffer contents.
         on_commit_buffer_handler::<Self>(surface);
@@ -114,6 +116,7 @@ impl CompositorHandler for Beewm {
             let split_target = self.focused_tiled_window_root(ws_idx);
             self.workspace_windows[ws_idx].push(window.clone());
             self.workspaces[ws_idx].add_window();
+            self.publish_workspace_state();
             self.track_window(&window);
             // Propagate the first commit through the window's surface tree.
             window.on_commit();
@@ -307,6 +310,7 @@ impl XdgShellHandler for Beewm {
                 self.remove_tiled_window(ws_idx, target_surface);
                 self.space.unmap_elem(&window);
                 self.workspaces[ws_idx].remove_window(pos);
+                self.publish_workspace_state();
                 if ws_idx == self.active_workspace {
                     if should_restore_focus {
                         let focus = self.workspaces[self.active_workspace]

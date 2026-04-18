@@ -4,7 +4,7 @@ use smithay::utils::{Point, Size};
 
 use crate::model::window::Geometry;
 
-use super::{root_surface, Beewm};
+use super::{Beewm, FloatingWindowData, root_surface};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FloatToggleTransition {
@@ -146,7 +146,10 @@ impl Beewm {
             output_geo.loc.x + (output_geo.size.w - win_w) / 2,
             output_geo.loc.y + (output_geo.size.h - win_h) / 2,
         ));
-        self.floating_windows.insert(root, pos);
+        self.floating_windows.insert(
+            root,
+            FloatingWindowData::new(pos, Size::from((win_w, win_h))),
+        );
         self.space.map_element(window.clone(), pos, true);
     }
 
@@ -175,7 +178,10 @@ impl Beewm {
         }
         self.remove_tiled_window(self.active_workspace, &root);
         self.space.map_element(window.clone(), pos, true);
-        self.floating_windows.insert(root, pos);
+        self.floating_windows.insert(
+            root,
+            FloatingWindowData::new(pos, Size::from((float_w, float_h))),
+        );
         self.relayout();
         self.needs_render = true;
     }
@@ -190,8 +196,8 @@ impl Beewm {
                 Some(surface) => root_surface(&surface),
                 None => continue,
             };
-            if let Some(&pos) = self.floating_windows.get(&root) {
-                self.space.map_element(window, pos, false);
+            if let Some(floating) = self.floating_windows.get(&root).copied() {
+                self.space.map_element(window, floating.position, false);
             }
         }
     }
@@ -240,13 +246,20 @@ impl Beewm {
 
     fn exit_fullscreen_internal(&mut self, relayout: bool) -> Option<Window> {
         let fs_window = self.fullscreen_window.take()?;
+        let restore_floating = Self::window_root_surface(&fs_window)
+            .and_then(|root| self.floating_windows.get(&root).copied());
 
         if let Some(toplevel) = fs_window.toplevel() {
             toplevel.with_pending_state(|state| {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
-                state.size = None;
+                state.size = restore_floating.map(|floating| floating.size);
             });
             toplevel.send_configure();
+        }
+
+        if let Some(floating) = restore_floating {
+            self.space
+                .map_element(fs_window.clone(), floating.position, true);
         }
 
         let ws_idx = self.active_workspace;
@@ -378,7 +391,7 @@ impl Beewm {
         }
 
         self.active_workspace = idx;
-        self.publish_active_workspace_state();
+        self.publish_workspace_state();
 
         self.needs_render = true;
         self.relayout();
@@ -439,6 +452,7 @@ impl Beewm {
                 .expect("just pushed a window");
             self.insert_tiled_window(target, &inserted, split_target.as_ref());
         }
+        self.publish_workspace_state();
 
         tracing::info!(
             "Moved window from workspace {} to {}",
@@ -464,7 +478,7 @@ impl Beewm {
 
 #[cfg(test)]
 mod tests {
-    use super::{float_toggle_transition, FloatToggleTransition};
+    use super::{FloatToggleTransition, float_toggle_transition};
 
     #[test]
     fn fullscreened_floating_window_stays_floating_when_toggling_float() {

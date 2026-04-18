@@ -1,7 +1,7 @@
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::CommitCounter;
-use smithay::desktop::{layer_map_for_output, Window};
+use smithay::desktop::{Window, layer_map_for_output};
 use smithay::utils::{Coordinate, Logical, Physical, Rectangle};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
@@ -309,9 +309,11 @@ mod tests {
         let visible = visible_border_rectangles(window, 2, &[floating_with_border]);
 
         assert!(!visible.is_empty());
-        assert!(visible
-            .iter()
-            .all(|rect| !rect.overlaps(floating_with_border)));
+        assert!(
+            visible
+                .iter()
+                .all(|rect| !rect.overlaps(floating_with_border))
+        );
         assert!(visible.iter().any(|rect| rect.loc.y == 98));
     }
 }

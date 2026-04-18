@@ -21,7 +21,7 @@ use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::{spawn_startup_commands, ChildEnvironment};
+use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -427,4 +427,4 @@ fn apply_cursor(
     }
 }
 
-// 
+//

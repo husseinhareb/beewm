@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Format;
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime};
@@ -13,26 +13,26 @@ use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Event as SessionEvent;
 use smithay::backend::session::Session;
+use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
-use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
+use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::ScrollMethod;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::utils::{Monotonic, Time};
-use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::{spawn_startup_commands, ChildEnvironment};
+use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -40,7 +40,7 @@ use crate::compositor::feedback::{
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
 use crate::compositor::render::{
-    layer_render_elements, window_render_elements, OutputRenderElement,
+    OutputRenderElement, layer_render_elements, window_render_elements,
 };
 use crate::compositor::state::{Beewm, ClientState};
 

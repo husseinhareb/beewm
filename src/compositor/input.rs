@@ -18,8 +18,8 @@ use smithay::wayland::shell::wlr_layer::{
 use super::commands::spawn_shell_command;
 use super::layering::{layers_hit_tested_after_windows, layers_hit_tested_before_windows};
 use super::state::{
-    Beewm, MoveGrab, ResizeEdges, ResizeGrab, ResizeHorizontalEdge, ResizeVerticalEdge,
-    TiledSwapGrab,
+    Beewm, FloatingWindowData, MoveGrab, ResizeEdges, ResizeGrab, ResizeHorizontalEdge,
+    ResizeVerticalEdge, TiledSwapGrab,
 };
 
 const BTN_LEFT: u32 = 0x110;
@@ -268,6 +268,16 @@ fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
     })
 }
 
+fn keyboard_focus_target_under_pointer(state: &Beewm, surface: &WlSurface) -> Option<WlSurface> {
+    if let Some(window) = state.mapped_window_for_surface(surface) {
+        return window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone());
+    }
+
+    surface_accepts_keyboard_focus(state, surface).then(|| surface.clone())
+}
+
 fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMotionEvent) {
     let output = match state.space.outputs().next() {
         Some(o) => o.clone(),
@@ -318,14 +328,18 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     // Never steal focus away from a layer-shell surface (e.g. wofi).
     if state.config.focus_follows_mouse && !layer_surface_has_keyboard_focus(state) {
         if let Some((surface, _)) = under {
+            let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
+                state.refresh_compositor_cursor();
+                return;
+            };
             let keyboard = state.seat.get_keyboard().unwrap();
             let already_focused = keyboard
                 .current_focus()
                 .as_ref()
-                .map(|f| *f == surface)
+                .map(|f| *f == target)
                 .unwrap_or(false);
-            if !already_focused && surface_accepts_keyboard_focus(state, &surface) {
-                keyboard.set_focus(state, Some(surface), serial);
+            if !already_focused {
+                keyboard.set_focus(state, Some(target), serial);
             }
         }
     }
@@ -372,14 +386,18 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
     // Never steal focus away from a layer-shell surface (e.g. wofi).
     if state.config.focus_follows_mouse && !layer_surface_has_keyboard_focus(state) {
         if let Some((surface, _)) = under {
+            let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
+                state.refresh_compositor_cursor();
+                return;
+            };
             let keyboard = state.seat.get_keyboard().unwrap();
             let already_focused = keyboard
                 .current_focus()
                 .as_ref()
-                .map(|f| *f == surface)
+                .map(|f| *f == target)
                 .unwrap_or(false);
-            if !already_focused && surface_accepts_keyboard_focus(state, &surface) {
-                keyboard.set_focus(state, Some(surface), serial);
+            if !already_focused {
+                keyboard.set_focus(state, Some(target), serial);
             }
         }
     }
@@ -512,7 +530,21 @@ fn apply_move_grab(state: &mut Beewm, grab: &MoveGrab, pointer: Point<f64, Logic
         .space
         .map_element(grab.window.clone(), new_window_pos, true);
     if let Some(root) = Beewm::window_root_surface(&grab.window) {
-        state.floating_windows.insert(root, new_window_pos);
+        let size = state
+            .space
+            .element_geometry(&grab.window)
+            .map(|geo| geo.size)
+            .or_else(|| {
+                state
+                    .floating_windows
+                    .get(&root)
+                    .map(|floating| floating.size)
+            });
+        if let Some(size) = size {
+            state
+                .floating_windows
+                .insert(root, FloatingWindowData::new(new_window_pos, size));
+        }
     }
 }
 
@@ -523,7 +555,10 @@ fn apply_resize_grab(state: &mut Beewm, grab: &ResizeGrab, pointer: Point<f64, L
         .map_element(grab.window.clone(), new_window_pos, true);
 
     if let Some(root) = Beewm::window_root_surface(&grab.window) {
-        state.floating_windows.insert(root, new_window_pos);
+        state.floating_windows.insert(
+            root,
+            FloatingWindowData::new(new_window_pos, new_window_size),
+        );
     }
 
     if let Some(toplevel) = grab.window.toplevel() {
@@ -677,7 +712,10 @@ fn finish_resize_grab(state: &mut Beewm) -> bool {
         .space
         .map_element(grab.window.clone(), grab.current_window_pos, true);
     if let Some(root) = Beewm::window_root_surface(&grab.window) {
-        state.floating_windows.insert(root, grab.current_window_pos);
+        state.floating_windows.insert(
+            root,
+            FloatingWindowData::new(grab.current_window_pos, grab.current_window_size),
+        );
     }
     state.refresh_compositor_cursor();
     true

@@ -7,9 +7,9 @@ mod workspace;
 use std::collections::HashMap;
 use std::fs;
 
+use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::sync::Fence;
-use smithay::backend::renderer::Color32F;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::xkb;
@@ -20,8 +20,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Clock, Logical, Monotonic, Point, Size};
 use smithay::wayland::compositor::{
-    add_blocker, add_pre_commit_hook, get_parent, with_states, CompositorClientState,
-    CompositorState,
+    CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
+    with_states,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -32,16 +32,16 @@ use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
-use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::config::{Action, Config, Keybind, LayoutKind};
+use crate::layout::Layout;
 use crate::layout::dwindle::Dwindle;
 use crate::layout::master_stack::MasterStack;
-use crate::layout::Layout;
 use crate::model::workspace::Workspace;
 
 use self::tiling::DwindleTree;
@@ -51,6 +51,7 @@ use super::commands::ChildEnvironment;
 use super::cursor::CursorThemeManager;
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
+const WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspaces";
 
 type SyncobjBlockerInstaller = dyn Fn(DrmSyncPointSource, Client);
 
@@ -134,6 +135,21 @@ pub struct ResizeGrab {
     pub current_window_size: Size<i32, Logical>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FloatingWindowData {
+    pub position: Point<i32, Logical>,
+    pub size: Size<i32, Logical>,
+}
+
+impl FloatingWindowData {
+    pub fn new(position: Point<i32, Logical>, size: Size<i32, Logical>) -> Self {
+        Self {
+            position,
+            size: Size::from((size.w.max(1), size.h.max(1))),
+        }
+    }
+}
+
 /// The main compositor state.
 pub struct Beewm {
     pub running: bool,
@@ -196,9 +212,10 @@ pub struct Beewm {
     pub fullscreen_window: Option<Window>,
     /// Tracks popup surfaces and provides grab support.
     pub popup_manager: PopupManager,
-    /// Floating windows (not subject to tiling) mapped to their last position.
-    /// The key is the root WlSurface; the value is where the window is placed.
-    pub floating_windows: HashMap<WlSurface, Point<i32, Logical>>,
+    /// Floating windows (not subject to tiling) mapped to their last geometry.
+    /// The key is the root WlSurface; the value is where the window is placed
+    /// and how large it should be when restored.
+    pub floating_windows: HashMap<WlSurface, FloatingWindowData>,
     /// Active floating-window move grab (Super + left-click drag).
     pub move_grab: Option<MoveGrab>,
     /// Active tiled-window swap grab (Super + left-click drag).
@@ -308,7 +325,7 @@ impl Beewm {
             child_env: ChildEnvironment::default(),
         };
 
-        state.publish_active_workspace_state();
+        state.publish_workspace_state();
         state
     }
 
@@ -351,12 +368,32 @@ impl Beewm {
         });
     }
 
-    fn publish_active_workspace_state(&self) {
+    pub(crate) fn publish_workspace_state(&self) {
         let workspace = (self.active_workspace + 1).to_string();
         if let Err(error) = fs::write(ACTIVE_WORKSPACE_STATE_PATH, workspace) {
             tracing::warn!(
                 "Failed to publish active workspace to {}: {}",
                 ACTIVE_WORKSPACE_STATE_PATH,
+                error
+            );
+        }
+
+        let occupied = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| workspace.window_count > 0)
+            .map(|(index, _)| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let state = format!(
+            "active={}\noccupied={occupied}\n",
+            self.active_workspace + 1
+        );
+        if let Err(error) = fs::write(WORKSPACE_STATE_PATH, state) {
+            tracing::warn!(
+                "Failed to publish workspace state to {}: {}",
+                WORKSPACE_STATE_PATH,
                 error
             );
         }

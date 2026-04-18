@@ -1,13 +1,13 @@
+use smithay::backend::renderer::ImportAll;
+use smithay::backend::renderer::Texture;
+use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::backend::renderer::ImportAll;
-use smithay::backend::renderer::Texture;
-use smithay::desktop::{layer_map_for_output, Space, Window};
+use smithay::desktop::{Space, Window, layer_map_for_output};
 use smithay::output::Output;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
