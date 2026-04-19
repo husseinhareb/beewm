@@ -6,6 +6,8 @@ mod workspace;
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
@@ -52,6 +54,7 @@ use super::cursor::CursorThemeManager;
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
 const WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspaces";
+static STATE_FILE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type SyncobjBlockerInstaller = dyn Fn(DrmSyncPointSource, Client);
 
@@ -369,8 +372,10 @@ impl Beewm {
     }
 
     pub(crate) fn publish_workspace_state(&self) {
-        let workspace = (self.active_workspace + 1).to_string();
-        if let Err(error) = fs::write(ACTIVE_WORKSPACE_STATE_PATH, workspace) {
+        let active_workspace = active_workspace_state_contents(self.active_workspace);
+        if let Err(error) =
+            write_state_file_atomically(Path::new(ACTIVE_WORKSPACE_STATE_PATH), &active_workspace)
+        {
             tracing::warn!(
                 "Failed to publish active workspace to {}: {}",
                 ACTIVE_WORKSPACE_STATE_PATH,
@@ -378,19 +383,8 @@ impl Beewm {
             );
         }
 
-        let occupied = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(_, workspace)| workspace.window_count > 0)
-            .map(|(index, _)| (index + 1).to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let state = format!(
-            "active={}\noccupied={occupied}\n",
-            self.active_workspace + 1
-        );
-        if let Err(error) = fs::write(WORKSPACE_STATE_PATH, state) {
+        let state = workspace_state_contents(self.active_workspace, &self.workspaces);
+        if let Err(error) = write_state_file_atomically(Path::new(WORKSPACE_STATE_PATH), &state) {
             tracing::warn!(
                 "Failed to publish workspace state to {}: {}",
                 WORKSPACE_STATE_PATH,
@@ -398,6 +392,42 @@ impl Beewm {
             );
         }
     }
+}
+
+fn active_workspace_state_contents(active_workspace: usize) -> String {
+    (active_workspace + 1).to_string()
+}
+
+fn workspace_state_contents(active_workspace: usize, workspaces: &[Workspace]) -> String {
+    let occupied = workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, workspace)| workspace.window_count > 0)
+        .map(|(index, _)| (index + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("active={}\noccupied={occupied}\n", active_workspace + 1)
+}
+
+fn write_state_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("beewm_state");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        STATE_FILE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    fs::write(&temp_path, contents)?;
+
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn build_layout(config: &Config) -> Box<dyn Layout> {
@@ -417,6 +447,80 @@ fn hex_to_color32f(hex: u32) -> Color32F {
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
     let b = (hex & 0xFF) as f32 / 255.0;
     Color32F::new(r, g, b, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::model::workspace::Workspace;
+
+    use super::{
+        active_workspace_state_contents, workspace_state_contents, write_state_file_atomically,
+    };
+
+    fn workspaces(count: usize) -> Vec<Workspace> {
+        std::iter::repeat_with(Workspace::default)
+            .take(count)
+            .collect()
+    }
+
+    #[test]
+    fn active_workspace_export_uses_one_based_numbers() {
+        assert_eq!(active_workspace_state_contents(0), "1");
+        assert_eq!(active_workspace_state_contents(4), "5");
+    }
+
+    #[test]
+    fn workspace_state_export_lists_active_and_occupied_workspaces() {
+        let mut workspaces = workspaces(5);
+        workspaces[0].add_window();
+        workspaces[2].add_window();
+        workspaces[4].add_window();
+
+        let state = workspace_state_contents(2, &workspaces);
+
+        assert_eq!(state, "active=3\noccupied=1,3,5\n");
+    }
+
+    #[test]
+    fn workspace_state_export_handles_no_occupied_workspaces() {
+        let workspaces = workspaces(3);
+
+        let state = workspace_state_contents(1, &workspaces);
+
+        assert_eq!(state, "active=2\noccupied=\n");
+    }
+
+    #[test]
+    fn state_file_writes_are_atomic_and_replace_previous_contents() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("beewm-state-test-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workspaces");
+
+        write_state_file_atomically(&path, "active=1\noccupied=1\n").unwrap();
+        write_state_file_atomically(&path, "active=2\noccupied=2,3\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "active=2\noccupied=2,3\n"
+        );
+
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
 }
 
 pub(super) fn root_surface(surface: &WlSurface) -> WlSurface {

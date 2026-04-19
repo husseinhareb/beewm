@@ -318,13 +318,16 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             render_frame(&mut data);
         }
         event_loop.dispatch(Some(Duration::from_millis(20)), &mut data)?;
+        // Process pending surface state (sends wl_surface.enter/leave)
+        // BEFORE flushing so clients receive enter events in the same
+        // batch as configures and frame callbacks.
+        data.state.space.refresh();
         // Flush outgoing Wayland events (configure, enter, frame callbacks, etc.)
         // MUST be called every loop iteration — without this, clients never
         // receive compositor-initiated events such as xdg_toplevel.configure.
         if let Err(err) = data.display.flush_clients() {
             tracing::warn!("Failed to flush Wayland clients: {}", err);
         }
-        data.state.space.refresh();
     }
 
     Ok(())

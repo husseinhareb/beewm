@@ -397,10 +397,12 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // Dispatch event loop
         let timeout = Duration::from_millis(16);
         event_loop.dispatch(Some(timeout), &mut data)?;
-        data.display.flush_clients()?;
 
-        // Process pending surface state
+        // Process pending surface state (sends wl_surface.enter/leave)
+        // BEFORE flushing so clients receive enter events in the same
+        // batch as configures and frame callbacks.
         data.state.space.refresh();
+        data.display.flush_clients()?;
     }
 
     Ok(())

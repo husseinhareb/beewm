@@ -239,11 +239,17 @@ impl XdgShellHandler for Beewm {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Send initial configure: tell client it is activated so it renders.
-        // We do NOT include a size here — the client picks its own initial size.
-        // After the initial commit, we map and relayout to apply tiling.
+        // Send an initial tiled size up front so terminals can render their
+        // first real frame at the target geometry instead of painting a blank
+        // placeholder and immediately resizing on first commit.
+        let initial_size = if surface.parent().is_none() {
+            self.initial_toplevel_size(surface.wl_surface())
+        } else {
+            None
+        };
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
+            state.size = initial_size;
         });
         surface.send_configure();
         let window = Window::new_wayland_window(surface);

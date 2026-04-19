@@ -1,5 +1,6 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Point, Size};
 
 use crate::model::window::Geometry;
@@ -28,6 +29,77 @@ fn float_toggle_transition(is_fullscreen: bool, is_floating: bool) -> FloatToggl
 }
 
 impl Beewm {
+    fn tiling_usable_geometry(&self) -> Option<Geometry> {
+        let output = self.space.outputs().next()?.clone();
+        let output_geo = self.space.output_geometry(&output)?;
+        let gap = self.config.gap as i32;
+
+        // Respect layer-shell exclusive zones (for example bars) when sizing
+        // tiled windows before they commit their first visible frame.
+        let non_exclusive = {
+            let lm = smithay::desktop::layer_map_for_output(&output);
+            lm.non_exclusive_zone()
+        };
+        let tile_origin = output_geo.loc + non_exclusive.loc;
+        let tile_size = non_exclusive.size;
+
+        Some(Geometry::new(
+            tile_origin.x + gap,
+            tile_origin.y + gap,
+            (tile_size.w - gap * 2).max(0) as u32,
+            (tile_size.h - gap * 2).max(0) as u32,
+        ))
+    }
+
+    fn configured_tiled_size(&self, geo: Geometry) -> Size<i32, smithay::utils::Logical> {
+        let gap = self.config.gap as i32;
+        let bw = self.config.border_width as i32;
+        let w = (geo.width as i32 - gap * 2 - bw * 2).max(1);
+        let h = (geo.height as i32 - gap * 2 - bw * 2).max(1);
+        Size::from((w, h))
+    }
+
+    pub(crate) fn initial_toplevel_size(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<Size<i32, smithay::utils::Logical>> {
+        let usable = self.tiling_usable_geometry()?;
+        let ws_idx = self.active_workspace;
+        let root = root_surface(surface);
+
+        let geo = if self.config.layout == crate::config::LayoutKind::Dwindle {
+            let mut tree = self.dwindle_trees[ws_idx].clone();
+            let split_target = self.focused_tiled_window_root(ws_idx);
+            tree.insert(split_target.as_ref(), root.clone());
+            tree.geometries(&usable, self.config.split_ratio)
+                .into_iter()
+                .find_map(|(candidate, geo)| (candidate == root).then_some(geo))
+        } else {
+            let tile_count = self.workspace_windows[ws_idx]
+                .iter()
+                .filter(|window| {
+                    let root = Self::window_root_surface(window);
+                    let is_fullscreen = root
+                        .as_ref()
+                        .map(|root| self.is_root_fullscreen(root))
+                        .unwrap_or(false);
+                    let is_floating = root
+                        .as_ref()
+                        .map(|root| self.is_root_floating(root))
+                        .unwrap_or(false);
+                    !is_fullscreen && !is_floating
+                })
+                .count()
+                + 1;
+            self.layout
+                .apply(&usable, tile_count)
+                .into_iter()
+                .nth(tile_count - 1)
+        }?;
+
+        Some(self.configured_tiled_size(geo))
+    }
+
     /// Toggle the floating state of the currently focused window.
     pub fn toggle_float(&mut self) {
         let window = match self.active_workspace_focused_window().cloned() {
@@ -280,30 +352,10 @@ impl Beewm {
 
     /// Re-tile all windows in the space using the current layout.
     pub fn relayout(&mut self) {
-        let output = match self.space.outputs().next() {
-            Some(o) => o.clone(),
-            None => return,
+        let Some(usable) = self.tiling_usable_geometry() else {
+            return;
         };
-
-        let output_geo = self.space.output_geometry(&output).unwrap();
         let gap = self.config.gap as i32;
-        let bw = self.config.border_width as i32;
-
-        // Shrink the tiling area to respect layer-shell exclusive zones
-        // (e.g. a top bar reserves space so windows don't go under it).
-        let non_exclusive = {
-            let lm = smithay::desktop::layer_map_for_output(&output);
-            lm.non_exclusive_zone()
-        };
-        let tile_origin = output_geo.loc + non_exclusive.loc;
-        let tile_size = non_exclusive.size;
-
-        let usable = Geometry::new(
-            tile_origin.x + gap,
-            tile_origin.y + gap,
-            (tile_size.w - gap * 2).max(0) as u32,
-            (tile_size.h - gap * 2).max(0) as u32,
-        );
 
         let windows = &self.workspace_windows[self.active_workspace];
         if windows.is_empty() {
@@ -350,12 +402,11 @@ impl Beewm {
             };
             let x = geo.x + gap;
             let y = geo.y + gap;
-            let w = (geo.width as i32 - gap * 2 - bw * 2).max(1);
-            let h = (geo.height as i32 - gap * 2 - bw * 2).max(1);
+            let size = self.configured_tiled_size(geo);
 
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|state| {
-                    state.size = Some(Size::from((w, h)));
+                    state.size = Some(size);
                 });
                 toplevel.send_pending_configure();
             }

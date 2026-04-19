@@ -4,12 +4,12 @@ use smithay::backend::input::{
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::session::Session;
-use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
+use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Size, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER, Size};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
@@ -300,6 +300,7 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
 
     let serial = SERIAL_COUNTER.next_serial();
     let pointer = state.seat.get_pointer().unwrap();
+    let pointer_is_grabbed = pointer.is_grabbed();
 
     let under = surface_under(state, new_pos);
 
@@ -312,6 +313,7 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
             time: Event::time_msec(&event),
         },
     );
+    pointer.frame(state);
 
     // Emit relative motion for clients that care (e.g. games)
     pointer.relative_motion(
@@ -325,8 +327,13 @@ fn handle_pointer_motion<I: InputBackend>(state: &mut Beewm, event: I::PointerMo
     );
 
     // Focus follows mouse — only change focus when the surface changes.
-    // Never steal focus away from a layer-shell surface (e.g. wofi).
-    if state.config.focus_follows_mouse && !layer_surface_has_keyboard_focus(state) {
+    // Never steal focus away from a layer-shell surface (e.g. wofi), and
+    // don't retarget keyboard focus while Smithay is holding an active
+    // pointer grab for click, popup, or drag-and-drop handling.
+    if state.config.focus_follows_mouse
+        && !layer_surface_has_keyboard_focus(state)
+        && !pointer_is_grabbed
+    {
         if let Some((surface, _)) = under {
             let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
                 state.refresh_compositor_cursor();
@@ -369,6 +376,7 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
 
     let serial = SERIAL_COUNTER.next_serial();
     let pointer = state.seat.get_pointer().unwrap();
+    let pointer_is_grabbed = pointer.is_grabbed();
 
     let under = surface_under(state, pos);
 
@@ -381,10 +389,16 @@ fn handle_pointer_motion_absolute<I: InputBackend>(
             time: Event::time_msec(&event),
         },
     );
+    pointer.frame(state);
 
     // Focus follows mouse — only change focus when the surface changes.
-    // Never steal focus away from a layer-shell surface (e.g. wofi).
-    if state.config.focus_follows_mouse && !layer_surface_has_keyboard_focus(state) {
+    // Never steal focus away from a layer-shell surface (e.g. wofi), and
+    // don't retarget keyboard focus while Smithay is holding an active
+    // pointer grab for click, popup, or drag-and-drop handling.
+    if state.config.focus_follows_mouse
+        && !layer_surface_has_keyboard_focus(state)
+        && !pointer_is_grabbed
+    {
         if let Some((surface, _)) = under {
             let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
                 state.refresh_compositor_cursor();
@@ -458,6 +472,7 @@ fn handle_pointer_button<I: InputBackend>(state: &mut Beewm, event: I::PointerBu
             time: Event::time_msec(&event),
         },
     );
+    pointer.frame(state);
 }
 
 fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {
@@ -838,8 +853,8 @@ fn resized_window_geometry_from_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        resize_edges_for_pointer, resized_window_geometry_from_start, ResizeEdges,
-        ResizeHorizontalEdge, ResizeVerticalEdge,
+        ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge, resize_edges_for_pointer,
+        resized_window_geometry_from_start,
     };
     use smithay::utils::{Logical, Point, Size};
 
