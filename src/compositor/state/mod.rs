@@ -46,11 +46,16 @@ use crate::layout::dwindle::Dwindle;
 use crate::layout::master_stack::MasterStack;
 use crate::model::workspace::Workspace;
 
-use self::tiling::DwindleTree;
-
 use super::commands::ChildEnvironment;
 
 use super::cursor::CursorThemeManager;
+
+pub use self::decorations::{
+    expand_by_border, root_is_swap_highlighted, visible_border_rectangles,
+    window_border_overlaps_layer,
+};
+pub use self::tiling::DwindleTree;
+pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
 const WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspaces";
@@ -394,11 +399,11 @@ impl Beewm {
     }
 }
 
-fn active_workspace_state_contents(active_workspace: usize) -> String {
+pub fn active_workspace_state_contents(active_workspace: usize) -> String {
     (active_workspace + 1).to_string()
 }
 
-fn workspace_state_contents(active_workspace: usize, workspaces: &[Workspace]) -> String {
+pub fn workspace_state_contents(active_workspace: usize, workspaces: &[Workspace]) -> String {
     let occupied = workspaces
         .iter()
         .enumerate()
@@ -409,7 +414,7 @@ fn workspace_state_contents(active_workspace: usize, workspaces: &[Workspace]) -
     format!("active={}\noccupied={occupied}\n", active_workspace + 1)
 }
 
-fn write_state_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+pub fn write_state_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -447,80 +452,6 @@ fn hex_to_color32f(hex: u32) -> Color32F {
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
     let b = (hex & 0xFF) as f32 / 255.0;
     Color32F::new(r, g, b, 1.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::model::workspace::Workspace;
-
-    use super::{
-        active_workspace_state_contents, workspace_state_contents, write_state_file_atomically,
-    };
-
-    fn workspaces(count: usize) -> Vec<Workspace> {
-        std::iter::repeat_with(Workspace::default)
-            .take(count)
-            .collect()
-    }
-
-    #[test]
-    fn active_workspace_export_uses_one_based_numbers() {
-        assert_eq!(active_workspace_state_contents(0), "1");
-        assert_eq!(active_workspace_state_contents(4), "5");
-    }
-
-    #[test]
-    fn workspace_state_export_lists_active_and_occupied_workspaces() {
-        let mut workspaces = workspaces(5);
-        workspaces[0].add_window();
-        workspaces[2].add_window();
-        workspaces[4].add_window();
-
-        let state = workspace_state_contents(2, &workspaces);
-
-        assert_eq!(state, "active=3\noccupied=1,3,5\n");
-    }
-
-    #[test]
-    fn workspace_state_export_handles_no_occupied_workspaces() {
-        let workspaces = workspaces(3);
-
-        let state = workspace_state_contents(1, &workspaces);
-
-        assert_eq!(state, "active=2\noccupied=\n");
-    }
-
-    #[test]
-    fn state_file_writes_are_atomic_and_replace_previous_contents() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("beewm-state-test-{unique}"));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("workspaces");
-
-        write_state_file_atomically(&path, "active=1\noccupied=1\n").unwrap();
-        write_state_file_atomically(&path, "active=2\noccupied=2,3\n").unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "active=2\noccupied=2,3\n"
-        );
-
-        let leftovers = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
-            .count();
-        assert_eq!(leftovers, 0);
-
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(&dir).unwrap();
-    }
 }
 
 pub(super) fn root_surface(surface: &WlSurface) -> WlSurface {

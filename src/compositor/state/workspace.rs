@@ -8,13 +8,13 @@ use crate::model::window::Geometry;
 use super::{Beewm, FloatingWindowData, root_surface};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FloatToggleTransition {
+pub enum FloatToggleTransition {
     SinkToTiling,
     KeepFloating,
     MakeFloating,
 }
 
-fn float_toggle_transition(is_fullscreen: bool, is_floating: bool) -> FloatToggleTransition {
+pub fn float_toggle_transition(is_fullscreen: bool, is_floating: bool) -> FloatToggleTransition {
     if is_fullscreen {
         if is_floating {
             FloatToggleTransition::KeepFloating
@@ -524,34 +524,5 @@ impl Beewm {
         } else {
             self.set_keyboard_focus(None);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FloatToggleTransition, float_toggle_transition};
-
-    #[test]
-    fn fullscreened_floating_window_stays_floating_when_toggling_float() {
-        assert_eq!(
-            float_toggle_transition(true, true),
-            FloatToggleTransition::KeepFloating
-        );
-    }
-
-    #[test]
-    fn fullscreened_tiled_window_becomes_floating_when_toggling_float() {
-        assert_eq!(
-            float_toggle_transition(true, false),
-            FloatToggleTransition::MakeFloating
-        );
-    }
-
-    #[test]
-    fn non_fullscreen_floating_window_sinks_back_to_tiling() {
-        assert_eq!(
-            float_toggle_transition(false, true),
-            FloatToggleTransition::SinkToTiling
-        );
     }
 }

@@ -25,7 +25,7 @@ enum DwindleNode<T> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DwindleTree<T> {
+pub struct DwindleTree<T> {
     root: Option<DwindleNode<T>>,
 }
 
@@ -36,7 +36,7 @@ impl<T> Default for DwindleTree<T> {
 }
 
 impl<T: Clone + Eq> DwindleTree<T> {
-    pub(crate) fn insert(&mut self, target: Option<&T>, new_leaf: T) {
+    pub fn insert(&mut self, target: Option<&T>, new_leaf: T) {
         if self.root.is_none() {
             self.root = Some(DwindleNode::Leaf(new_leaf));
             return;
@@ -52,11 +52,11 @@ impl<T: Clone + Eq> DwindleTree<T> {
         }
     }
 
-    pub(crate) fn remove(&mut self, target: &T) {
+    pub fn remove(&mut self, target: &T) {
         self.root = self.root.take().and_then(|root| root.remove(target));
     }
 
-    pub(crate) fn swap(&mut self, first: &T, second: &T) -> bool {
+    pub fn swap(&mut self, first: &T, second: &T) -> bool {
         if first == second {
             return false;
         }
@@ -73,7 +73,7 @@ impl<T: Clone + Eq> DwindleTree<T> {
         true
     }
 
-    pub(crate) fn geometries(&self, screen: &Geometry, split_ratio: f64) -> Vec<(T, Geometry)> {
+    pub fn geometries(&self, screen: &Geometry, split_ratio: f64) -> Vec<(T, Geometry)> {
         let mut geometries = Vec::new();
         let split_ratio = if split_ratio.is_finite() {
             split_ratio.clamp(0.0, 1.0)
@@ -306,53 +306,5 @@ impl Beewm {
             .geometries(screen, self.config.split_ratio)
             .into_iter()
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use crate::model::window::Geometry;
-
-    use super::DwindleTree;
-
-    fn geometry_map(entries: Vec<(u8, Geometry)>) -> HashMap<u8, Geometry> {
-        entries.into_iter().collect()
-    }
-
-    #[test]
-    fn splits_the_focused_leaf_instead_of_the_remaining_screen() {
-        let mut tree = DwindleTree::default();
-        let screen = Geometry::new(0, 0, 100, 100);
-
-        tree.insert(None, 1);
-        tree.insert(Some(&1), 2);
-        tree.insert(Some(&1), 3);
-        tree.insert(Some(&2), 4);
-
-        let geometries = geometry_map(tree.geometries(&screen, 0.5));
-
-        assert_eq!(geometries[&1], Geometry::new(0, 0, 50, 50));
-        assert_eq!(geometries[&2], Geometry::new(50, 0, 50, 50));
-        assert_eq!(geometries[&3], Geometry::new(0, 50, 50, 50));
-        assert_eq!(geometries[&4], Geometry::new(50, 50, 50, 50));
-    }
-
-    #[test]
-    fn swapping_two_leaves_exchanges_their_geometries() {
-        let mut tree = DwindleTree::default();
-        let screen = Geometry::new(0, 0, 100, 100);
-
-        tree.insert(None, 1);
-        tree.insert(Some(&1), 2);
-        tree.insert(Some(&1), 3);
-        assert!(tree.swap(&1, &2));
-
-        let geometries = geometry_map(tree.geometries(&screen, 0.5));
-
-        assert_eq!(geometries[&1], Geometry::new(50, 0, 50, 100));
-        assert_eq!(geometries[&2], Geometry::new(0, 0, 50, 50));
-        assert_eq!(geometries[&3], Geometry::new(0, 50, 50, 50));
     }
 }

@@ -19,7 +19,7 @@ where
     ]
 }
 
-fn expand_by_border<Kind>(geo: Rectangle<i32, Kind>, bw: i32) -> Rectangle<i32, Kind>
+pub fn expand_by_border<Kind>(geo: Rectangle<i32, Kind>, bw: i32) -> Rectangle<i32, Kind>
 where
     i32: Coordinate,
 {
@@ -33,7 +33,7 @@ where
     )
 }
 
-fn window_border_overlaps_layer(
+pub fn window_border_overlaps_layer(
     window_geo: Rectangle<i32, Logical>,
     layer_geo: Rectangle<i32, Logical>,
     bw: i32,
@@ -53,7 +53,7 @@ fn window_border_overlaps_layer(
     .any(|border_geo| border_geo.overlaps(layer_geo))
 }
 
-fn visible_border_rectangles<Kind>(
+pub fn visible_border_rectangles<Kind>(
     window_geo: Rectangle<i32, Kind>,
     bw: i32,
     occluders: &[Rectangle<i32, Kind>],
@@ -77,7 +77,7 @@ where
     .collect()
 }
 
-fn root_is_swap_highlighted<T: PartialEq>(
+pub fn root_is_swap_highlighted<T: PartialEq>(
     root: &T,
     dragged_root: Option<&T>,
     target_root: Option<&T>,
@@ -223,97 +223,5 @@ impl Beewm {
                 )
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use smithay::utils::{Logical, Rectangle};
-
-    use super::{
-        expand_by_border, root_is_swap_highlighted, visible_border_rectangles,
-        window_border_overlaps_layer,
-    };
-
-    fn rect(x: i32, y: i32, width: i32, height: i32) -> Rectangle<i32, Logical> {
-        Rectangle::new((x, y).into(), (width, height).into())
-    }
-
-    #[test]
-    fn reserved_top_bar_does_not_hide_borders() {
-        let window = rect(4, 34, 400, 300);
-        let top_bar = rect(0, 0, 1920, 30);
-
-        assert!(!window_border_overlaps_layer(window, top_bar, 2));
-    }
-
-    #[test]
-    fn fullscreen_overlay_hides_borders() {
-        let window = rect(100, 100, 400, 300);
-        let overlay = rect(0, 0, 1920, 1080);
-
-        assert!(window_border_overlaps_layer(window, overlay, 2));
-    }
-
-    #[test]
-    fn centered_popup_does_not_hide_borders() {
-        let window = rect(100, 100, 400, 300);
-        let popup = rect(180, 160, 120, 80);
-
-        assert!(!window_border_overlaps_layer(window, popup, 2));
-    }
-
-    #[test]
-    fn popup_crossing_border_hides_borders() {
-        let window = rect(100, 100, 400, 300);
-        let popup = rect(98, 120, 24, 80);
-
-        assert!(window_border_overlaps_layer(window, popup, 2));
-    }
-
-    #[test]
-    fn swap_highlight_matches_dragged_and_target_roots() {
-        assert!(root_is_swap_highlighted(&1, Some(&1), Some(&2)));
-        assert!(root_is_swap_highlighted(&2, Some(&1), Some(&2)));
-        assert!(!root_is_swap_highlighted(&3, Some(&1), Some(&2)));
-    }
-
-    #[test]
-    fn floating_window_clips_the_overlapped_border_segments() {
-        let window = rect(100, 100, 400, 300);
-        let floating = rect(180, 98, 120, 40);
-
-        let visible = visible_border_rectangles(window, 2, &[floating]);
-
-        assert!(!visible.is_empty());
-        assert!(visible.iter().all(|rect| !rect.overlaps(floating)));
-        assert!(visible.iter().any(|rect| rect.loc.y == 98));
-    }
-
-    #[test]
-    fn non_overlapping_floating_window_keeps_all_four_borders() {
-        let window = rect(100, 100, 400, 300);
-        let floating = rect(180, 160, 120, 80);
-
-        let visible = visible_border_rectangles(window, 2, &[floating]);
-
-        assert_eq!(visible.len(), 4);
-    }
-
-    #[test]
-    fn floating_window_border_also_clips_the_window_behind_it() {
-        let window = rect(100, 100, 400, 300);
-        let floating_client = rect(180, 100, 120, 40);
-        let floating_with_border = expand_by_border(floating_client, 2);
-
-        let visible = visible_border_rectangles(window, 2, &[floating_with_border]);
-
-        assert!(!visible.is_empty());
-        assert!(
-            visible
-                .iter()
-                .all(|rect| !rect.overlaps(floating_with_border))
-        );
-        assert!(visible.iter().any(|rect| rect.loc.y == 98));
     }
 }

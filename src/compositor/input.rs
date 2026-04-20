@@ -770,7 +770,7 @@ fn focus_and_raise_window(state: &mut Beewm, window: &smithay::desktop::Window) 
     state.needs_render = true;
 }
 
-fn resize_edges_for_pointer(
+pub fn resize_edges_for_pointer(
     window_pos: Point<i32, Logical>,
     window_size: Size<i32, Logical>,
     pointer: Point<f64, Logical>,
@@ -805,7 +805,7 @@ fn resized_window_geometry(
     )
 }
 
-fn resized_window_geometry_from_start(
+pub fn resized_window_geometry_from_start(
     start_window_pos: Point<i32, Logical>,
     start_window_size: Size<i32, Logical>,
     start_pointer: Point<f64, Logical>,
@@ -848,90 +848,4 @@ fn resized_window_geometry_from_start(
         Point::from((new_x, new_y)),
         Size::from((new_width, new_height)),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge, resize_edges_for_pointer,
-        resized_window_geometry_from_start,
-    };
-    use smithay::utils::{Logical, Point, Size};
-
-    #[test]
-    fn resize_edges_use_the_window_center_as_the_anchor_split() {
-        let edges = resize_edges_for_pointer(
-            Point::<i32, Logical>::from((100, 200)),
-            Size::<i32, Logical>::from((300, 200)),
-            Point::<f64, Logical>::from((120.0, 220.0)),
-        );
-        assert_eq!(
-            edges,
-            ResizeEdges {
-                horizontal: ResizeHorizontalEdge::Left,
-                vertical: ResizeVerticalEdge::Top,
-            }
-        );
-
-        let edges = resize_edges_for_pointer(
-            Point::<i32, Logical>::from((100, 200)),
-            Size::<i32, Logical>::from((300, 200)),
-            Point::<f64, Logical>::from((399.0, 399.0)),
-        );
-        assert_eq!(
-            edges,
-            ResizeEdges {
-                horizontal: ResizeHorizontalEdge::Right,
-                vertical: ResizeVerticalEdge::Bottom,
-            }
-        );
-    }
-
-    #[test]
-    fn resizing_from_the_bottom_right_grows_width_and_height_only() {
-        let (pos, size) = resized_window_geometry_from_start(
-            Point::<i32, Logical>::from((100, 200)),
-            Size::<i32, Logical>::from((300, 150)),
-            Point::<f64, Logical>::from((400.0, 350.0)),
-            Point::<f64, Logical>::from((460.0, 390.0)),
-            ResizeEdges {
-                horizontal: ResizeHorizontalEdge::Right,
-                vertical: ResizeVerticalEdge::Bottom,
-            },
-        );
-        assert_eq!(pos, Point::from((100, 200)));
-        assert_eq!(size, Size::from((360, 190)));
-    }
-
-    #[test]
-    fn resizing_from_the_top_left_keeps_the_bottom_right_corner_fixed() {
-        let (pos, size) = resized_window_geometry_from_start(
-            Point::<i32, Logical>::from((100, 200)),
-            Size::<i32, Logical>::from((300, 150)),
-            Point::<f64, Logical>::from((100.0, 200.0)),
-            Point::<f64, Logical>::from((70.0, 170.0)),
-            ResizeEdges {
-                horizontal: ResizeHorizontalEdge::Left,
-                vertical: ResizeVerticalEdge::Top,
-            },
-        );
-        assert_eq!(pos, Point::from((70, 170)));
-        assert_eq!(size, Size::from((330, 180)));
-    }
-
-    #[test]
-    fn resizing_from_left_and_top_clamps_at_one_pixel() {
-        let (pos, size) = resized_window_geometry_from_start(
-            Point::<i32, Logical>::from((100, 200)),
-            Size::<i32, Logical>::from((300, 150)),
-            Point::<f64, Logical>::from((100.0, 200.0)),
-            Point::<f64, Logical>::from((500.0, 500.0)),
-            ResizeEdges {
-                horizontal: ResizeHorizontalEdge::Left,
-                vertical: ResizeVerticalEdge::Top,
-            },
-        );
-        assert_eq!(pos, Point::from((399, 349)));
-        assert_eq!(size, Size::from((1, 1)));
-    }
 }
