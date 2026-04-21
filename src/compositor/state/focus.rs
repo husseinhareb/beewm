@@ -17,7 +17,8 @@ impl Beewm {
         surface: &WlSurface,
     ) -> Option<usize> {
         let surface_root = root_surface(surface);
-        self.workspace_windows[workspace_idx]
+        self.workspaces[workspace_idx]
+            .windows
             .iter()
             .position(|window| {
                 window
@@ -52,7 +53,7 @@ impl Beewm {
 
     pub fn active_workspace_focused_window(&self) -> Option<&Window> {
         let idx = self.active_workspace_focused_index()?;
-        self.workspace_windows[self.active_workspace].get(idx)
+        self.workspaces[self.active_workspace].windows.get(idx)
     }
 
     pub fn note_keyboard_focus_change(&mut self, focused: Option<&WlSurface>) {

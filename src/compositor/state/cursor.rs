@@ -4,7 +4,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::utils::{Physical, Point};
 
-use super::Beewm;
+use super::{ActiveGrab, Beewm};
 
 impl Beewm {
     pub fn effective_cursor_icon(&self) -> Option<CursorIcon> {
@@ -76,13 +76,12 @@ impl Beewm {
 /// position and grab state. Returns `Some(icon)` when the compositor
 /// itself should override the client cursor, `None` to fall through.
 fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
-    if let Some(grab) = state.resize_grab.as_ref() {
-        return Some(grab.edges.cursor_icon());
-    }
-
-    // During window drag grabs always show the grabbing hand.
-    if state.move_grab.is_some() || state.tiled_swap_grab.is_some() {
-        return Some(CursorIcon::Grabbing);
+    match &state.active_grab {
+        Some(ActiveGrab::Resize(grab)) => return Some(grab.edges.cursor_icon()),
+        Some(ActiveGrab::Move(_)) | Some(ActiveGrab::TiledSwap(_)) => {
+            return Some(CursorIcon::Grabbing)
+        }
+        None => {}
     }
 
     let bw = state.config.border_width as i32;

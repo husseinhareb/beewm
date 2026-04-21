@@ -3,7 +3,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use beewm::compositor::{
-    DwindleTree, FloatToggleTransition, ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge,
+    FloatToggleTransition, ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge,
     active_workspace_state_contents, constrain_popup_geometry, expand_by_border,
     float_toggle_transition, is_fixed_size, layers_hit_tested_after_windows,
     layers_hit_tested_before_windows, layers_rendered_above_windows, layers_rendered_below_windows,
@@ -11,6 +11,7 @@ use beewm::compositor::{
     root_is_swap_highlighted, visible_border_rectangles, window_border_overlaps_layer,
     workspace_state_contents, write_state_file_atomically,
 };
+use beewm::layout::dwindle_tree::DwindleTree;
 use beewm::model::window::Geometry;
 use beewm::model::workspace::Workspace;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner;
@@ -296,9 +297,9 @@ fn active_workspace_export_uses_one_based_numbers() {
 #[test]
 fn workspace_state_export_lists_active_and_occupied_workspaces() {
     let mut workspaces = workspaces(5);
-    workspaces[0].add_window();
-    workspaces[2].add_window();
-    workspaces[4].add_window();
+    workspaces[0].add_window(());
+    workspaces[2].add_window(());
+    workspaces[4].add_window(());
 
     let state = workspace_state_contents(2, &workspaces);
 

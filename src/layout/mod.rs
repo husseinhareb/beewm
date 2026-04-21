@@ -1,4 +1,6 @@
 pub mod dwindle;
+pub mod dwindle_tree;
+pub mod manager;
 pub mod master_stack;
 
 use crate::model::window::Geometry;

@@ -1,7 +1,9 @@
 mod cursor;
 mod decorations;
 mod focus;
+pub(crate) mod popup;
 mod tiling;
+mod window_lifecycle;
 mod workspace;
 
 use std::collections::HashMap;
@@ -20,7 +22,7 @@ use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
-use smithay::utils::{Clock, Logical, Monotonic, Point, Size};
+use smithay::utils::{Clock, Logical, Monotonic, Point};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
     with_states,
@@ -40,10 +42,8 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 
-use crate::config::{Action, Config, Keybind, LayoutKind};
-use crate::layout::Layout;
-use crate::layout::dwindle::Dwindle;
-use crate::layout::master_stack::MasterStack;
+use crate::config::{Config, Keybind, LayoutKind};
+use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
 
 use super::commands::ChildEnvironment;
@@ -54,8 +54,8 @@ pub use self::decorations::{
     expand_by_border, root_is_swap_highlighted, visible_border_rectangles,
     window_border_overlaps_layer,
 };
-pub use self::tiling::DwindleTree;
 pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
+pub use self::popup::{constrain_popup_geometry, is_fixed_size, popup_constraint_target};
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
 const WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspaces";
@@ -63,100 +63,7 @@ static STATE_FILE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type SyncobjBlockerInstaller = dyn Fn(DrmSyncPointSource, Client);
 
-/// A keybinding pre-resolved at startup so the hot-path avoids string
-/// allocations and repeated `xkb::keysym_from_name` lookups.
-#[derive(Debug, Clone)]
-pub struct ResolvedKeybind {
-    pub logo: bool,
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
-    pub keysym: xkb::Keysym,
-    pub action: Action,
-}
-
-/// State for an in-progress floating window move (Super + LMB drag).
-#[derive(Debug, Clone)]
-pub struct MoveGrab {
-    /// The window being moved.
-    pub window: Window,
-    /// Pointer position when the grab started.
-    pub start_pointer: Point<f64, Logical>,
-    /// Window position when the grab started.
-    pub start_window_pos: Point<i32, Logical>,
-}
-
-/// State for an in-progress tiled-window swap grab (Super + LMB drag).
-#[derive(Debug, Clone)]
-pub struct TiledSwapGrab {
-    /// The tiled window being dragged.
-    pub window: Window,
-    /// Workspace that owns the dragged tiled window.
-    pub workspace_idx: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResizeHorizontalEdge {
-    Left,
-    Right,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResizeVerticalEdge {
-    Top,
-    Bottom,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResizeEdges {
-    pub horizontal: ResizeHorizontalEdge,
-    pub vertical: ResizeVerticalEdge,
-}
-
-impl ResizeEdges {
-    pub fn cursor_icon(self) -> CursorIcon {
-        match (self.vertical, self.horizontal) {
-            (ResizeVerticalEdge::Top, ResizeHorizontalEdge::Left) => CursorIcon::NwResize,
-            (ResizeVerticalEdge::Top, ResizeHorizontalEdge::Right) => CursorIcon::NeResize,
-            (ResizeVerticalEdge::Bottom, ResizeHorizontalEdge::Left) => CursorIcon::SwResize,
-            (ResizeVerticalEdge::Bottom, ResizeHorizontalEdge::Right) => CursorIcon::SeResize,
-        }
-    }
-}
-
-/// State for an in-progress floating window resize (Super + RMB drag).
-#[derive(Debug, Clone)]
-pub struct ResizeGrab {
-    /// The window being resized.
-    pub window: Window,
-    /// Pointer position when the resize started.
-    pub start_pointer: Point<f64, Logical>,
-    /// Window position when the resize started.
-    pub start_window_pos: Point<i32, Logical>,
-    /// Window size when the resize started.
-    pub start_window_size: Size<i32, Logical>,
-    /// Which edges of the window are following the pointer.
-    pub edges: ResizeEdges,
-    /// Latest requested window position during the interactive resize.
-    pub current_window_pos: Point<i32, Logical>,
-    /// Latest requested window size during the interactive resize.
-    pub current_window_size: Size<i32, Logical>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FloatingWindowData {
-    pub position: Point<i32, Logical>,
-    pub size: Size<i32, Logical>,
-}
-
-impl FloatingWindowData {
-    pub fn new(position: Point<i32, Logical>, size: Size<i32, Logical>) -> Self {
-        Self {
-            position,
-            size: Size::from((size.w.max(1), size.h.max(1))),
-        }
-    }
-}
+pub(crate) use super::types::{ActiveGrab, FloatingWindowData, ResolvedKeybind};
 
 /// The main compositor state.
 pub struct Beewm {
@@ -200,10 +107,8 @@ pub struct Beewm {
 
     // Desktop management
     pub space: Space<Window>,
-    pub layout: Box<dyn Layout>,
-    pub workspaces: Vec<Workspace>,
-    pub workspace_windows: Vec<Vec<Window>>,
-    pub(crate) dwindle_trees: Vec<DwindleTree<WlSurface>>,
+    pub layout_manager: Box<dyn LayoutManager<WlSurface>>,
+    pub workspaces: Vec<Workspace<Window>>,
     pub active_workspace: usize,
     /// Windows that have been created but not yet committed their first buffer.
     pub pending_windows: Vec<Window>,
@@ -224,14 +129,11 @@ pub struct Beewm {
     /// The key is the root WlSurface; the value is where the window is placed
     /// and how large it should be when restored.
     pub floating_windows: HashMap<WlSurface, FloatingWindowData>,
-    /// Active floating-window move grab (Super + left-click drag).
-    pub move_grab: Option<MoveGrab>,
-    /// Active tiled-window swap grab (Super + left-click drag).
-    pub tiled_swap_grab: Option<TiledSwapGrab>,
+    /// Active pointer grab (move, resize, or tiled swap). Only one can be
+    /// active at a time.
+    pub active_grab: Option<ActiveGrab>,
     /// Current tiled-window swap drop target, if the pointer is over one.
     pub tiled_swap_target: Option<WlSurface>,
-    /// Active floating-window resize grab (Super + right-click drag).
-    pub resize_grab: Option<ResizeGrab>,
     /// Pre-resolved keybindings (no per-keypress string allocs).
     pub resolved_keybinds: Vec<ResolvedKeybind>,
     /// Cached border colours derived from config (avoid per-frame conversion).
@@ -272,7 +174,7 @@ impl Beewm {
         seat.add_pointer();
 
         let num_ws = config.num_workspaces;
-        let layout = build_layout(&config);
+        let layout_manager = build_layout_manager(&config, num_ws);
         let resolved_keybinds = resolve_keybinds(&config.keybinds);
         let border_color_focused = hex_to_color32f(config.border_color_focused);
         let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
@@ -309,10 +211,8 @@ impl Beewm {
             _cursor_shape_manager_state: cursor_shape_manager_state_,
             session: None,
             space: Space::default(),
-            layout,
-            workspaces: (0..num_ws).map(|_| Workspace::default()).collect(),
-            workspace_windows: (0..num_ws).map(|_| Vec::new()).collect(),
-            dwindle_trees: (0..num_ws).map(|_| DwindleTree::default()).collect(),
+            layout_manager,
+            workspaces: (0..num_ws).map(|_| Workspace::new()).collect(),
             active_workspace: 0,
             pending_windows: Vec::new(),
             window_lookup: HashMap::new(),
@@ -322,10 +222,8 @@ impl Beewm {
             fullscreen_window: None,
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
-            move_grab: None,
-            tiled_swap_grab: None,
+            active_grab: None,
             tiled_swap_target: None,
-            resize_grab: None,
             resolved_keybinds,
             border_color_focused,
             border_color_unfocused,
@@ -403,11 +301,11 @@ pub fn active_workspace_state_contents(active_workspace: usize) -> String {
     (active_workspace + 1).to_string()
 }
 
-pub fn workspace_state_contents(active_workspace: usize, workspaces: &[Workspace]) -> String {
+pub fn workspace_state_contents<W>(active_workspace: usize, workspaces: &[Workspace<W>]) -> String {
     let occupied = workspaces
         .iter()
         .enumerate()
-        .filter(|(_, workspace)| workspace.window_count > 0)
+        .filter(|(_, workspace)| workspace.window_count() > 0)
         .map(|(index, _)| (index + 1).to_string())
         .collect::<Vec<_>>()
         .join(",");
@@ -435,14 +333,15 @@ pub fn write_state_file_atomically(path: &Path, contents: &str) -> std::io::Resu
     Ok(())
 }
 
-fn build_layout(config: &Config) -> Box<dyn Layout> {
+fn build_layout_manager(
+    config: &Config,
+    num_workspaces: usize,
+) -> Box<dyn LayoutManager<WlSurface>> {
     match config.layout {
-        LayoutKind::Dwindle => Box::new(Dwindle {
-            split_ratio: config.split_ratio,
-        }),
-        LayoutKind::MasterStack => Box::new(MasterStack {
-            master_ratio: config.split_ratio,
-        }),
+        LayoutKind::Dwindle => {
+            Box::new(DwindleManager::new(num_workspaces, config.split_ratio))
+        }
+        LayoutKind::MasterStack => Box::new(MasterStackManager::new(config.split_ratio)),
     }
 }
 

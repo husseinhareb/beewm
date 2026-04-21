@@ -139,10 +139,10 @@ impl Beewm {
         let focused_surface = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
         let focused_color = self.border_color_focused;
         let unfocused_color = self.border_color_unfocused;
-        let dragged_root = self
-            .tiled_swap_grab
-            .as_ref()
-            .and_then(|grab| Self::window_root_surface(&grab.window));
+        let dragged_root = match &self.active_grab {
+            Some(super::ActiveGrab::TiledSwap(grab)) => Self::window_root_surface(&grab.window),
+            _ => None,
+        };
         let target_root = self.tiled_swap_target.clone();
 
         // Exclude the fullscreen window — it has no borders.

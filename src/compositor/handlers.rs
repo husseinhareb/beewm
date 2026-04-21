@@ -27,7 +27,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
@@ -53,198 +53,8 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::utils::Size;
-
 use super::state::{Beewm, ClientState};
-
-#[derive(Debug, Clone, Copy)]
-struct PopupConstraintSpace {
-    parent_geometry: Rectangle<i32, Logical>,
-    output_geometry: Rectangle<i32, Logical>,
-}
-
-pub fn is_fixed_size(size: Size<i32, smithay::utils::Logical>) -> bool {
-    size.w > 0 && size.h > 0
-}
-
-pub fn popup_constraint_target(
-    parent_geometry: Rectangle<i32, Logical>,
-    output_geometry: Rectangle<i32, Logical>,
-) -> Rectangle<i32, Logical> {
-    Rectangle::new(
-        output_geometry.loc - parent_geometry.loc,
-        output_geometry.size,
-    )
-}
-
-pub fn constrain_popup_geometry(
-    positioner: PositionerState,
-    parent_geometry: Rectangle<i32, Logical>,
-    output_geometry: Rectangle<i32, Logical>,
-) -> Rectangle<i32, Logical> {
-    positioner.get_unconstrained_geometry(popup_constraint_target(parent_geometry, output_geometry))
-}
-
-fn should_map_toplevel_floating(window: &Window) -> bool {
-    let Some(toplevel) = window.toplevel() else {
-        return false;
-    };
-
-    if toplevel.parent().is_some() {
-        return true;
-    }
-
-    smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
-        let mut cached = states
-            .cached_state
-            .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
-        let current = *cached.current();
-        is_fixed_size(current.min_size) && current.min_size == current.max_size
-    })
-}
-
-impl Beewm {
-    fn output_geometry_for_rectangle(
-        &self,
-        rectangle: Rectangle<i32, Logical>,
-    ) -> Option<Rectangle<i32, Logical>> {
-        let center = Point::from((
-            rectangle.loc.x + rectangle.size.w / 2,
-            rectangle.loc.y + rectangle.size.h / 2,
-        ));
-
-        self.space
-            .output_under(center.to_f64())
-            .find_map(|output| self.space.output_geometry(output))
-            .or_else(|| {
-                self.space.outputs().find_map(|output| {
-                    let output_geometry = self.space.output_geometry(output)?;
-                    output_geometry
-                        .intersection(rectangle)
-                        .map(|_| output_geometry)
-                })
-            })
-            .or_else(|| {
-                self.space
-                    .outputs()
-                    .next()
-                    .and_then(|output| self.space.output_geometry(output))
-            })
-    }
-
-    fn popup_constraint_space_for_popup(&self, popup: &PopupKind) -> Option<PopupConstraintSpace> {
-        let PopupKind::Xdg(parent_popup) = popup else {
-            return None;
-        };
-
-        let parent_surface = parent_popup.get_parent_surface()?;
-        let parent_space = self.popup_constraint_space_for_surface(&parent_surface)?;
-        let geometry = popup.geometry();
-
-        Some(PopupConstraintSpace {
-            parent_geometry: Rectangle::new(
-                parent_space.parent_geometry.loc + geometry.loc,
-                geometry.size,
-            ),
-            output_geometry: parent_space.output_geometry,
-        })
-    }
-
-    fn popup_constraint_space_for_layer_surface(
-        &self,
-        surface: &WlSurface,
-    ) -> Option<PopupConstraintSpace> {
-        self.space.outputs().find_map(|output| {
-            let (layer, layer_geometry) = {
-                let layer_map = layer_map_for_output(output);
-                let layer = layer_map
-                    .layer_for_surface(
-                        surface,
-                        WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
-                    )
-                    .cloned()?;
-                let layer_geometry = layer_map.layer_geometry(&layer)?;
-                Some((layer, layer_geometry))
-            }?;
-
-            let output_geometry = self.space.output_geometry(output)?;
-            let surface_origin = layer_geometry.loc - layer.bbox().loc;
-            let current_size = layer
-                .layer_surface()
-                .current_state()
-                .size
-                .filter(|size| size.w > 0 && size.h > 0);
-            let cached_size = layer.cached_state().size;
-            let parent_size = current_size
-                .or_else(|| (cached_size.w > 0 && cached_size.h > 0).then_some(cached_size))
-                .unwrap_or(layer_geometry.size);
-
-            Some(PopupConstraintSpace {
-                parent_geometry: Rectangle::new(surface_origin, parent_size),
-                output_geometry,
-            })
-        })
-    }
-
-    fn popup_constraint_space_for_surface(
-        &self,
-        surface: &WlSurface,
-    ) -> Option<PopupConstraintSpace> {
-        if let Some(popup) = self.popup_manager.find_popup(surface) {
-            return self.popup_constraint_space_for_popup(&popup);
-        }
-
-        if let Some(window) = self.mapped_window_for_surface(surface) {
-            let parent_geometry = self.space.element_geometry(&window)?;
-            let output_geometry = self.output_geometry_for_rectangle(parent_geometry)?;
-            return Some(PopupConstraintSpace {
-                parent_geometry,
-                output_geometry,
-            });
-        }
-
-        self.popup_constraint_space_for_layer_surface(surface)
-    }
-
-    fn configure_xdg_popup(&self, surface: &PopupSurface, positioner: PositionerState) {
-        let parent_surface = surface.get_parent_surface();
-        let root_surface = find_popup_root_surface(&PopupKind::Xdg(surface.clone())).ok();
-        let constraint_space = parent_surface
-            .as_ref()
-            .and_then(|parent| self.popup_constraint_space_for_surface(parent));
-        let geometry = constraint_space
-            .map(|space| {
-                constrain_popup_geometry(positioner, space.parent_geometry, space.output_geometry)
-            })
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    popup_surface = ?surface.wl_surface(),
-                    parent_surface = ?parent_surface.as_ref(),
-                    root_surface = ?root_surface.as_ref(),
-                    "Failed to resolve popup constraint space; falling back to raw positioner geometry",
-                );
-                positioner.get_geometry()
-            });
-
-        if let Some(space) = constraint_space {
-            tracing::debug!(
-                popup_surface = ?surface.wl_surface(),
-                parent_surface = ?parent_surface.as_ref(),
-                root_surface = ?root_surface.as_ref(),
-                parent_geometry = ?space.parent_geometry,
-                output_geometry = ?space.output_geometry,
-                popup_geometry = ?geometry,
-                reactive = positioner.reactive,
-                "Configured xdg_popup geometry",
-            );
-        }
-
-        surface.with_pending_state(|state| {
-            state.positioner = positioner;
-            state.geometry = geometry;
-        });
-    }
-}
+use super::state::popup::should_map_toplevel_floating;
 
 impl CompositorHandler for Beewm {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -281,8 +91,7 @@ impl CompositorHandler for Beewm {
             // centered instead of being tiled or inheriting a (0, 0) origin.
             let should_float = should_map_toplevel_floating(&window);
             let split_target = self.focused_tiled_window_root(ws_idx);
-            self.workspace_windows[ws_idx].push(window.clone());
-            self.workspaces[ws_idx].add_window();
+            self.workspaces[ws_idx].add_window(window.clone());
             self.publish_workspace_state();
             self.track_window(&window);
             // Propagate the first commit through the window's surface tree.
@@ -418,13 +227,13 @@ impl XdgShellHandler for Beewm {
         }
 
         // Find which workspace owns this window and remove it
-        for ws_idx in 0..self.workspace_windows.len() {
-            if let Some(pos) = self.workspace_windows[ws_idx].iter().position(|w| {
+        for ws_idx in 0..self.workspaces.len() {
+            if let Some(pos) = self.workspaces[ws_idx].windows.iter().position(|w| {
                 w.toplevel()
                     .map(|t| t.wl_surface() == target_surface)
                     .unwrap_or(false)
             }) {
-                let window = self.workspace_windows[ws_idx].remove(pos);
+                let window = self.workspaces[ws_idx].remove_window(pos).unwrap();
                 let should_restore_focus = if ws_idx == self.active_workspace {
                     match self
                         .seat
@@ -454,7 +263,7 @@ impl XdgShellHandler for Beewm {
                 if was_fullscreen {
                     self.fullscreen_window = None;
                     // Remap siblings that were unmapped while fullscreen was active.
-                    for sibling in &self.workspace_windows[ws_idx] {
+                    for sibling in &self.workspaces[ws_idx].windows {
                         if self.space.element_geometry(sibling).is_none() {
                             self.space.map_element(sibling.clone(), (0, 0), false);
                         }
@@ -464,14 +273,13 @@ impl XdgShellHandler for Beewm {
                 self.floating_windows.remove(target_surface);
                 self.remove_tiled_window(ws_idx, target_surface);
                 self.space.unmap_elem(&window);
-                self.workspaces[ws_idx].remove_window(pos);
                 self.publish_workspace_state();
                 if ws_idx == self.active_workspace {
                     if should_restore_focus {
                         let focus = self.workspaces[self.active_workspace]
                             .focused_idx
                             .and_then(|focus_idx| {
-                                self.workspace_windows[self.active_workspace].get(focus_idx)
+                                self.workspaces[self.active_workspace].windows.get(focus_idx)
                             })
                             .and_then(|window| window.toplevel())
                             .map(|toplevel| toplevel.wl_surface().clone());
@@ -628,7 +436,7 @@ impl WlrLayerShellHandler for Beewm {
         // Restore keyboard focus to the active tiled window, if any.
         let focus = self.workspaces[self.active_workspace]
             .focused_idx
-            .and_then(|i| self.workspace_windows[self.active_workspace].get(i))
+            .and_then(|i| self.workspaces[self.active_workspace].windows.get(i))
             .and_then(|w| w.toplevel())
             .map(|t| t.wl_surface().clone());
         self.set_keyboard_focus(focus);
