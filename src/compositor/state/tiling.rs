@@ -1,13 +1,14 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::seat::WaylandFocus;
 
 use super::{Beewm, root_surface};
 
 impl Beewm {
     pub(crate) fn window_root_surface(window: &Window) -> Option<WlSurface> {
         window
-            .toplevel()
-            .map(|toplevel| root_surface(toplevel.wl_surface()))
+            .wl_surface()
+            .map(|surface| root_surface(&surface.into_owned()))
     }
 
     pub(crate) fn is_root_floating(&self, root: &WlSurface) -> bool {
@@ -44,6 +45,33 @@ impl Beewm {
                     .and_then(Self::window_root_surface)
             })
             .filter(|root| !self.is_root_floating(root) && !self.is_root_fullscreen(root))
+    }
+
+    pub(crate) fn tiled_windows_in_workspace(&self, workspace_idx: usize) -> Vec<Window> {
+        self.workspaces[workspace_idx]
+            .windows
+            .iter()
+            .filter(|window| {
+                let root = Self::window_root_surface(window);
+                let is_fullscreen = root
+                    .as_ref()
+                    .map(|root| self.is_root_fullscreen(root))
+                    .unwrap_or(false);
+                let is_floating = root
+                    .as_ref()
+                    .map(|root| self.is_root_floating(root))
+                    .unwrap_or(false);
+                !is_fullscreen && !is_floating
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn tiled_window_roots_in_workspace(&self, workspace_idx: usize) -> Vec<WlSurface> {
+        self.tiled_windows_in_workspace(workspace_idx)
+            .iter()
+            .filter_map(Self::window_root_surface)
+            .collect()
     }
 
     pub(crate) fn insert_tiled_window(

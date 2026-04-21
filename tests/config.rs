@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use beewm::config::{Action, Config, ConfigError, LayoutKind};
+use beewm::config::{Action, Config, ConfigError, FocusDirection, LayoutKind};
 
 fn remove_dir_all_if_exists(path: &Path) {
     if let Err(error) = std::fs::remove_dir_all(path) {
@@ -77,6 +77,30 @@ fn fills_default_keybinds_for_custom_workspace_count() {
             .keybinds
             .iter()
             .all(|bind| !matches!(bind.action, Action::MoveToWorkspace(index) if index >= 4))
+    );
+    assert!(config.keybinds.iter().any(|bind| {
+        bind.key == "Left" && matches!(bind.action, Action::FocusDirection(FocusDirection::Left))
+    }));
+    assert!(config.keybinds.iter().any(|bind| {
+        bind.key == "Right" && matches!(bind.action, Action::FocusDirection(FocusDirection::Right))
+    }));
+    assert!(config.keybinds.iter().any(|bind| {
+        bind.key == "Up" && matches!(bind.action, Action::FocusDirection(FocusDirection::Up))
+    }));
+    assert!(config.keybinds.iter().any(|bind| {
+        bind.key == "Down" && matches!(bind.action, Action::FocusDirection(FocusDirection::Down))
+    }));
+    assert!(
+        !config
+            .keybinds
+            .iter()
+            .any(|bind| bind.key == "j" && matches!(bind.action, Action::FocusNext))
+    );
+    assert!(
+        !config
+            .keybinds
+            .iter()
+            .any(|bind| bind.key == "k" && matches!(bind.action, Action::FocusPrev))
     );
 }
 
@@ -179,6 +203,37 @@ fn custom_keybinds_replace_the_default_bind_set() {
 }
 
 #[test]
+fn parses_directional_focus_actions() {
+    let config = Config::parse(
+        r#"
+        bindsym mod4+Right focus_right
+        bindsym mod4+Left focus_left
+        bindsym mod4+Up focus_up
+        bindsym mod4+Down focus_down
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(config.keybinds.len(), 4);
+    assert_eq!(
+        config.keybinds[0].action,
+        Action::FocusDirection(FocusDirection::Right)
+    );
+    assert_eq!(
+        config.keybinds[1].action,
+        Action::FocusDirection(FocusDirection::Left)
+    );
+    assert_eq!(
+        config.keybinds[2].action,
+        Action::FocusDirection(FocusDirection::Up)
+    );
+    assert_eq!(
+        config.keybinds[3].action,
+        Action::FocusDirection(FocusDirection::Down)
+    );
+}
+
+#[test]
 fn rejects_zero_workspaces() {
     let err = Config::parse("workspaces 0\n").unwrap_err();
     assert!(matches!(err, ConfigError::Parse { .. }));
@@ -226,6 +281,12 @@ fn writes_default_config_file_when_missing() {
     assert!(written.contains("workspaces 10"));
     assert!(written.contains("# exec waybar"));
     assert!(written.contains("bindsym $mod+Return exec $terminal"));
+    assert!(written.contains("bindsym $mod+Left focus_left"));
+    assert!(written.contains("bindsym $mod+Right focus_right"));
+    assert!(written.contains("bindsym $mod+Up focus_up"));
+    assert!(written.contains("bindsym $mod+Down focus_down"));
+    assert!(!written.contains("bindsym $mod+j focus_next"));
+    assert!(!written.contains("bindsym $mod+k focus_prev"));
     assert!(written.contains("bindsym $mod+0 workspace 10"));
     assert!(written.contains("bindsym $mod+Shift+0 move_to_workspace 10"));
 

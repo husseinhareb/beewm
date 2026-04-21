@@ -2,11 +2,12 @@ use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Size};
+use smithay::wayland::seat::WaylandFocus;
 
 use crate::compositor::state::Beewm;
 use crate::compositor::types::{
     ActiveGrab, FloatingWindowData, MoveGrab, ResizeEdges, ResizeGrab, ResizeHorizontalEdge,
-    ResizeVerticalEdge, TiledSwapGrab,
+    ResizeVerticalEdge, TiledResizeGrab, TiledSwapGrab,
 };
 
 use super::MIN_FLOATING_WINDOW_SIZE;
@@ -20,6 +21,10 @@ pub(super) fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>
         }
         Some(ActiveGrab::Resize(grab)) => {
             apply_resize_grab(state, &grab, pointer);
+            true
+        }
+        Some(ActiveGrab::TiledResize(grab)) => {
+            apply_tiled_resize_grab(state, &grab, pointer);
             true
         }
         Some(ActiveGrab::TiledSwap(_)) => {
@@ -80,6 +85,57 @@ fn apply_resize_grab(state: &mut Beewm, grab: &ResizeGrab, pointer: Point<f64, L
     if let Some(ActiveGrab::Resize(active_grab)) = state.active_grab.as_mut() {
         active_grab.current_window_pos = new_window_pos;
         active_grab.current_window_size = new_window_size;
+    }
+}
+
+fn apply_tiled_resize_grab(
+    state: &mut Beewm,
+    grab: &TiledResizeGrab,
+    pointer: Point<f64, Logical>,
+) {
+    let dx = (pointer.x - grab.last_pointer.x) as i32;
+    let dy = (pointer.y - grab.last_pointer.y) as i32;
+
+    let Some(root) = Beewm::window_root_surface(&grab.window) else {
+        if let Some(ActiveGrab::TiledResize(active_grab)) = state.active_grab.as_mut() {
+            active_grab.last_pointer = pointer;
+        }
+        return;
+    };
+
+    let Some(usable) = state.tiling_usable_geometry() else {
+        if let Some(ActiveGrab::TiledResize(active_grab)) = state.active_grab.as_mut() {
+            active_grab.last_pointer = pointer;
+        }
+        return;
+    };
+
+    let tiled_roots = state.tiled_window_roots_in_workspace(grab.workspace_idx);
+    if (dx != 0 || dy != 0)
+        && state.layout_manager.resize(
+            grab.workspace_idx,
+            &usable,
+            &tiled_roots,
+            &root,
+            grab.edges,
+            (dx, dy),
+        )
+    {
+        state.relayout();
+
+        if let Some(toplevel) = grab.window.toplevel() {
+            if let Some(size) = tiled_window_target_size(state, grab.workspace_idx, &root) {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Resizing);
+                    state.size = Some(size);
+                });
+                toplevel.send_pending_configure();
+            }
+        }
+    }
+
+    if let Some(ActiveGrab::TiledResize(active_grab)) = state.active_grab.as_mut() {
+        active_grab.last_pointer = pointer;
     }
 }
 
@@ -151,6 +207,41 @@ pub(super) fn try_start_resize_grab(state: &mut Beewm) -> bool {
     true
 }
 
+pub(super) fn try_start_tiled_resize_grab(state: &mut Beewm) -> bool {
+    let Some(window) = tiled_window_under_pointer_with_logo(state) else {
+        return false;
+    };
+
+    let Some(window_geo) = state.space.element_geometry(&window) else {
+        return false;
+    };
+    let Some(root) = Beewm::window_root_surface(&window) else {
+        return false;
+    };
+
+    let edges = resize_edges_for_pointer(window_geo.loc, window_geo.size, state.pointer_location);
+    let initial_size = tiled_window_target_size(state, state.active_workspace, &root)
+        .unwrap_or_else(|| Size::from((window_geo.size.w, window_geo.size.h)));
+    focus_and_raise_window(state, &window);
+
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Resizing);
+            state.size = Some(initial_size);
+        });
+        toplevel.send_pending_configure();
+    }
+
+    state.active_grab = Some(ActiveGrab::TiledResize(TiledResizeGrab {
+        window,
+        workspace_idx: state.active_workspace,
+        edges,
+        last_pointer: state.pointer_location,
+    }));
+    state.refresh_compositor_cursor();
+    true
+}
+
 pub(super) fn finish_tiled_swap_grab(state: &mut Beewm) -> bool {
     let grab = match state.active_grab.take() {
         Some(ActiveGrab::TiledSwap(grab)) => grab,
@@ -210,6 +301,20 @@ fn candidate_tiled_swap_target(state: &Beewm) -> Option<WlSurface> {
 pub(super) fn finish_resize_grab(state: &mut Beewm) -> bool {
     let grab = match state.active_grab.take() {
         Some(ActiveGrab::Resize(grab)) => grab,
+        Some(ActiveGrab::TiledResize(grab)) => {
+            if let Some(toplevel) = grab.window.toplevel() {
+                let size = Beewm::window_root_surface(&grab.window)
+                    .as_ref()
+                    .and_then(|root| tiled_window_target_size(state, grab.workspace_idx, root));
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Resizing);
+                    state.size = size;
+                });
+                toplevel.send_configure();
+            }
+            state.refresh_compositor_cursor();
+            return true;
+        }
         other => {
             state.active_grab = other;
             return false;
@@ -240,6 +345,21 @@ pub(super) fn finish_resize_grab(state: &mut Beewm) -> bool {
     true
 }
 
+fn tiled_window_target_size(
+    state: &Beewm,
+    workspace_idx: usize,
+    root: &WlSurface,
+) -> Option<Size<i32, Logical>> {
+    let usable = state.tiling_usable_geometry()?;
+    let tiled_roots = state.tiled_window_roots_in_workspace(workspace_idx);
+    let geometry = state
+        .layout_manager
+        .geometries(workspace_idx, &usable, &tiled_roots)
+        .get(root)
+        .copied()?;
+    Some(state.configured_tiled_size(geometry))
+}
+
 fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
     let keyboard = state.seat.get_keyboard().unwrap();
     let modifiers = keyboard.modifier_state();
@@ -267,8 +387,8 @@ fn tiled_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
 }
 
 fn focus_and_raise_window(state: &mut Beewm, window: &Window) {
-    if let Some(toplevel) = window.toplevel() {
-        state.set_keyboard_focus(Some(toplevel.wl_surface().clone()));
+    if let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) {
+        state.set_keyboard_focus(Some(surface));
     }
     state.space.raise_element(window, true);
     state.needs_render = true;

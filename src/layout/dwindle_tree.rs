@@ -6,11 +6,20 @@ enum SplitAxis {
     Horizontal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 #[derive(Debug, Clone)]
 enum DwindleNode<T> {
     Leaf(T),
     Split {
         axis: SplitAxis,
+        ratio: f64,
         first: Box<DwindleNode<T>>,
         second: Box<DwindleNode<T>>,
     },
@@ -19,15 +28,26 @@ enum DwindleNode<T> {
 #[derive(Debug, Clone)]
 pub struct DwindleTree<T> {
     root: Option<DwindleNode<T>>,
+    default_split_ratio: f64,
 }
 
 impl<T> Default for DwindleTree<T> {
     fn default() -> Self {
-        Self { root: None }
+        Self {
+            root: None,
+            default_split_ratio: 0.5,
+        }
     }
 }
 
 impl<T: Clone + Eq> DwindleTree<T> {
+    pub fn with_split_ratio(split_ratio: f64) -> Self {
+        Self {
+            root: None,
+            default_split_ratio: sanitize_split_ratio(split_ratio),
+        }
+    }
+
     pub fn insert(&mut self, target: Option<&T>, new_leaf: T) {
         if self.root.is_none() {
             self.root = Some(DwindleNode::Leaf(new_leaf));
@@ -40,7 +60,7 @@ impl<T: Clone + Eq> DwindleTree<T> {
             .or_else(|| self.root.as_ref().and_then(DwindleNode::last_leaf).cloned());
 
         if let (Some(root), Some(split_target)) = (self.root.as_mut(), split_target) {
-            root.insert_at(&split_target, new_leaf, 0);
+            root.insert_at(&split_target, new_leaf, 0, self.default_split_ratio);
         }
     }
 
@@ -65,18 +85,44 @@ impl<T: Clone + Eq> DwindleTree<T> {
         true
     }
 
-    pub fn geometries(&self, screen: &Geometry, split_ratio: f64) -> Vec<(T, Geometry)> {
+    pub fn geometries(&self, screen: &Geometry) -> Vec<(T, Geometry)> {
         let mut geometries = Vec::new();
-        let split_ratio = if split_ratio.is_finite() {
-            split_ratio.clamp(0.0, 1.0)
-        } else {
-            0.5
-        };
         if let Some(root) = self.root.as_ref() {
-            root.collect_geometries(screen, split_ratio, &mut geometries);
+            root.collect_geometries(screen, &mut geometries);
         }
         geometries
     }
+
+    pub fn resize(
+        &mut self,
+        target: &T,
+        edge: ResizeEdge,
+        delta: i32,
+        screen: &Geometry,
+        min_leaf_span: u32,
+    ) -> bool {
+        let Some(root) = self.root.as_mut() else {
+            return false;
+        };
+
+        matches!(
+            root.resize(target, edge, delta, screen, min_leaf_span.max(1)),
+            ResizeSearch::Handled
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeSearch {
+    NotFound,
+    Found,
+    Handled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildBranch {
+    First,
+    Second,
 }
 
 impl<T: Clone + Eq> DwindleNode<T> {
@@ -94,12 +140,13 @@ impl<T: Clone + Eq> DwindleNode<T> {
         }
     }
 
-    fn insert_at(&mut self, target: &T, new_leaf: T, depth: usize) -> bool {
+    fn insert_at(&mut self, target: &T, new_leaf: T, depth: usize, default_ratio: f64) -> bool {
         match self {
             Self::Leaf(existing) if existing == target => {
                 let existing = existing.clone();
                 *self = Self::Split {
                     axis: split_axis_for_depth(depth),
+                    ratio: default_ratio,
                     first: Box::new(Self::Leaf(existing)),
                     second: Box::new(Self::Leaf(new_leaf)),
                 };
@@ -107,8 +154,8 @@ impl<T: Clone + Eq> DwindleNode<T> {
             }
             Self::Leaf(_) => false,
             Self::Split { first, second, .. } => {
-                first.insert_at(target, new_leaf.clone(), depth + 1)
-                    || second.insert_at(target, new_leaf, depth + 1)
+                first.insert_at(target, new_leaf.clone(), depth + 1, default_ratio)
+                    || second.insert_at(target, new_leaf, depth + 1, default_ratio)
             }
         }
     }
@@ -118,6 +165,7 @@ impl<T: Clone + Eq> DwindleNode<T> {
             Self::Leaf(window) => (window != *target).then_some(Self::Leaf(window)),
             Self::Split {
                 axis,
+                ratio,
                 first,
                 second,
             } => {
@@ -126,6 +174,7 @@ impl<T: Clone + Eq> DwindleNode<T> {
                 match (first, second) {
                     (Some(first), Some(second)) => Some(Self::Split {
                         axis,
+                        ratio,
                         first: Box::new(first),
                         second: Box::new(second),
                     }),
@@ -153,23 +202,133 @@ impl<T: Clone + Eq> DwindleNode<T> {
         }
     }
 
-    fn collect_geometries(
-        &self,
-        screen: &Geometry,
-        split_ratio: f64,
-        geometries: &mut Vec<(T, Geometry)>,
-    ) {
+    fn collect_geometries(&self, screen: &Geometry, geometries: &mut Vec<(T, Geometry)>) {
         match self {
             Self::Leaf(window) => geometries.push((window.clone(), *screen)),
             Self::Split {
                 axis,
+                ratio,
                 first,
                 second,
             } => {
-                let (first_geo, second_geo) = split_geometry(screen, *axis, split_ratio);
-                first.collect_geometries(&first_geo, split_ratio, geometries);
-                second.collect_geometries(&second_geo, split_ratio, geometries);
+                let (first_geo, second_geo) = split_geometry(screen, *axis, *ratio);
+                first.collect_geometries(&first_geo, geometries);
+                second.collect_geometries(&second_geo, geometries);
             }
+        }
+    }
+
+    fn resize(
+        &mut self,
+        target: &T,
+        edge: ResizeEdge,
+        delta: i32,
+        container: &Geometry,
+        min_leaf_span: u32,
+    ) -> ResizeSearch {
+        match self {
+            Self::Leaf(window) => {
+                if window == target {
+                    ResizeSearch::Found
+                } else {
+                    ResizeSearch::NotFound
+                }
+            }
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (first_geo, second_geo) = split_geometry(container, *axis, *ratio);
+
+                match first.resize(target, edge, delta, &first_geo, min_leaf_span) {
+                    ResizeSearch::Handled => return ResizeSearch::Handled,
+                    ResizeSearch::Found => {
+                        if edge_matches_branch(edge, *axis, ChildBranch::First) {
+                            adjust_split_ratio(
+                                axis,
+                                ratio,
+                                first,
+                                second,
+                                &first_geo,
+                                &second_geo,
+                                delta,
+                                min_leaf_span,
+                            );
+                            return ResizeSearch::Handled;
+                        }
+                        return ResizeSearch::Found;
+                    }
+                    ResizeSearch::NotFound => {}
+                }
+
+                match second.resize(target, edge, delta, &second_geo, min_leaf_span) {
+                    ResizeSearch::Handled => ResizeSearch::Handled,
+                    ResizeSearch::Found => {
+                        if edge_matches_branch(edge, *axis, ChildBranch::Second) {
+                            adjust_split_ratio(
+                                axis,
+                                ratio,
+                                first,
+                                second,
+                                &first_geo,
+                                &second_geo,
+                                delta,
+                                min_leaf_span,
+                            );
+                            ResizeSearch::Handled
+                        } else {
+                            ResizeSearch::Found
+                        }
+                    }
+                    ResizeSearch::NotFound => ResizeSearch::NotFound,
+                }
+            }
+        }
+    }
+
+    fn min_width(&self, min_leaf_span: u32) -> u32 {
+        match self {
+            Self::Leaf(_) => min_leaf_span,
+            Self::Split {
+                axis: SplitAxis::Vertical,
+                first,
+                second,
+                ..
+            } => first
+                .min_width(min_leaf_span)
+                .saturating_add(second.min_width(min_leaf_span)),
+            Self::Split {
+                axis: SplitAxis::Horizontal,
+                first,
+                second,
+                ..
+            } => first
+                .min_width(min_leaf_span)
+                .max(second.min_width(min_leaf_span)),
+        }
+    }
+
+    fn min_height(&self, min_leaf_span: u32) -> u32 {
+        match self {
+            Self::Leaf(_) => min_leaf_span,
+            Self::Split {
+                axis: SplitAxis::Horizontal,
+                first,
+                second,
+                ..
+            } => first
+                .min_height(min_leaf_span)
+                .saturating_add(second.min_height(min_leaf_span)),
+            Self::Split {
+                axis: SplitAxis::Vertical,
+                first,
+                second,
+                ..
+            } => first
+                .min_height(min_leaf_span)
+                .max(second.min_height(min_leaf_span)),
         }
     }
 }
@@ -183,6 +342,7 @@ fn split_axis_for_depth(depth: usize) -> SplitAxis {
 }
 
 fn split_geometry(screen: &Geometry, axis: SplitAxis, split_ratio: f64) -> (Geometry, Geometry) {
+    let split_ratio = sanitize_split_ratio(split_ratio);
     match axis {
         SplitAxis::Vertical => {
             let first_width = (screen.width as f64 * split_ratio) as u32;
@@ -211,4 +371,69 @@ fn split_geometry(screen: &Geometry, axis: SplitAxis, split_ratio: f64) -> (Geom
             )
         }
     }
+}
+
+fn sanitize_split_ratio(split_ratio: f64) -> f64 {
+    if split_ratio.is_finite() {
+        split_ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+fn edge_matches_branch(edge: ResizeEdge, axis: SplitAxis, branch: ChildBranch) -> bool {
+    matches!(
+        (edge, axis, branch),
+        (ResizeEdge::Right, SplitAxis::Vertical, ChildBranch::First)
+            | (ResizeEdge::Left, SplitAxis::Vertical, ChildBranch::Second)
+            | (
+                ResizeEdge::Bottom,
+                SplitAxis::Horizontal,
+                ChildBranch::First
+            )
+            | (ResizeEdge::Top, SplitAxis::Horizontal, ChildBranch::Second)
+    )
+}
+
+fn adjust_split_ratio<T: Clone + Eq>(
+    axis: &SplitAxis,
+    ratio: &mut f64,
+    first: &DwindleNode<T>,
+    second: &DwindleNode<T>,
+    first_geo: &Geometry,
+    second_geo: &Geometry,
+    delta: i32,
+    min_leaf_span: u32,
+) {
+    let (current_first_span, total_span, min_first, min_second) = match axis {
+        SplitAxis::Vertical => (
+            first_geo.width,
+            first_geo.width.saturating_add(second_geo.width),
+            first.min_width(min_leaf_span),
+            second.min_width(min_leaf_span),
+        ),
+        SplitAxis::Horizontal => (
+            first_geo.height,
+            first_geo.height.saturating_add(second_geo.height),
+            first.min_height(min_leaf_span),
+            second.min_height(min_leaf_span),
+        ),
+    };
+
+    if total_span == 0 {
+        return;
+    }
+
+    if min_first.saturating_add(min_second) > total_span {
+        return;
+    }
+
+    let lower = min_first as i32;
+    let upper = total_span as i32 - min_second as i32;
+    if upper < lower {
+        return;
+    }
+
+    let new_first_span = (current_first_span as i32 + delta).clamp(lower, upper);
+    *ratio = sanitize_split_ratio(new_first_span as f64 / total_span as f64);
 }

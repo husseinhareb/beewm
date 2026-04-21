@@ -41,10 +41,13 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::xwayland_shell::XWaylandShellState;
+use smithay::xwayland::{X11Wm, XWaylandClientData};
 
 use crate::config::{Config, Keybind, LayoutKind};
 use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
+use crate::xwayland::PendingX11Window;
 
 use super::commands::ChildEnvironment;
 
@@ -77,6 +80,7 @@ pub struct Beewm {
     pub xdg_shell_state: XdgShellState,
     pub _xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
+    pub xwayland_shell_state: XWaylandShellState,
     pub shm_state: ShmState,
     pub _output_manager_state: OutputManagerState,
     pub _viewporter_state: ViewporterState,
@@ -121,6 +125,10 @@ pub struct Beewm {
     pub border_commit_serial: u64,
     /// Set when visual state changed and a new frame should be rendered.
     pub needs_render: bool,
+    /// X11 window manager state for the compositor-managed XWayland instance.
+    pub xwm: Option<X11Wm>,
+    /// DISPLAY number exported to spawned child processes once XWayland is ready.
+    pub xdisplay: Option<u32>,
     /// The window currently occupying the full screen, if any.
     pub fullscreen_window: Option<Window>,
     /// Tracks popup surfaces and provides grab support.
@@ -143,6 +151,11 @@ pub struct Beewm {
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
     /// Compositor-specific environment for spawned child processes.
     pub(crate) child_env: ChildEnvironment,
+    /// Startup commands are delayed until both an output exists and XWayland startup has settled.
+    pub(crate) startup_commands_spawned: bool,
+    pub(crate) outputs_ready_for_startup: bool,
+    pub(crate) xwayland_start_pending: bool,
+    pub(crate) pending_x11_windows: Vec<PendingX11Window>,
 }
 
 impl Beewm {
@@ -153,6 +166,7 @@ impl Beewm {
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
@@ -189,6 +203,7 @@ impl Beewm {
             xdg_shell_state,
             _xdg_decoration_state: xdg_decoration_state,
             layer_shell_state,
+            xwayland_shell_state,
             shm_state,
             _output_manager_state: output_manager_state,
             _viewporter_state: viewporter_state,
@@ -219,6 +234,8 @@ impl Beewm {
             border_ids: Vec::new(),
             border_commit_serial: 0,
             needs_render: true,
+            xwm: None,
+            xdisplay: None,
             fullscreen_window: None,
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
@@ -229,6 +246,10 @@ impl Beewm {
             border_color_unfocused,
             syncobj_blocker_installer: None,
             child_env: ChildEnvironment::default(),
+            startup_commands_spawned: false,
+            outputs_ready_for_startup: false,
+            xwayland_start_pending: false,
+            pending_x11_windows: Vec::new(),
         };
 
         state.publish_workspace_state();
@@ -339,7 +360,9 @@ fn build_layout_manager(
 ) -> Box<dyn LayoutManager<WlSurface>> {
     match config.layout {
         LayoutKind::Dwindle => Box::new(DwindleManager::new(num_workspaces, config.split_ratio)),
-        LayoutKind::MasterStack => Box::new(MasterStackManager::new(config.split_ratio)),
+        LayoutKind::MasterStack => {
+            Box::new(MasterStackManager::new(num_workspaces, config.split_ratio))
+        }
     }
 }
 
@@ -351,7 +374,7 @@ fn hex_to_color32f(hex: u32) -> Color32F {
     Color32F::new(r, g, b, 1.0)
 }
 
-pub(super) fn root_surface(surface: &WlSurface) -> WlSurface {
+pub(crate) fn root_surface(surface: &WlSurface) -> WlSurface {
     let mut root = surface.clone();
     while let Some(parent) = get_parent(&root) {
         root = parent;
@@ -388,6 +411,17 @@ fn resolve_keybinds(keybinds: &[Keybind]) -> Vec<ResolvedKeybind> {
             }
         })
         .collect()
+}
+
+pub(crate) fn lookup_client_compositor_state(client: &Client) -> Option<&CompositorClientState> {
+    client
+        .get_data::<ClientState>()
+        .map(|state| &state.compositor_state)
+        .or_else(|| {
+            client
+                .get_data::<XWaylandClientData>()
+                .map(|state| &state.compositor_state)
+        })
 }
 
 /// Per-client state required by smithay.

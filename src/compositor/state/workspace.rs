@@ -1,3 +1,5 @@
+use smithay::wayland::seat::WaylandFocus;
+
 use super::Beewm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +58,7 @@ impl Beewm {
                     .windows
                     .get(focus_idx)
             })
-            .and_then(|window| window.toplevel())
-            .map(|toplevel| toplevel.wl_surface().clone());
+            .and_then(|window| window.wl_surface().map(|surface| surface.into_owned()));
         if let Some(focus) = focus {
             self.set_keyboard_focus(Some(focus));
         } else {
@@ -124,8 +125,7 @@ impl Beewm {
                     .windows
                     .get(focus_idx)
             })
-            .and_then(|window| window.toplevel())
-            .map(|toplevel| toplevel.wl_surface().clone());
+            .and_then(|window| window.wl_surface().map(|surface| surface.into_owned()));
         if let Some(focus) = focus {
             self.set_keyboard_focus(Some(focus));
         } else {

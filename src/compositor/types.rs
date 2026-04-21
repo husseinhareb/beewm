@@ -37,6 +37,19 @@ pub struct TiledSwapGrab {
     pub workspace_idx: usize,
 }
 
+/// State for an in-progress tiled-window resize (Super + RMB drag).
+#[derive(Debug, Clone)]
+pub struct TiledResizeGrab {
+    /// The tiled window being resized.
+    pub window: Window,
+    /// Workspace that owns the resized tiled window.
+    pub workspace_idx: usize,
+    /// Which edges of the window are following the pointer.
+    pub edges: ResizeEdges,
+    /// Pointer position used to compute the next resize delta.
+    pub last_pointer: Point<f64, Logical>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeHorizontalEdge {
     Left,
@@ -109,4 +122,6 @@ pub enum ActiveGrab {
     TiledSwap(TiledSwapGrab),
     /// Floating window resize (Super + RMB drag).
     Resize(ResizeGrab),
+    /// Tiled window resize (Super + RMB drag on tiled window).
+    TiledResize(TiledResizeGrab),
 }

@@ -11,7 +11,8 @@ use beewm::compositor::{
     root_is_swap_highlighted, visible_border_rectangles, window_border_overlaps_layer,
     workspace_state_contents, write_state_file_atomically,
 };
-use beewm::layout::dwindle_tree::DwindleTree;
+use beewm::layout::dwindle_tree::{DwindleTree, ResizeEdge};
+use beewm::layout::manager::{LayoutManager, MasterStackManager};
 use beewm::model::window::Geometry;
 use beewm::model::workspace::Workspace;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner;
@@ -263,7 +264,7 @@ fn splits_the_focused_leaf_instead_of_the_remaining_screen() {
     tree.insert(Some(&1), 3);
     tree.insert(Some(&2), 4);
 
-    let geometries = geometry_map(tree.geometries(&screen, 0.5));
+    let geometries = geometry_map(tree.geometries(&screen));
 
     assert_eq!(geometries[&1], Geometry::new(0, 0, 50, 50));
     assert_eq!(geometries[&2], Geometry::new(50, 0, 50, 50));
@@ -281,11 +282,58 @@ fn swapping_two_leaves_exchanges_their_geometries() {
     tree.insert(Some(&1), 3);
     assert!(tree.swap(&1, &2));
 
-    let geometries = geometry_map(tree.geometries(&screen, 0.5));
+    let geometries = geometry_map(tree.geometries(&screen));
 
     assert_eq!(geometries[&1], Geometry::new(50, 0, 50, 100));
     assert_eq!(geometries[&2], Geometry::new(0, 0, 50, 50));
     assert_eq!(geometries[&3], Geometry::new(0, 50, 50, 50));
+}
+
+#[test]
+fn resizing_a_dwindle_leaf_updates_the_nearest_matching_split() {
+    let mut tree = DwindleTree::default();
+    let screen = Geometry::new(0, 0, 100, 100);
+
+    tree.insert(None, 1);
+    tree.insert(Some(&1), 2);
+    tree.insert(Some(&2), 3);
+
+    assert!(tree.resize(&3, ResizeEdge::Top, -10, &screen, 1));
+
+    let geometries = geometry_map(tree.geometries(&screen));
+
+    assert_eq!(geometries[&1], Geometry::new(0, 0, 50, 100));
+    assert_eq!(geometries[&2], Geometry::new(50, 0, 50, 40));
+    assert_eq!(geometries[&3], Geometry::new(50, 40, 50, 60));
+}
+
+#[test]
+fn resizing_master_stack_tracks_master_and_stack_split_ratios() {
+    let mut manager = MasterStackManager::new(1, 0.5);
+    let screen = Geometry::new(0, 0, 100, 100);
+    let tiled_ids = vec![1u8, 2u8, 3u8];
+
+    manager.insert(0, None, 1);
+    manager.insert(0, None, 2);
+    manager.insert(0, None, 3);
+
+    assert!(manager.resize(
+        0,
+        &screen,
+        &tiled_ids,
+        &2,
+        ResizeEdges {
+            horizontal: ResizeHorizontalEdge::Left,
+            vertical: ResizeVerticalEdge::Bottom,
+        },
+        (10, 10),
+    ));
+
+    let geometries = manager.geometries(0, &screen, &tiled_ids);
+
+    assert_eq!(geometries[&1], Geometry::new(0, 0, 60, 100));
+    assert_eq!(geometries[&2], Geometry::new(60, 0, 40, 60));
+    assert_eq!(geometries[&3], Geometry::new(60, 60, 40, 40));
 }
 
 #[test]

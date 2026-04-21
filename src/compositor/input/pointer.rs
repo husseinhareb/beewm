@@ -7,6 +7,7 @@ use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotio
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
 };
@@ -19,7 +20,7 @@ use crate::compositor::types::ActiveGrab;
 
 use super::grab::{
     finish_resize_grab, finish_tiled_swap_grab, handle_active_grab, try_start_move_grab,
-    try_start_resize_grab, try_start_tiled_swap_grab,
+    try_start_resize_grab, try_start_tiled_resize_grab, try_start_tiled_swap_grab,
 };
 use super::{BTN_LEFT, BTN_RIGHT, layer_surface_has_keyboard_focus};
 
@@ -92,9 +93,7 @@ fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
 
 fn keyboard_focus_target_under_pointer(state: &Beewm, surface: &WlSurface) -> Option<WlSurface> {
     if let Some(window) = state.mapped_window_for_surface(surface) {
-        return window
-            .toplevel()
-            .map(|toplevel| toplevel.wl_surface().clone());
+        return window.wl_surface().map(|surface| surface.into_owned());
     }
 
     surface_accepts_keyboard_focus(state, surface).then(|| surface.clone())
@@ -262,6 +261,9 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
 
     if button == BTN_RIGHT && btn_state == ButtonState::Pressed {
         if try_start_resize_grab(state) {
+            return;
+        }
+        if try_start_tiled_resize_grab(state) {
             return;
         }
     }

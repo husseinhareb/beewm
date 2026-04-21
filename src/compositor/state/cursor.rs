@@ -78,6 +78,7 @@ impl Beewm {
 fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
     match &state.active_grab {
         Some(ActiveGrab::Resize(grab)) => return Some(grab.edges.cursor_icon()),
+        Some(ActiveGrab::TiledResize(grab)) => return Some(grab.edges.cursor_icon()),
         Some(ActiveGrab::Move(_)) | Some(ActiveGrab::TiledSwap(_)) => {
             return Some(CursorIcon::Grabbing);
         }

@@ -83,12 +83,15 @@ fn execute_action(state: &mut Beewm, action: Action) {
         Action::FocusNext => {
             let ws = &mut state.workspaces[state.active_workspace];
             ws.focus_next();
-            focus_current_window(state);
+            state.focus_current_window();
         }
         Action::FocusPrev => {
             let ws = &mut state.workspaces[state.active_workspace];
             ws.focus_prev();
-            focus_current_window(state);
+            state.focus_current_window();
+        }
+        Action::FocusDirection(direction) => {
+            state.focus_window_in_direction(direction);
         }
         Action::CloseWindow => {
             if let Some(window) = state.active_workspace_focused_window() {
@@ -114,30 +117,4 @@ fn execute_action(state: &mut Beewm, action: Action) {
             state.move_to_workspace(idx);
         }
     }
-}
-
-fn focus_current_window(state: &mut Beewm) {
-    let ws = &state.workspaces[state.active_workspace];
-    let idx = match ws.focused_idx {
-        Some(i) => i,
-        None => return,
-    };
-
-    let window = match state.workspaces[state.active_workspace]
-        .windows
-        .get(idx)
-        .cloned()
-    {
-        Some(w) => w,
-        None => return,
-    };
-
-    let serial = SERIAL_COUNTER.next_serial();
-    let keyboard = state.seat.get_keyboard().unwrap();
-    if let Some(toplevel) = window.toplevel() {
-        let surface = toplevel.wl_surface().clone();
-        keyboard.set_focus(state, Some(surface), serial);
-    }
-    state.space.raise_element(&window, true);
-    state.needs_render = true;
 }

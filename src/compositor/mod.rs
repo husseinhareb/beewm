@@ -1,5 +1,5 @@
 pub mod backend;
-mod commands;
+pub(crate) mod commands;
 mod cursor;
 mod feedback;
 mod handlers;
@@ -7,7 +7,7 @@ mod input;
 mod ipc;
 mod layering;
 mod render;
-mod state;
+pub(crate) mod state;
 pub mod types;
 
 pub use backend::{run_udev, run_winit};
@@ -24,5 +24,5 @@ pub use state::{
 };
 pub use types::{
     ActiveGrab, FloatingWindowData, MoveGrab, ResizeEdges, ResizeGrab, ResizeHorizontalEdge,
-    ResizeVerticalEdge, ResolvedKeybind, TiledSwapGrab,
+    ResizeVerticalEdge, ResolvedKeybind, TiledResizeGrab, TiledSwapGrab,
 };

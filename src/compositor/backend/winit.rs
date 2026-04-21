@@ -21,7 +21,7 @@ use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
+use crate::compositor::commands::ChildEnvironment;
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -30,12 +30,15 @@ use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
 use crate::compositor::render::{layer_render_elements, window_render_elements};
 use crate::compositor::state::{Beewm, ClientState};
+use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
 
 struct WinitData {
     state: Beewm,
     display: Display<Beewm>,
     presentation_sequence: u64,
 }
+
+delegate_backend_xwayland!(WinitData, state);
 
 enum WinitRenderElement {
     Surface(Box<WaylandSurfaceRenderElement<GlowRenderer>>),
@@ -183,6 +186,8 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         presentation_sequence: 0,
     };
 
+    start_xwayland(event_loop.handle(), &display_handle, &mut data.state);
+
     // Set up the Wayland listening socket
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_os_string();
@@ -285,7 +290,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     child_env.set_sanitize_display(true);
     data.state.child_env = child_env;
 
-    spawn_startup_commands(&data.state.config.autostart_commands, &data.state.child_env);
+    data.state.mark_output_ready();
 
     tracing::info!("Starting winit event loop");
     let mut applied_cursor_status_serial = u64::MAX;

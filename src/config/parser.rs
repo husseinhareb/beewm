@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
 
-use super::{Action, Config, ConfigError, Keybind, LayoutKind};
+use super::{Action, Config, ConfigError, FocusDirection, Keybind, LayoutKind};
 
 pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
     let defaults = Config::default();
@@ -275,6 +275,10 @@ fn parse_action(action_text: &str, line_no: usize) -> Result<Action, ConfigError
         }
         "focus_next" => Ok(Action::FocusNext),
         "focus_prev" => Ok(Action::FocusPrev),
+        "focus_left" => Ok(Action::FocusDirection(FocusDirection::Left)),
+        "focus_right" => Ok(Action::FocusDirection(FocusDirection::Right)),
+        "focus_up" => Ok(Action::FocusDirection(FocusDirection::Up)),
+        "focus_down" => Ok(Action::FocusDirection(FocusDirection::Down)),
         "close_window" | "kill" => Ok(Action::CloseWindow),
         "fullscreen" | "toggle_fullscreen" => Ok(Action::ToggleFullscreen),
         "float" | "toggle_float" => Ok(Action::ToggleFloat),

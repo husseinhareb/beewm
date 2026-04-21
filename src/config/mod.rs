@@ -13,11 +13,20 @@ pub struct Keybind {
     pub action: Action,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// Actions that can be bound to keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     FocusNext,
     FocusPrev,
+    FocusDirection(FocusDirection),
     CloseWindow,
     ToggleFullscreen,
     ToggleFloat,
@@ -135,13 +144,23 @@ impl Config {
             },
             Keybind {
                 modifiers: vec!["mod4".into()],
-                key: "j".into(),
-                action: Action::FocusNext,
+                key: "Left".into(),
+                action: Action::FocusDirection(FocusDirection::Left),
             },
             Keybind {
                 modifiers: vec!["mod4".into()],
-                key: "k".into(),
-                action: Action::FocusPrev,
+                key: "Right".into(),
+                action: Action::FocusDirection(FocusDirection::Right),
+            },
+            Keybind {
+                modifiers: vec!["mod4".into()],
+                key: "Up".into(),
+                action: Action::FocusDirection(FocusDirection::Up),
+            },
+            Keybind {
+                modifiers: vec!["mod4".into()],
+                key: "Down".into(),
+                action: Action::FocusDirection(FocusDirection::Down),
             },
             Keybind {
                 modifiers: vec!["mod4".into(), "shift".into()],
@@ -253,8 +272,10 @@ impl Config {
         text.push_str("# exec nm-applet\n\n");
         text.push_str("bindsym $mod+Return exec $terminal\n");
         text.push_str("bindsym $mod+q exec $launcher\n");
-        text.push_str("bindsym $mod+j focus_next\n");
-        text.push_str("bindsym $mod+k focus_prev\n");
+        text.push_str("bindsym $mod+Left focus_left\n");
+        text.push_str("bindsym $mod+Right focus_right\n");
+        text.push_str("bindsym $mod+Up focus_up\n");
+        text.push_str("bindsym $mod+Down focus_down\n");
         text.push_str("bindsym $mod+Shift+q kill\n");
         text.push_str("bindsym $mod+Shift+e exit\n");
         text.push_str("bindsym $mod+f fullscreen\n");

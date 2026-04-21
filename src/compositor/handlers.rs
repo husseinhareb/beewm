@@ -56,7 +56,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use super::state::{Beewm, ClientState};
+use super::state::{Beewm, lookup_client_compositor_state};
 use super::state::popup::should_map_toplevel_floating;
 
 impl Beewm {
@@ -92,7 +92,8 @@ impl CompositorHandler for Beewm {
         &self,
         client: &'a smithay::reexports::wayland_server::Client,
     ) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        lookup_client_compositor_state(client)
+            .expect("missing compositor client state for Wayland or XWayland client")
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {

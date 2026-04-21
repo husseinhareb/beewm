@@ -32,7 +32,7 @@ use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::compositor::commands::{ChildEnvironment, spawn_startup_commands};
+use crate::compositor::commands::ChildEnvironment;
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -42,7 +42,8 @@ use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered
 use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, window_render_elements,
 };
-use crate::compositor::state::{Beewm, ClientState};
+use crate::compositor::state::{Beewm, ClientState, lookup_client_compositor_state};
+use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
 
 /// Per-GPU state for the DRM backend.
 struct GpuData {
@@ -71,6 +72,8 @@ struct UdevData {
     display: Display<Beewm>,
 }
 
+delegate_backend_xwayland!(UdevData, state);
+
 /// Run the compositor on real hardware from a TTY using DRM/KMS.
 pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<UdevData> = EventLoop::try_new()?;
@@ -93,17 +96,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         display,
     };
 
+    start_xwayland(event_loop.handle(), &display_handle, &mut data.state);
+
     let loop_handle = event_loop.handle();
     data.state
         .install_syncobj_blocker_source(Box::new(move |source, client| {
             let client = client.clone();
             if let Err(error) =
                 loop_handle.insert_source(source, move |(), _, data: &mut UdevData| {
-                    if let Some(client_state) = client.get_data::<ClientState>() {
+                    if let Some(client_state) = lookup_client_compositor_state(&client) {
                         let display_handle = data.state.display_handle.clone();
-                        client_state
-                            .compositor_state
-                            .blocker_cleared(&mut data.state, &display_handle);
+                        client_state.blocker_cleared(&mut data.state, &display_handle);
                     }
                     Ok(())
                 })
@@ -154,6 +157,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Keep compositor-specific env on child processes instead of mutating the
     // global process environment, which is unsafe in Rust 2024.
     let mut child_env = ChildEnvironment::wayland(socket_name);
+    child_env.set_sanitize_display(true);
 
     // Ensure XDG_RUNTIME_DIR is set — required by Wayland clients like kitty.
     // seatd/logind normally sets this; provide a fallback for bare TTY sessions.
@@ -304,10 +308,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Store session for VT switching
     data.state.session = Some(session.clone());
 
-    // Start autostart clients only after an output exists. Layer-shell
-    // clients like beebar need an output-backed initial configure; spawning
-    // them earlier races output creation and leaves them unmapped/blank.
-    spawn_startup_commands(&data.state.config.autostart_commands, &data.state.child_env);
+    // Start autostart clients only after an output exists and XWayland has
+    // produced a usable DISPLAY (or failed to do so).
+    data.state.mark_output_ready();
 
     tracing::info!("Starting udev event loop");
 

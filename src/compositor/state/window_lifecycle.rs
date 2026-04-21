@@ -2,6 +2,7 @@ use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Point, Size};
+use smithay::wayland::seat::WaylandFocus;
 
 use crate::model::window::Geometry;
 
@@ -86,7 +87,7 @@ impl Beewm {
             Some(w) => w,
             None => return,
         };
-        let surface = match window.toplevel().map(|t| t.wl_surface().clone()) {
+        let surface = match window.wl_surface().map(|surface| surface.into_owned()) {
             Some(s) => s,
             None => return,
         };
@@ -173,7 +174,10 @@ impl Beewm {
     /// Float a newly-mapped window centered on the screen using its own
     /// natural size.
     pub fn map_as_floating_centered(&mut self, window: &Window) {
-        let root = match window.toplevel().map(|t| root_surface(t.wl_surface())) {
+        let root = match window
+            .wl_surface()
+            .map(|surface| root_surface(&surface.into_owned()))
+        {
             Some(r) => r,
             None => return,
         };
@@ -205,7 +209,10 @@ impl Beewm {
     }
 
     fn float_window(&mut self, window: Window) {
-        let root = match window.toplevel().map(|t| root_surface(t.wl_surface())) {
+        let root = match window
+            .wl_surface()
+            .map(|surface| root_surface(&surface.into_owned()))
+        {
             Some(r) => r,
             None => return,
         };
@@ -242,7 +249,7 @@ impl Beewm {
     fn remap_floating_windows(&mut self) {
         let ws_idx = self.active_workspace;
         for window in self.workspaces[ws_idx].windows.clone() {
-            let root = match window.toplevel().map(|t| t.wl_surface().clone()) {
+            let root = match window.wl_surface().map(|surface| surface.into_owned()) {
                 Some(surface) => root_surface(&surface),
                 None => continue,
             };
@@ -336,44 +343,23 @@ impl Beewm {
             return;
         }
 
-        let tiled_windows: Vec<Window> = windows
-            .iter()
-            .filter(|w| {
-                let root = Self::window_root_surface(w);
-                let is_fullscreen = root
-                    .as_ref()
-                    .map(|root| self.is_root_fullscreen(root))
-                    .unwrap_or(false);
-                let is_floating = root
-                    .as_ref()
-                    .map(|root| self.is_root_floating(root))
-                    .unwrap_or(false);
-                !is_fullscreen && !is_floating
-            })
-            .cloned()
-            .collect();
-        let tile_count = tiled_windows.len();
-        if tile_count == 0 {
+        let tiled_windows = self.tiled_windows_in_workspace(self.active_workspace);
+        if tiled_windows.is_empty() {
             self.remap_floating_windows();
             return;
         }
+        let tiled_roots: Vec<WlSurface> = tiled_windows
+            .iter()
+            .filter_map(Self::window_root_surface)
+            .collect();
 
-        let keyed_geos = self
-            .layout_manager
-            .geometries(self.active_workspace, &usable, tile_count);
-        let positional_geos = self
-            .layout_manager
-            .positional_layout()
-            .map(|layout| layout.apply(&usable, tile_count));
+        let keyed_geos =
+            self.layout_manager
+                .geometries(self.active_workspace, &usable, &tiled_roots);
 
-        for (index, window) in tiled_windows.iter().enumerate() {
-            let geo = Self::window_root_surface(window)
-                .and_then(|root| keyed_geos.get(&root).copied())
-                .or_else(|| {
-                    positional_geos
-                        .as_ref()
-                        .and_then(|geos| geos.get(index).copied())
-                });
+        for window in &tiled_windows {
+            let geo =
+                Self::window_root_surface(window).and_then(|root| keyed_geos.get(&root).copied());
             let Some(geo) = geo else {
                 continue;
             };
@@ -386,6 +372,9 @@ impl Beewm {
                     state.size = Some(size);
                 });
                 toplevel.send_pending_configure();
+            } else if let Some(x11_surface) = window.x11_surface() {
+                let location = Point::from((x, y));
+                let _ = x11_surface.configure(smithay::utils::Rectangle::new(location, size));
             }
 
             let location = Point::from((x, y));
