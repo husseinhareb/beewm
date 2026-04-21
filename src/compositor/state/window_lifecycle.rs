@@ -28,7 +28,10 @@ impl Beewm {
         ))
     }
 
-    pub(crate) fn configured_tiled_size(&self, geo: Geometry) -> Size<i32, smithay::utils::Logical> {
+    pub(crate) fn configured_tiled_size(
+        &self,
+        geo: Geometry,
+    ) -> Size<i32, smithay::utils::Logical> {
         let gap = self.config.gap as i32;
         let bw = self.config.border_width as i32;
         let w = (geo.width as i32 - gap * 2 - bw * 2).max(1);

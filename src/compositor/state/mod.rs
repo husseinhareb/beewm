@@ -54,8 +54,8 @@ pub use self::decorations::{
     expand_by_border, root_is_swap_highlighted, visible_border_rectangles,
     window_border_overlaps_layer,
 };
-pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
 pub use self::popup::{constrain_popup_geometry, is_fixed_size, popup_constraint_target};
+pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
 const WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspaces";
@@ -338,9 +338,7 @@ fn build_layout_manager(
     num_workspaces: usize,
 ) -> Box<dyn LayoutManager<WlSurface>> {
     match config.layout {
-        LayoutKind::Dwindle => {
-            Box::new(DwindleManager::new(num_workspaces, config.split_ratio))
-        }
+        LayoutKind::Dwindle => Box::new(DwindleManager::new(num_workspaces, config.split_ratio)),
         LayoutKind::MasterStack => Box::new(MasterStackManager::new(config.split_ratio)),
     }
 }

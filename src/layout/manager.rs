@@ -4,9 +4,9 @@ use std::hash::Hash;
 
 use crate::model::window::Geometry;
 
+use super::Layout;
 use super::dwindle_tree::DwindleTree;
 use super::master_stack::MasterStack;
-use super::Layout;
 
 /// A per-workspace layout manager that owns both the placement algorithm and
 /// any persistent structure (e.g. the dwindle split tree).

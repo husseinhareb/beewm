@@ -9,8 +9,8 @@ use crate::compositor::types::{
     ResizeVerticalEdge, TiledSwapGrab,
 };
 
-use super::pointer::surface_under;
 use super::MIN_FLOATING_WINDOW_SIZE;
+use super::pointer::surface_under;
 
 pub(super) fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>) -> bool {
     match state.active_grab.clone() {

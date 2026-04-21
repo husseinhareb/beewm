@@ -29,11 +29,14 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent};
+use smithay::wayland::compositor::{
+    CompositorClientState, CompositorHandler, CompositorState, get_parent, send_surface_state,
+    with_states,
+};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
+use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::fractional_scale::FractionalScaleHandler;
 use smithay::wayland::selection::data_device::{set_data_device_focus,
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
@@ -55,6 +58,30 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::state::{Beewm, ClientState};
 use super::state::popup::should_map_toplevel_floating;
+
+impl Beewm {
+    fn prime_surface_scale_state(&self, surface: &WlSurface) {
+        let Some(output) = self.space.outputs().next().cloned() else {
+            return;
+        };
+
+        let scale = output.current_scale();
+        let transform = output.current_transform();
+
+        with_states(surface, |states| {
+            // kitty's Wayland startup path is sensitive to the first configure
+            // arriving before it sees an explicit scale=1 hint.
+            if surface.version() >= 6 && scale.integer_scale() == 1 {
+                surface.preferred_buffer_scale(1);
+            }
+
+            send_surface_state(surface, states, scale.integer_scale(), transform);
+            with_fractional_scale(states, |fractional_scale| {
+                fractional_scale.set_preferred_scale(scale.fractional_scale());
+            });
+        });
+    }
+}
 
 impl CompositorHandler for Beewm {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -197,6 +224,8 @@ impl XdgShellHandler for Beewm {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        self.prime_surface_scale_state(surface.wl_surface());
+
         // Send an initial tiled size up front so terminals can render their
         // first real frame at the target geometry instead of painting a blank
         // placeholder and immediately resizing on first commit.
@@ -279,7 +308,9 @@ impl XdgShellHandler for Beewm {
                         let focus = self.workspaces[self.active_workspace]
                             .focused_idx
                             .and_then(|focus_idx| {
-                                self.workspaces[self.active_workspace].windows.get(focus_idx)
+                                self.workspaces[self.active_workspace]
+                                    .windows
+                                    .get(focus_idx)
                             })
                             .and_then(|window| window.toplevel())
                             .map(|toplevel| toplevel.wl_surface().clone());
@@ -511,7 +542,11 @@ delegate_fractional_scale!(Beewm);
 delegate_single_pixel_buffer!(Beewm);
 delegate_drm_syncobj!(Beewm);
 
-impl FractionalScaleHandler for Beewm {}
+impl FractionalScaleHandler for Beewm {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        self.prime_surface_scale_state(&surface);
+    }
+}
 
 impl DmabufHandler for Beewm {
     fn dmabuf_state(&mut self) -> &mut DmabufState {

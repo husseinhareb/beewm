@@ -51,7 +51,11 @@ impl Beewm {
         // Focus the active window on the new workspace
         let focus = self.workspaces[self.active_workspace]
             .focused_idx
-            .and_then(|focus_idx| self.workspaces[self.active_workspace].windows.get(focus_idx))
+            .and_then(|focus_idx| {
+                self.workspaces[self.active_workspace]
+                    .windows
+                    .get(focus_idx)
+            })
             .and_then(|window| window.toplevel())
             .map(|toplevel| toplevel.wl_surface().clone());
         if let Some(focus) = focus {
@@ -115,7 +119,11 @@ impl Beewm {
         // Focus next window on current workspace if any
         let focus = self.workspaces[self.active_workspace]
             .focused_idx
-            .and_then(|focus_idx| self.workspaces[self.active_workspace].windows.get(focus_idx))
+            .and_then(|focus_idx| {
+                self.workspaces[self.active_workspace]
+                    .windows
+                    .get(focus_idx)
+            })
             .and_then(|window| window.toplevel())
             .map(|toplevel| toplevel.wl_surface().clone());
         if let Some(focus) = focus {

@@ -1,5 +1,5 @@
 use smithay::desktop::{
-    find_popup_root_surface, layer_map_for_output, PopupKind, Window, WindowSurfaceType,
+    PopupKind, Window, WindowSurfaceType, find_popup_root_surface, layer_map_for_output,
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};

@@ -285,10 +285,7 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
     pointer.frame(state);
 }
 
-pub(super) fn handle_pointer_axis<I: InputBackend>(
-    state: &mut Beewm,
-    event: I::PointerAxisEvent,
-) {
+pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {
     let pointer = state.seat.get_pointer().unwrap();
 
     let source = event.source();
