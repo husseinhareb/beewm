@@ -24,6 +24,28 @@ use super::grab::{
 };
 use super::{BTN_LEFT, BTN_RIGHT, layer_surface_has_keyboard_focus};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftButtonReleaseAction {
+    FinishMove,
+    FinishTiledSwap,
+    ForwardToClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftButtonGrabKind {
+    Move,
+    TiledSwap,
+    Other,
+}
+
+fn left_button_release_action(grab_kind: Option<LeftButtonGrabKind>) -> LeftButtonReleaseAction {
+    match grab_kind {
+        Some(LeftButtonGrabKind::Move) => LeftButtonReleaseAction::FinishMove,
+        Some(LeftButtonGrabKind::TiledSwap) => LeftButtonReleaseAction::FinishTiledSwap,
+        Some(LeftButtonGrabKind::Other) | None => LeftButtonReleaseAction::ForwardToClient,
+    }
+}
+
 pub(in crate::compositor) fn surface_under(
     state: &Beewm,
     pos: Point<f64, Logical>,
@@ -250,12 +272,25 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
     }
 
     if button == BTN_LEFT && btn_state == ButtonState::Released {
-        if let Some(ActiveGrab::Move(_)) = state.active_grab.take() {
-            state.refresh_compositor_cursor();
-            return;
-        }
-        if finish_tiled_swap_grab(state) {
-            return;
+        let grab_kind = match state.active_grab.as_ref() {
+            Some(ActiveGrab::Move(_)) => Some(LeftButtonGrabKind::Move),
+            Some(ActiveGrab::TiledSwap(_)) => Some(LeftButtonGrabKind::TiledSwap),
+            Some(_) => Some(LeftButtonGrabKind::Other),
+            None => None,
+        };
+
+        match left_button_release_action(grab_kind) {
+            LeftButtonReleaseAction::FinishMove => {
+                state.active_grab = None;
+                state.refresh_compositor_cursor();
+                return;
+            }
+            LeftButtonReleaseAction::FinishTiledSwap => {
+                if finish_tiled_swap_grab(state) {
+                    return;
+                }
+            }
+            LeftButtonReleaseAction::ForwardToClient => {}
         }
     }
 
@@ -285,6 +320,35 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
         },
     );
     pointer.frame(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LeftButtonGrabKind, LeftButtonReleaseAction, left_button_release_action};
+
+    #[test]
+    fn left_release_routes_tiled_swap_grabs_to_swap_completion() {
+        assert_eq!(
+            left_button_release_action(Some(LeftButtonGrabKind::TiledSwap)),
+            LeftButtonReleaseAction::FinishTiledSwap
+        );
+    }
+
+    #[test]
+    fn left_release_only_clears_move_grabs_directly() {
+        assert_eq!(
+            left_button_release_action(Some(LeftButtonGrabKind::Move)),
+            LeftButtonReleaseAction::FinishMove
+        );
+        assert_eq!(
+            left_button_release_action(Some(LeftButtonGrabKind::Other)),
+            LeftButtonReleaseAction::ForwardToClient
+        );
+        assert_eq!(
+            left_button_release_action(None),
+            LeftButtonReleaseAction::ForwardToClient
+        );
+    }
 }
 
 pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {

@@ -296,12 +296,26 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut applied_cursor_status_serial = u64::MAX;
 
     while data.state.running {
+        let timeout = if data.state.active_grab.is_some() || data.state.needs_render {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(16)
+        };
+        event_loop.dispatch(Some(timeout), &mut data)?;
+
+        // Process pending surface state (sends wl_surface.enter/leave)
+        // BEFORE flushing so clients receive enter events in the same
+        // batch as configures and frame callbacks.
+        data.state.space.refresh();
+        data.display.flush_clients()?;
+
         if applied_cursor_status_serial != data.state.cursor_status_serial {
             apply_cursor(&winit_backend, &data.state.cursor_status);
             applied_cursor_status_serial = data.state.cursor_status_serial;
         }
 
-        // Only render when something visual has changed.
+        // Only render when something visual has changed. Rendering after
+        // dispatch/flush keeps interactive resizes closer to the latest input.
         if data.state.needs_render {
             let output = data.state.space.outputs().next().cloned();
             if let Some(ref output) = output {
@@ -398,16 +412,6 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-
-        // Dispatch event loop
-        let timeout = Duration::from_millis(16);
-        event_loop.dispatch(Some(timeout), &mut data)?;
-
-        // Process pending surface state (sends wl_surface.enter/leave)
-        // BEFORE flushing so clients receive enter events in the same
-        // batch as configures and frame callbacks.
-        data.state.space.refresh();
-        data.display.flush_clients()?;
     }
 
     Ok(())

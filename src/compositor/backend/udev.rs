@@ -315,12 +315,12 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting udev event loop");
 
     while data.state.running {
-        // Only render when the previous frame has been presented (VBlank fired)
-        // AND something visual has actually changed.
-        if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.state.needs_render {
-            render_frame(&mut data);
-        }
-        event_loop.dispatch(Some(Duration::from_millis(20)), &mut data)?;
+        let timeout = if data.state.active_grab.is_some() || data.state.needs_render {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(20)
+        };
+        event_loop.dispatch(Some(timeout), &mut data)?;
         // Process pending surface state (sends wl_surface.enter/leave)
         // BEFORE flushing so clients receive enter events in the same
         // batch as configures and frame callbacks.
@@ -330,6 +330,12 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // receive compositor-initiated events such as xdg_toplevel.configure.
         if let Err(err) = data.display.flush_clients() {
             tracing::warn!("Failed to flush Wayland clients: {}", err);
+        }
+        // Only render when the previous frame has been presented (VBlank fired)
+        // AND something visual has actually changed. Rendering after dispatch
+        // keeps live resizes closer to the latest pointer and commit state.
+        if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.state.needs_render {
+            render_frame(&mut data);
         }
     }
 

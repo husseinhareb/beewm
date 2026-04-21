@@ -378,9 +378,11 @@ impl Beewm {
             }
 
             let location = Point::from((x, y));
-            if self.space.element_location(window) != Some(location) {
-                self.space.map_element(window.clone(), location, false);
-            }
+            // Re-map even when the location is unchanged so Smithay refreshes
+            // the element placement against the window's current bbox. During
+            // interactive tiled resizes, size-only changes otherwise lag a frame
+            // behind and exposed regions can briefly show through.
+            self.space.map_element(window.clone(), location, false);
         }
         self.needs_render = true;
         self.remap_floating_windows();

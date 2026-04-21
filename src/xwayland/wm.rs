@@ -1,7 +1,7 @@
 use smithay::delegate_xwayland_shell;
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Rectangle};
+use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowType, XwmId};
@@ -17,19 +17,32 @@ impl Beewm {
 
         match kind {
             PendingX11Kind::OverrideRedirect => {
+                tracing::debug!(
+                    title = %surface.title(),
+                    class = %surface.class(),
+                    instance = %surface.instance(),
+                    geometry = ?surface.geometry(),
+                    "mapping override-redirect X11 window",
+                );
                 self.track_window(&window);
                 self.space.map_element(window, surface.geometry().loc, true);
                 self.needs_render = true;
             }
             PendingX11Kind::Managed => {
-                if let Err(error) = surface.set_mapped(true) {
-                    tracing::warn!("Failed to map X11 window: {}", error);
-                    return;
-                }
-
                 let workspace_idx = self.active_workspace;
                 let should_float = should_map_x11_floating(&surface);
                 let split_target = self.focused_tiled_window_root(workspace_idx);
+
+                tracing::debug!(
+                    title = %surface.title(),
+                    class = %surface.class(),
+                    instance = %surface.instance(),
+                    geometry = ?surface.geometry(),
+                    should_float,
+                    window_type = ?surface.window_type(),
+                    transient_for = ?surface.is_transient_for(),
+                    "finalizing managed X11 window mapping",
+                );
 
                 self.workspaces[workspace_idx].add_window(window.clone());
                 self.publish_workspace_state();
@@ -48,10 +61,32 @@ impl Beewm {
 
                 self.space.raise_element(&window, true);
 
-                if let Some(geometry) = self.space.element_geometry(&window) {
+                let geometry = self
+                    .space
+                    .element_geometry(&window)
+                    .filter(|geometry| geometry.size.w > 0 && geometry.size.h > 0)
+                    .or_else(|| {
+                        Self::window_root_surface(&window).and_then(|root| {
+                            self.floating_windows.get(&root).map(|floating| {
+                                Rectangle::new(
+                                    Point::from((floating.position.x, floating.position.y)),
+                                    floating.size,
+                                )
+                            })
+                        })
+                    });
+
+                if let Some(geometry) = geometry {
                     if let Err(error) = surface.configure(geometry) {
                         tracing::warn!("Failed to configure mapped X11 window: {}", error);
                     }
+                } else {
+                    tracing::debug!(
+                        title = %surface.title(),
+                        class = %surface.class(),
+                        instance = %surface.instance(),
+                        "managed X11 window has no non-zero target geometry yet",
+                    );
                 }
 
                 self.needs_render = true;
@@ -199,6 +234,13 @@ impl XWaylandShellHandler for Beewm {
     }
 
     fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, surface: X11Surface) {
+        tracing::debug!(
+            title = %surface.title(),
+            class = %surface.class(),
+            instance = %surface.instance(),
+            geometry = ?surface.geometry(),
+            "associated X11 window with wl_surface",
+        );
         if let Some(pending) = self.take_pending_x11_window(&surface) {
             self.map_x11_window(surface, pending.kind);
         }
@@ -210,11 +252,49 @@ impl XwmHandler for Beewm {
         self.xwm.as_mut().expect("XWayland WM should exist")
     }
 
-    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        tracing::debug!(
+            title = %window.title(),
+            class = %window.class(),
+            instance = %window.instance(),
+            geometry = ?window.geometry(),
+            window_type = ?window.window_type(),
+            transient_for = ?window.is_transient_for(),
+            "new managed X11 window",
+        );
+    }
 
-    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        tracing::debug!(
+            title = %window.title(),
+            class = %window.class(),
+            instance = %window.instance(),
+            geometry = ?window.geometry(),
+            "new override-redirect X11 window",
+        );
+    }
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        tracing::debug!(
+            title = %window.title(),
+            class = %window.class(),
+            instance = %window.instance(),
+            geometry = ?window.geometry(),
+            has_wl_surface = window.wl_surface().is_some(),
+            window_type = ?window.window_type(),
+            transient_for = ?window.is_transient_for(),
+            "map request for managed X11 window",
+        );
+
+        // Some XWayland clients only produce/associate their wl_surface after
+        // the X11 map has been granted. Map the X11 side immediately, then
+        // integrate the window into the compositor scene graph once the
+        // wl_surface association arrives.
+        if let Err(error) = window.set_mapped(true) {
+            tracing::warn!("Failed to map X11 window: {}", error);
+            return;
+        }
+
         if window.wl_surface().is_some() {
             self.map_x11_window(window, PendingX11Kind::Managed);
         } else {
@@ -223,6 +303,14 @@ impl XwmHandler for Beewm {
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        tracing::debug!(
+            title = %window.title(),
+            class = %window.class(),
+            instance = %window.instance(),
+            geometry = ?window.geometry(),
+            has_wl_surface = window.wl_surface().is_some(),
+            "mapped override-redirect X11 window notification",
+        );
         if window.wl_surface().is_some() {
             self.map_x11_window(window, PendingX11Kind::OverrideRedirect);
         } else {
