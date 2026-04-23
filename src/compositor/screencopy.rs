@@ -299,7 +299,7 @@ fn process_screencopy_frame<R>(
             &elements,
             &[render_area],
         )?;
-        frame.finish()?;
+        let _ = frame.finish()?;
 
         let read_region = readback_region(&pending.geometry);
         let mapping = renderer.copy_framebuffer(&framebuffer, read_region, Fourcc::Argb8888)?;
