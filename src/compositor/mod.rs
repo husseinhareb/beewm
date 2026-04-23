@@ -7,6 +7,7 @@ mod input;
 mod ipc;
 mod layering;
 mod render;
+mod screencopy;
 pub(crate) mod state;
 pub mod types;
 

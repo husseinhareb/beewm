@@ -35,6 +35,12 @@ pub struct TiledSwapGrab {
     pub window: Window,
     /// Workspace that owns the dragged tiled window.
     pub workspace_idx: usize,
+    /// Pointer position when the drag started.
+    pub start_pointer: Point<f64, Logical>,
+    /// Window position when the drag started.
+    pub start_window_pos: Point<i32, Logical>,
+    /// Window size when the drag started.
+    pub start_window_size: Size<i32, Logical>,
 }
 
 /// State for an in-progress tiled-window resize (Super + RMB drag).
@@ -118,7 +124,8 @@ impl FloatingWindowData {
 pub enum ActiveGrab {
     /// Floating window move (Super + LMB drag).
     Move(MoveGrab),
-    /// Tiled window swap (Super + LMB drag on tiled window).
+    /// Detached tiled-window drag (Super + LMB on tiled window).
+    /// The window follows the pointer like a floating move and swaps on drop.
     TiledSwap(TiledSwapGrab),
     /// Floating window resize (Super + RMB drag).
     Resize(ResizeGrab),

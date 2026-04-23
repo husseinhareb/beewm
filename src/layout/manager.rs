@@ -14,7 +14,9 @@ use super::master_stack::MasterStack;
 ///
 /// This unifies the two code paths that previously diverged on `LayoutKind`:
 /// callers interact with one interface regardless of the active layout.
-pub trait LayoutManager<Id: Clone + Eq + Hash>: Debug {
+pub trait LayoutManager<Id: Clone + Eq + Hash + 'static>: Debug {
+    fn clone_box(&self) -> Box<dyn LayoutManager<Id>>;
+
     /// Notify the manager that a new window was mapped.
     /// `split_target` is the surface that should be split to make room (may be `None`).
     fn insert(&mut self, workspace: usize, split_target: Option<&Id>, id: Id);
@@ -65,9 +67,15 @@ pub trait LayoutManager<Id: Clone + Eq + Hash>: Debug {
     }
 }
 
+impl<Id: Clone + Eq + Hash + 'static> Clone for Box<dyn LayoutManager<Id>> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
 // ── Dwindle ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DwindleManager<Id: Clone + Eq + Hash> {
     trees: Vec<DwindleTree<Id>>,
 }
@@ -82,7 +90,11 @@ impl<Id: Clone + Eq + Hash> DwindleManager<Id> {
     }
 }
 
-impl<Id: Clone + Eq + Hash + Debug> LayoutManager<Id> for DwindleManager<Id> {
+impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManager<Id> {
+    fn clone_box(&self) -> Box<dyn LayoutManager<Id>> {
+        Box::new(self.clone())
+    }
+
     fn insert(&mut self, workspace: usize, split_target: Option<&Id>, id: Id) {
         self.trees[workspace].insert(split_target, id);
     }
@@ -164,14 +176,14 @@ impl<Id: Clone + Eq + Hash + Debug> LayoutManager<Id> for DwindleManager<Id> {
 
 // ── MasterStack ──────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MasterStackWorkspace<Id> {
     order: Vec<Id>,
     master_ratio: f64,
     stack_weights: Vec<f64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MasterStackManager<Id: Clone + Eq + Hash> {
     workspaces: Vec<MasterStackWorkspace<Id>>,
 }
@@ -190,7 +202,11 @@ impl<Id: Clone + Eq + Hash> MasterStackManager<Id> {
     }
 }
 
-impl<Id: Clone + Eq + Hash + Debug> LayoutManager<Id> for MasterStackManager<Id> {
+impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackManager<Id> {
+    fn clone_box(&self) -> Box<dyn LayoutManager<Id>> {
+        Box::new(self.clone())
+    }
+
     fn insert(&mut self, workspace: usize, _split_target: Option<&Id>, id: Id) {
         let state = &mut self.workspaces[workspace];
         state.order.push(id);

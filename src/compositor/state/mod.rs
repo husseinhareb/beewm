@@ -19,7 +19,7 @@ use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::xkb;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
-use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::backend::{ClientData, GlobalId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Clock, Logical, Monotonic, Point};
@@ -50,6 +50,7 @@ use crate::model::workspace::Workspace;
 use crate::xwayland::PendingX11Window;
 
 use super::commands::ChildEnvironment;
+use super::screencopy::{PendingScreencopyFrame, create_screencopy_global};
 
 use super::cursor::CursorThemeManager;
 
@@ -88,6 +89,7 @@ pub struct Beewm {
     pub _single_pixel_buffer_state: SinglePixelBufferState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub _screencopy_global: GlobalId,
     pub dmabuf_state: DmabufState,
     pub _dmabuf_global: Option<DmabufGlobal>,
     pub drm_syncobj_state: Option<DrmSyncobjState>,
@@ -112,6 +114,8 @@ pub struct Beewm {
     // Desktop management
     pub space: Space<Window>,
     pub layout_manager: Box<dyn LayoutManager<WlSurface>>,
+    /// Layout state saved while a tiled window is temporarily detached for a drag.
+    pub tiled_swap_layout_snapshot: Option<Box<dyn LayoutManager<WlSurface>>>,
     pub workspaces: Vec<Workspace<Window>>,
     pub active_workspace: usize,
     /// Windows that have been created but not yet committed their first buffer.
@@ -149,6 +153,8 @@ pub struct Beewm {
     pub border_color_unfocused: Color32F,
     /// Installs acquire-fence event sources into the active backend loop.
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
+    /// Outstanding zwlr_screencopy_frame_v1 objects waiting for a buffer copy.
+    pub pending_screencopy_frames: Vec<PendingScreencopyFrame>,
     /// Compositor-specific environment for spawned child processes.
     pub(crate) child_env: ChildEnvironment,
     /// Startup commands are delayed until both an output exists and XWayland startup has settled.
@@ -175,6 +181,7 @@ impl Beewm {
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        let screencopy_global = create_screencopy_global::<Self>(&display_handle);
         let dmabuf_state = DmabufState::new();
         let presentation_clock = Clock::<Monotonic>::new();
         let presentation_state =
@@ -211,6 +218,7 @@ impl Beewm {
             _single_pixel_buffer_state: single_pixel_buffer_state,
             data_device_state,
             primary_selection_state,
+            _screencopy_global: screencopy_global,
             dmabuf_state,
             _dmabuf_global: None,
             drm_syncobj_state: None,
@@ -227,6 +235,7 @@ impl Beewm {
             session: None,
             space: Space::default(),
             layout_manager,
+            tiled_swap_layout_snapshot: None,
             workspaces: (0..num_ws).map(|_| Workspace::new()).collect(),
             active_workspace: 0,
             pending_windows: Vec::new(),
@@ -245,6 +254,7 @@ impl Beewm {
             border_color_focused,
             border_color_unfocused,
             syncobj_blocker_installer: None,
+            pending_screencopy_frames: Vec::new(),
             child_env: ChildEnvironment::default(),
             startup_commands_spawned: false,
             outputs_ready_for_startup: false,

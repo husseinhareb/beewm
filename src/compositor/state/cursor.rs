@@ -1,5 +1,6 @@
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+use smithay::backend::renderer::{ImportMem, Renderer};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::utils::{Physical, Point};
@@ -39,11 +40,16 @@ impl Beewm {
         }
     }
 
-    /// Build a themed software cursor element for the DRM backend.
-    pub fn cursor_elements(
+    /// Build a themed software cursor element for a renderer that can import
+    /// shared-memory cursor sprites.
+    pub fn cursor_elements_for_renderer<R>(
         &mut self,
-        renderer: &mut GlesRenderer,
-    ) -> Vec<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        renderer: &mut R,
+    ) -> Vec<MemoryRenderBufferRenderElement<R>>
+    where
+        R: Renderer + ImportMem,
+        R::TextureId: Send + Clone + 'static,
+    {
         let Some(icon) = self.effective_cursor_icon() else {
             return Vec::new();
         };
@@ -69,6 +75,14 @@ impl Beewm {
                 Vec::new()
             }
         }
+    }
+
+    /// Build a themed software cursor element for the DRM backend.
+    pub fn cursor_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Vec<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        self.cursor_elements_for_renderer(renderer)
     }
 }
 

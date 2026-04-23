@@ -42,6 +42,7 @@ use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered
 use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, window_render_elements,
 };
+use crate::compositor::screencopy::process_pending_screencopies;
 use crate::compositor::state::{Beewm, ClientState, lookup_client_compositor_state};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
 
@@ -373,6 +374,8 @@ fn render_frame(data: &mut UdevData) {
         layers_rendered_above_windows(fullscreen_active),
         1.0,
     );
+
+    process_pending_screencopies(&mut data.state, &mut gpu.renderer, &output);
 
     // Build final element list front-to-back (first = topmost).
     let mut elements: Vec<OutputRenderElement> = Vec::new();

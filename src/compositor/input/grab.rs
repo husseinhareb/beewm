@@ -1,7 +1,7 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Size};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
 
 use crate::compositor::state::Beewm;
@@ -27,8 +27,8 @@ pub(super) fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>
             apply_tiled_resize_grab(state, &grab, pointer);
             true
         }
-        Some(ActiveGrab::TiledSwap(_)) => {
-            update_tiled_swap_target(state);
+        Some(ActiveGrab::TiledSwap(grab)) => {
+            apply_tiled_swap_grab(state, &grab, pointer);
             true
         }
         None => false,
@@ -36,16 +36,41 @@ pub(super) fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>
 }
 
 fn apply_move_grab(state: &mut Beewm, grab: &MoveGrab, pointer: Point<f64, Logical>) {
-    let dx = (pointer.x - grab.start_pointer.x) as i32;
-    let dy = (pointer.y - grab.start_pointer.y) as i32;
-    let new_window_pos = Point::from((grab.start_window_pos.x + dx, grab.start_window_pos.y + dy));
+    apply_window_move_from_start(
+        state,
+        &grab.window,
+        grab.start_pointer,
+        grab.start_window_pos,
+        pointer,
+    );
+}
+
+fn apply_tiled_swap_grab(state: &mut Beewm, grab: &TiledSwapGrab, pointer: Point<f64, Logical>) {
+    apply_window_move_from_start(
+        state,
+        &grab.window,
+        grab.start_pointer,
+        grab.start_window_pos,
+        pointer,
+    );
+    update_tiled_swap_target(state);
+}
+
+fn apply_window_move_from_start(
+    state: &mut Beewm,
+    window: &Window,
+    start_pointer: Point<f64, Logical>,
+    start_window_pos: Point<i32, Logical>,
+    pointer: Point<f64, Logical>,
+) {
+    let new_window_pos = dragged_window_location(start_window_pos, start_pointer, pointer);
     state
         .space
-        .map_element(grab.window.clone(), new_window_pos, true);
-    if let Some(root) = Beewm::window_root_surface(&grab.window) {
+        .map_element(window.clone(), new_window_pos, true);
+    if let Some(root) = Beewm::window_root_surface(window) {
         let size = state
             .space
-            .element_geometry(&grab.window)
+            .element_geometry(window)
             .map(|geo| geo.size)
             .or_else(|| {
                 state
@@ -162,14 +187,33 @@ pub(super) fn try_start_tiled_swap_grab(state: &mut Beewm) -> bool {
     let Some(window) = tiled_window_under_pointer_with_logo(state) else {
         return false;
     };
+    let Some(window_geo) = state.space.element_geometry(&window) else {
+        return false;
+    };
+    let Some(root) = Beewm::window_root_surface(&window) else {
+        return false;
+    };
+
+    let layout_snapshot = state.layout_manager.clone();
 
     focus_and_raise_window(state, &window);
+    state.floating_windows.insert(
+        root.clone(),
+        FloatingWindowData::new(window_geo.loc, window_geo.size),
+    );
+    state.remove_tiled_window(state.active_workspace, &root);
+    state.tiled_swap_layout_snapshot = Some(layout_snapshot);
     state.active_grab = Some(ActiveGrab::TiledSwap(TiledSwapGrab {
-        window,
+        window: window.clone(),
         workspace_idx: state.active_workspace,
+        start_pointer: state.pointer_location,
+        start_window_pos: window_geo.loc,
+        start_window_size: window_geo.size,
     }));
     state.tiled_swap_target = None;
     state.invalidate_borders();
+    state.relayout();
+    state.space.raise_element(&window, true);
     state.refresh_compositor_cursor();
     true
 }
@@ -251,16 +295,31 @@ pub(super) fn finish_tiled_swap_grab(state: &mut Beewm) -> bool {
         }
     };
 
+    if let Some(layout_snapshot) = state.tiled_swap_layout_snapshot.take() {
+        state.layout_manager = layout_snapshot;
+    }
+
     let Some(source_root) = Beewm::window_root_surface(&grab.window) else {
         state.tiled_swap_target = None;
         state.invalidate_borders();
+        state.relayout();
         state.refresh_compositor_cursor();
         return true;
     };
 
+    state.floating_windows.remove(&source_root);
     let target_root = state.tiled_swap_target.take();
-    if let Some(target_root) = target_root {
-        state.swap_tiled_windows(grab.workspace_idx, &source_root, &target_root);
+    let dropped_in_original_slot = pointer_in_original_tiled_slot(&grab, state.pointer_location);
+    let swapped = (!dropped_in_original_slot)
+        .then(|| {
+            target_root.as_ref().map(|target_root| {
+                state.swap_tiled_windows(grab.workspace_idx, &source_root, target_root)
+            })
+        })
+        .flatten()
+        .unwrap_or(false);
+    if !swapped {
+        state.relayout();
     }
 
     state.invalidate_borders();
@@ -281,21 +340,36 @@ fn candidate_tiled_swap_target(state: &Beewm) -> Option<WlSurface> {
         Some(ActiveGrab::TiledSwap(grab)) => grab,
         _ => return None,
     };
-    let source_root = Beewm::window_root_surface(&grab.window)?;
-    let (surface, _) = surface_under(state, state.pointer_location)?;
-    let window = state.mapped_window_for_surface(&surface)?;
-    let target_root = Beewm::window_root_surface(&window)?;
-    if target_root == source_root
-        || state.is_root_floating(&target_root)
-        || state.is_root_fullscreen(&target_root)
-        || state
-            .window_index_for_surface(grab.workspace_idx, &target_root)
-            .is_none()
-    {
-        None
-    } else {
-        Some(target_root)
+    if original_tiled_slot_contains_pointer(
+        grab.start_window_pos,
+        grab.start_window_size,
+        state.pointer_location,
+    ) {
+        return None;
     }
+    let source_root = Beewm::window_root_surface(&grab.window)?;
+    tiled_swap_target_from_geometries(
+        state.pointer_location,
+        &source_root,
+        state.workspaces[grab.workspace_idx]
+            .windows
+            .iter()
+            .filter_map(|window| {
+                let root = Beewm::window_root_surface(window)?;
+                if state.is_root_floating(&root)
+                    || state.is_root_fullscreen(&root)
+                    || state
+                        .window_index_for_surface(grab.workspace_idx, &root)
+                        .is_none()
+                {
+                    return None;
+                }
+                state
+                    .space
+                    .element_geometry(window)
+                    .map(|geometry| (root, geometry))
+            }),
+    )
 }
 
 pub(super) fn finish_resize_grab(state: &mut Beewm) -> bool {
@@ -472,4 +546,122 @@ pub fn resized_window_geometry_from_start(
         Point::from((new_x, new_y)),
         Size::from((new_width, new_height)),
     )
+}
+
+fn dragged_window_location(
+    start_window_pos: Point<i32, Logical>,
+    start_pointer: Point<f64, Logical>,
+    pointer: Point<f64, Logical>,
+) -> Point<i32, Logical> {
+    let dx = (pointer.x - start_pointer.x) as i32;
+    let dy = (pointer.y - start_pointer.y) as i32;
+    Point::from((start_window_pos.x + dx, start_window_pos.y + dy))
+}
+
+fn tiled_swap_target_from_geometries<T: PartialEq>(
+    pointer: Point<f64, Logical>,
+    source_root: &T,
+    candidates: impl IntoIterator<Item = (T, Rectangle<i32, Logical>)>,
+) -> Option<T> {
+    candidates.into_iter().find_map(|(root, geometry)| {
+        (root != *source_root && window_geometry_contains_pointer(geometry, pointer))
+            .then_some(root)
+    })
+}
+
+fn pointer_in_original_tiled_slot(grab: &TiledSwapGrab, pointer: Point<f64, Logical>) -> bool {
+    original_tiled_slot_contains_pointer(grab.start_window_pos, grab.start_window_size, pointer)
+}
+
+fn original_tiled_slot_contains_pointer(
+    start_window_pos: Point<i32, Logical>,
+    start_window_size: Size<i32, Logical>,
+    pointer: Point<f64, Logical>,
+) -> bool {
+    window_geometry_contains_pointer(Rectangle::new(start_window_pos, start_window_size), pointer)
+}
+
+fn window_geometry_contains_pointer(
+    geometry: Rectangle<i32, Logical>,
+    pointer: Point<f64, Logical>,
+) -> bool {
+    pointer.x >= geometry.loc.x as f64
+        && pointer.x < (geometry.loc.x + geometry.size.w) as f64
+        && pointer.y >= geometry.loc.y as f64
+        && pointer.y < (geometry.loc.y + geometry.size.h) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::{Logical, Point, Rectangle, Size};
+
+    use super::{
+        dragged_window_location, original_tiled_slot_contains_pointer,
+        tiled_swap_target_from_geometries,
+    };
+
+    #[test]
+    fn dragged_window_location_preserves_the_initial_pointer_offset() {
+        let location = dragged_window_location(
+            Point::<i32, Logical>::from((100, 200)),
+            Point::<f64, Logical>::from((140.0, 260.0)),
+            Point::<f64, Logical>::from((220.0, 320.0)),
+        );
+
+        assert_eq!(location, Point::from((180, 260)));
+    }
+
+    #[test]
+    fn tiled_swap_target_ignores_the_dragged_root() {
+        let target = tiled_swap_target_from_geometries(
+            Point::<f64, Logical>::from((40.0, 40.0)),
+            &1u8,
+            [
+                (
+                    1u8,
+                    Rectangle::new((0, 0).into(), Size::<i32, Logical>::from((100, 100))),
+                ),
+                (
+                    2u8,
+                    Rectangle::new((120, 0).into(), Size::<i32, Logical>::from((100, 100))),
+                ),
+            ],
+        );
+
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn tiled_swap_target_finds_the_window_under_the_pointer() {
+        let target = tiled_swap_target_from_geometries(
+            Point::<f64, Logical>::from((150.0, 40.0)),
+            &1u8,
+            [
+                (
+                    1u8,
+                    Rectangle::new((0, 0).into(), Size::<i32, Logical>::from((100, 100))),
+                ),
+                (
+                    2u8,
+                    Rectangle::new((120, 0).into(), Size::<i32, Logical>::from((100, 100))),
+                ),
+            ],
+        );
+
+        assert_eq!(target, Some(2));
+    }
+
+    #[test]
+    fn original_tiled_slot_contains_the_release_pointer() {
+        assert!(original_tiled_slot_contains_pointer(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 150)),
+            Point::<f64, Logical>::from((250.0, 275.0)),
+        ));
+        assert!(!original_tiled_slot_contains_pointer(
+            Point::<i32, Logical>::from((100, 200)),
+            Size::<i32, Logical>::from((300, 150)),
+            Point::<f64, Logical>::from((410.0, 275.0)),
+        ));
+    }
 }

@@ -29,6 +29,7 @@ use crate::compositor::feedback::{
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
 use crate::compositor::render::{layer_render_elements, window_render_elements};
+use crate::compositor::screencopy::process_pending_screencopies;
 use crate::compositor::state::{Beewm, ClientState};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
 
@@ -345,6 +346,8 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         elements.extend(border_elements.into_iter().map(WinitRenderElement::from));
                         elements.extend(window_elements.into_iter().map(WinitRenderElement::from));
                         elements.extend(layers_below.into_iter().map(WinitRenderElement::from));
+
+                        process_pending_screencopies(&mut data.state, renderer, output);
 
                         Some(damage_tracker.render_output(
                             renderer,
