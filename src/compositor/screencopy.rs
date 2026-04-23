@@ -40,7 +40,6 @@ render_elements! {
 pub(crate) struct ScreencopyGeometry {
     pub render_size: Size<i32, Physical>,
     pub output_scale: f64,
-    pub output_transform: Transform,
     pub logical_output_size: Size<i32, Logical>,
     pub buffer_size: Size<i32, Buffer>,
     pub logical_region: Rectangle<i32, Logical>,
@@ -287,11 +286,10 @@ fn process_screencopy_frame<R>(
         let mut frame = renderer.render(
             &mut framebuffer,
             pending.geometry.render_size,
-            pending.geometry.output_transform.invert(),
+            Transform::Normal,
         )?;
 
-        let render_area =
-            Rectangle::from_size(pending.geometry.output_transform.transform_size(pending.geometry.render_size));
+        let render_area = Rectangle::from_size(pending.geometry.render_size);
         frame.clear(Color32F::from([0.1, 0.1, 0.1, 1.0]), &[render_area])?;
         let _ = draw_render_elements::<R, _, ScreencopyRenderElement<R>>(
             &mut frame,
@@ -405,7 +403,7 @@ fn capture_geometry(
     let logical_output_size = transformed_render_size
         .to_f64()
         .to_logical(output_scale)
-        .to_i32_round();
+        .to_i32_ceil();
     let logical_output_rect = Rectangle::from_size(logical_output_size);
     let logical_region = requested_region.unwrap_or(logical_output_rect);
     let logical_region = logical_region.intersection(logical_output_rect)?;
@@ -413,22 +411,34 @@ fn capture_geometry(
         return None;
     }
 
-    let buffer_size = logical_output_size
+    let buffer_size_physical = logical_output_size
         .to_f64()
-        .to_buffer(output_scale, output_transform)
+        .to_physical(output_scale)
         .to_i32_round();
-    let buffer_region = logical_region
+    let buffer_size = Size::from((buffer_size_physical.w, buffer_size_physical.h));
+    let buffer_region_physical = logical_region
         .to_f64()
-        .to_buffer(output_scale, output_transform, &logical_output_size.to_f64())
+        .to_physical(output_scale)
         .to_i32_round();
+    let buffer_region = Rectangle::new(
+        (
+            buffer_region_physical.loc.x,
+            buffer_region_physical.loc.y,
+        )
+            .into(),
+        (
+            buffer_region_physical.size.w,
+            buffer_region_physical.size.h,
+        )
+            .into(),
+    );
     if buffer_region.size.w <= 0 || buffer_region.size.h <= 0 {
         return None;
     }
 
     Some(ScreencopyGeometry {
-        render_size,
+        render_size: transformed_render_size,
         output_scale,
-        output_transform,
         logical_output_size,
         buffer_size,
         logical_region,
@@ -556,6 +566,6 @@ mod tests {
 
         assert_eq!(geometry.logical_output_size, Size::from((1080, 1920)));
         assert_eq!(geometry.buffer_size, Size::from((1080, 1920)));
-        assert_eq!(geometry.buffer_region.size, Size::from((100, 200)));
+        assert_eq!(geometry.buffer_region.size, Size::from((200, 100)));
     }
 }
