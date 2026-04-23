@@ -40,16 +40,20 @@ pub(crate) fn should_map_toplevel_floating(window: &Window) -> bool {
         return false;
     };
 
-    if toplevel.parent().is_some() {
-        return true;
-    }
-
     smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+        let is_dialog = states
+            .data_map
+            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+            .map(|role| {
+                let role = role.lock().unwrap();
+                role.parent.is_some() || role.modal
+            })
+            .unwrap_or(false);
         let mut cached = states
             .cached_state
             .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
         let current = *cached.current();
-        is_fixed_size(current.min_size) && current.min_size == current.max_size
+        is_dialog || (is_fixed_size(current.min_size) && current.min_size == current.max_size)
     })
 }
 

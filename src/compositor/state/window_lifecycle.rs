@@ -3,12 +3,52 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Point, Size};
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::model::window::Geometry;
 
+use super::popup::should_map_toplevel_floating;
 use super::{Beewm, FloatingWindowData, root_surface};
 
 impl Beewm {
+    fn centered_floating_data(&self, window: &Window) -> Option<(WlSurface, FloatingWindowData)> {
+        let root = window
+            .wl_surface()
+            .map(|surface| root_surface(&surface.into_owned()))?;
+        let output = self.space.outputs().next().cloned()?;
+        let output_geo = self.space.output_geometry(&output)?;
+        let win_size = window.geometry().size;
+        let win_w = if win_size.w > 0 {
+            win_size.w
+        } else {
+            output_geo.size.w / 2
+        };
+        let win_h = if win_size.h > 0 {
+            win_size.h
+        } else {
+            output_geo.size.h / 2
+        };
+        let pos = Point::from((
+            output_geo.loc.x + (output_geo.size.w - win_w) / 2,
+            output_geo.loc.y + (output_geo.size.h - win_h) / 2,
+        ));
+
+        Some((
+            root,
+            FloatingWindowData::new(pos, Size::from((win_w, win_h))),
+        ))
+    }
+
+    fn workspace_idx_for_surface(&self, surface: &WlSurface) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(workspace_idx, _)| {
+                self.window_index_for_surface(workspace_idx, surface)
+                    .map(|_| workspace_idx)
+            })
+    }
+
     pub(crate) fn tiling_usable_geometry(&self) -> Option<Geometry> {
         let output = self.space.outputs().next()?.clone();
         let output_geo = self.space.output_geometry(&output)?;
@@ -174,38 +214,63 @@ impl Beewm {
     /// Float a newly-mapped window centered on the screen using its own
     /// natural size.
     pub fn map_as_floating_centered(&mut self, window: &Window) {
-        let root = match window
-            .wl_surface()
-            .map(|surface| root_surface(&surface.into_owned()))
-        {
-            Some(r) => r,
-            None => return,
+        let Some((root, floating)) = self.centered_floating_data(window) else {
+            return;
         };
-        let output = match self.space.outputs().next().cloned() {
-            Some(o) => o,
-            None => return,
+
+        self.floating_windows.insert(root, floating);
+        self.space.map_element(window.clone(), floating.position, true);
+    }
+
+    pub(crate) fn adopt_floating_dialog_state(&mut self, surface: &ToplevelSurface) {
+        let pending_should_float = self
+            .pending_windows
+            .iter()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
+                    .unwrap_or(false)
+            })
+            .map(should_map_toplevel_floating)
+            .unwrap_or(false);
+        if pending_should_float {
+            surface.with_pending_state(|state| {
+                state.size = None;
+            });
+            surface.send_configure();
+            return;
+        }
+
+        let Some(window) = self.mapped_window_for_surface(surface.wl_surface()) else {
+            return;
         };
-        let output_geo = self.space.output_geometry(&output).unwrap();
-        let win_size = window.geometry().size;
-        let win_w = if win_size.w > 0 {
-            win_size.w
+        if !should_map_toplevel_floating(&window) {
+            return;
+        }
+
+        let Some((root, floating)) = self.centered_floating_data(&window) else {
+            return;
+        };
+        let Some(workspace_idx) = self.workspace_idx_for_surface(&root) else {
+            return;
+        };
+
+        let was_floating = self.is_root_floating(&root);
+        if !was_floating {
+            self.remove_tiled_window(workspace_idx, &root);
+        }
+        self.floating_windows.insert(root, floating);
+
+        if workspace_idx == self.active_workspace {
+            self.relayout();
+            self.space.raise_element(&window, true);
+            if let Some(wl_surface) = window.wl_surface().map(|surface| surface.into_owned()) {
+                self.set_keyboard_focus(Some(wl_surface));
+            }
         } else {
-            output_geo.size.w / 2
-        };
-        let win_h = if win_size.h > 0 {
-            win_size.h
-        } else {
-            output_geo.size.h / 2
-        };
-        let pos = Point::from((
-            output_geo.loc.x + (output_geo.size.w - win_w) / 2,
-            output_geo.loc.y + (output_geo.size.h - win_h) / 2,
-        ));
-        self.floating_windows.insert(
-            root,
-            FloatingWindowData::new(pos, Size::from((win_w, win_h))),
-        );
-        self.space.map_element(window.clone(), pos, true);
+            self.needs_render = true;
+        }
     }
 
     fn float_window(&mut self, window: Window) {

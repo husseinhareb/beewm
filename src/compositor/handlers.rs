@@ -13,6 +13,7 @@ use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
+use smithay::delegate_xdg_dialog;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::desktop::{
@@ -51,6 +52,7 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::wayland::shell::xdg::dialog::XdgDialogHandler;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
@@ -242,6 +244,10 @@ impl XdgShellHandler for Beewm {
         surface.send_configure();
         let window = Window::new_wayland_window(surface);
         self.pending_windows.push(window);
+    }
+
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        self.adopt_floating_dialog_state(&surface);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -517,6 +523,14 @@ impl XdgDecorationHandler for Beewm {
     }
 }
 
+impl XdgDialogHandler for Beewm {
+    fn modal_changed(&mut self, toplevel: ToplevelSurface, is_modal: bool) {
+        if is_modal {
+            self.adopt_floating_dialog_state(&toplevel);
+        }
+    }
+}
+
 // TabletSeatHandler is required by delegate_cursor_shape! even though we have
 // no tablet hardware; the trait provides default no-op implementations.
 impl TabletSeatHandler for Beewm {}
@@ -531,6 +545,7 @@ delegate_compositor!(Beewm);
 delegate_cursor_shape!(Beewm);
 delegate_shm!(Beewm);
 delegate_xdg_shell!(Beewm);
+delegate_xdg_dialog!(Beewm);
 delegate_xdg_decoration!(Beewm);
 delegate_layer_shell!(Beewm);
 delegate_data_device!(Beewm);

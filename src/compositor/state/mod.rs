@@ -37,6 +37,7 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
@@ -79,6 +80,7 @@ pub struct Beewm {
     // Smithay protocol state
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub _xdg_dialog_state: XdgDialogState,
     pub _xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
     pub xwayland_shell_state: XWaylandShellState,
@@ -170,6 +172,7 @@ impl Beewm {
 
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_dialog_state = XdgDialogState::new::<Self>(&display_handle);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
@@ -208,6 +211,7 @@ impl Beewm {
             display_handle: display_handle.clone(),
             compositor_state,
             xdg_shell_state,
+            _xdg_dialog_state: xdg_dialog_state,
             _xdg_decoration_state: xdg_decoration_state,
             layer_shell_state,
             xwayland_shell_state,

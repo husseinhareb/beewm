@@ -221,6 +221,7 @@ fn should_map_x11_floating(surface: &X11Surface) -> bool {
                 | WmWindowType::Utility
         )
     ) || surface.is_popup()
+        || surface.is_transient_for().is_some()
         || surface
             .min_size()
             .zip(surface.max_size())
