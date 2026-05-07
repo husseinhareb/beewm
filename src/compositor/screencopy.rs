@@ -315,9 +315,6 @@ fn process_screencopy_frame<R>(
                     pending.geometry.buffer_region.size.h as u32,
                 );
             }
-            pending
-                .frame
-                .flags(zwlr_screencopy_frame_v1::Flags::YInvert);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
@@ -504,14 +501,11 @@ fn write_pixels_into_buffer(
 }
 
 fn readback_region(geometry: &ScreencopyGeometry) -> Rectangle<i32, Buffer> {
-    Rectangle::new(
-        (
-            geometry.buffer_region.loc.x,
-            geometry.buffer_size.h - geometry.buffer_region.loc.y - geometry.buffer_region.size.h,
-        )
-            .into(),
-        geometry.buffer_region.size,
-    )
+    // Smithay's GlesRenderer applies a Y-flip in its projection matrix to account
+    // for GL's bottom-to-top convention. As a result, physical screen y=0 (top)
+    // maps directly to GL framebuffer row 0. glReadPixels therefore returns rows in
+    // correct top-to-bottom visual order with no additional Y-flip required.
+    geometry.buffer_region
 }
 
 #[cfg(test)]
@@ -538,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn readback_region_flips_y_for_gl() {
+    fn readback_region_matches_buffer_region() {
         let geometry = capture_geometry(
             Size::<i32, Physical>::from((100, 80)),
             1.0,
@@ -548,10 +542,12 @@ mod tests {
         .expect("geometry should be valid");
 
         let readback = readback_region(&geometry);
-        assert_eq!(readback.loc.x, 10);
-        assert_eq!(readback.loc.y, 20);
-        assert_eq!(readback.size.w, 30);
-        assert_eq!(readback.size.h, 40);
+        // Smithay's renderer already accounts for GL's Y-inversion in its projection
+        // matrix, so the readback region is identical to the buffer region (no Y-flip).
+        assert_eq!(readback.loc.x, geometry.buffer_region.loc.x);
+        assert_eq!(readback.loc.y, geometry.buffer_region.loc.y);
+        assert_eq!(readback.size.w, geometry.buffer_region.size.w);
+        assert_eq!(readback.size.h, geometry.buffer_region.size.h);
     }
 
     #[test]

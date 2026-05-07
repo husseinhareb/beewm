@@ -22,6 +22,7 @@ use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::compositor::commands::ChildEnvironment;
+use crate::compositor::config_watcher;
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -230,6 +231,33 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("Workspace IPC channel closed");
             }
         })?;
+
+    // Watch the config file for changes and reload automatically on save.
+    match config_watcher::make_config_watch_fd(&Config::config_path()) {
+        Ok((watch_fd, config_filename)) => {
+            event_loop
+                .handle()
+                .insert_source(
+                    Generic::new(
+                        watch_fd,
+                        Interest::READ,
+                        smithay::reexports::calloop::Mode::Level,
+                    ),
+                    move |_, fd, data| {
+                        use std::os::fd::AsFd;
+                        if config_watcher::drain_config_event(fd.as_fd(), &config_filename) {
+                            data.state.apply_config_reload();
+                        }
+                        Ok(PostAction::Continue)
+                    },
+                )
+                .map_err(|e| tracing::warn!("Failed to register config watcher: {}", e))
+                .ok();
+        }
+        Err(e) => {
+            tracing::warn!("Failed to set up config file watcher: {}", e);
+        }
+    }
 
     // Initialize winit backend
     let (mut winit_backend, winit_evt) = winit::init::<GlowRenderer>()?;

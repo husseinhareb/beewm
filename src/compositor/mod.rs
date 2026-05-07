@@ -1,5 +1,6 @@
 pub mod backend;
 pub(crate) mod commands;
+pub(crate) mod config_watcher;
 mod cursor;
 mod feedback;
 mod handlers;

@@ -1,4 +1,5 @@
 use smithay::desktop::Window;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{Logical, Rectangle};
@@ -48,10 +49,12 @@ impl Beewm {
     }
 
     pub fn active_workspace_focused_index(&self) -> Option<usize> {
-        match self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
-            Some(surface) => self.window_index_for_surface(self.active_workspace, &surface),
-            None => self.workspaces[self.active_workspace].focused_idx,
+        if let Some(surface) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+            if let Some(idx) = self.window_index_for_surface(self.active_workspace, &surface) {
+                return Some(idx);
+            }
         }
+        self.workspaces[self.active_workspace].focused_idx
     }
 
     pub fn active_workspace_focused_window(&self) -> Option<&Window> {
@@ -105,10 +108,36 @@ impl Beewm {
     }
 
     pub fn note_keyboard_focus_change(&mut self, focused: Option<&WlSurface>) {
-        if let Some(surface) = focused {
-            if let Some(idx) = self.window_index_for_surface(self.active_workspace, surface) {
-                self.workspaces[self.active_workspace].focused_idx = Some(idx);
+        let new_idx = focused
+            .and_then(|s| self.window_index_for_surface(self.active_workspace, s));
+
+        let old_idx = self.workspaces[self.active_workspace].focused_idx;
+
+        if new_idx != old_idx {
+            if let Some(idx) = old_idx {
+                if let Some(window) = self.workspaces[self.active_workspace].windows.get(idx) {
+                    if let Some(toplevel) = window.toplevel() {
+                        toplevel.with_pending_state(|s| {
+                            s.states.unset(xdg_toplevel::State::Activated);
+                        });
+                        toplevel.send_pending_configure();
+                    }
+                }
             }
+            if let Some(idx) = new_idx {
+                if let Some(window) = self.workspaces[self.active_workspace].windows.get(idx) {
+                    if let Some(toplevel) = window.toplevel() {
+                        toplevel.with_pending_state(|s| {
+                            s.states.set(xdg_toplevel::State::Activated);
+                        });
+                        toplevel.send_pending_configure();
+                    }
+                }
+            }
+        }
+
+        if let Some(idx) = new_idx {
+            self.workspaces[self.active_workspace].focused_idx = Some(idx);
         }
 
         self.invalidate_borders();
@@ -116,6 +145,23 @@ impl Beewm {
 
     pub fn set_keyboard_focus(&mut self, focused: Option<WlSurface>) {
         let serial = SERIAL_COUNTER.next_serial();
+
+        // Dismiss any active popup grab before re-focusing. We unset the keyboard
+        // grab first so that PopupPointerGrab::unset() finds keyboard.is_grabbed()
+        // = false and skips the intermediate keyboard.set_focus(root) call, which
+        // would otherwise emit a spurious focus_changed event before we set the
+        // real focus below.
+        let keyboard = self.seat.get_keyboard().unwrap();
+        if keyboard.is_grabbed() {
+            keyboard.unset_grab(self);
+        }
+        if let Some(pointer) = self.seat.get_pointer() {
+            if pointer.is_grabbed() {
+                let time_ms = self.start_time.elapsed().as_millis() as u32;
+                pointer.unset_grab(self, serial, time_ms);
+            }
+        }
+
         let keyboard = self.seat.get_keyboard().unwrap();
         keyboard.set_focus(self, focused.clone(), serial);
 

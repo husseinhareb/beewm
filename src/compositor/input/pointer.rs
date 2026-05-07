@@ -309,6 +309,26 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
         }
     }
 
+    // Click-to-focus: on any button press with no compositor-level grab active,
+    // focus whatever is under the pointer. This also dismisses popup grabs
+    // (via set_keyboard_focus) when the user clicks outside a popup.
+    if btn_state == ButtonState::Pressed && state.active_grab.is_none() {
+        let pos = state.pointer_location;
+        if let Some((surface, _)) = surface_under(state, pos) {
+            if let Some(target) = keyboard_focus_target_under_pointer(state, &surface) {
+                let already_focused = state
+                    .seat
+                    .get_keyboard()
+                    .and_then(|kb| kb.current_focus())
+                    .map(|f| f == target)
+                    .unwrap_or(false);
+                if !already_focused {
+                    state.set_keyboard_focus(Some(target));
+                }
+            }
+        }
+    }
+
     let pointer = state.seat.get_pointer().unwrap();
     pointer.button(
         state,

@@ -48,6 +48,10 @@ impl<T: Clone + Eq> DwindleTree<T> {
         }
     }
 
+    pub fn set_default_split_ratio(&mut self, ratio: f64) {
+        self.default_split_ratio = sanitize_split_ratio(ratio);
+    }
+
     pub fn insert(&mut self, target: Option<&T>, new_leaf: T) {
         if self.root.is_none() {
             self.root = Some(DwindleNode::Leaf(new_leaf));

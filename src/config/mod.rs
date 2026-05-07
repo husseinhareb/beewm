@@ -303,7 +303,7 @@ impl Config {
         text
     }
 
-    fn config_path() -> PathBuf {
+    pub fn config_path() -> PathBuf {
         let mut path = dirs_or_default();
         path.push("beewm");
         path.push("config");

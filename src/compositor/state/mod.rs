@@ -270,6 +270,81 @@ impl Beewm {
         state
     }
 
+    /// Re-read the config file and apply every hot-reloadable field in place.
+    /// Called automatically when the config file is saved.
+    pub fn apply_config_reload(&mut self) {
+        let new_config = match Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Config reload failed, keeping current config: {}", e);
+                return;
+            }
+        };
+
+        // Border colors are pre-converted to Color32F at init time; keep them in sync.
+        if new_config.border_color_focused != self.config.border_color_focused
+            || new_config.border_color_unfocused != self.config.border_color_unfocused
+            || new_config.border_width != self.config.border_width
+        {
+            self.border_color_focused = hex_to_color32f(new_config.border_color_focused);
+            self.border_color_unfocused = hex_to_color32f(new_config.border_color_unfocused);
+            // Bump the commit serial so the DRM damage tracker sees the colour change.
+            self.border_commit_serial = self.border_commit_serial.wrapping_add(1);
+        }
+
+        // Keybinds are pre-resolved to keysyms; re-resolve on any change.
+        if new_config.keybinds != self.config.keybinds {
+            self.resolved_keybinds = resolve_keybinds(&new_config.keybinds);
+        }
+
+        // Split ratio: propagate to the layout manager.
+        // For dwindle this affects future splits; for master-stack it also
+        // changes the current master/stack division immediately.
+        if new_config.split_ratio != self.config.split_ratio {
+            self.layout_manager.set_default_split_ratio(new_config.split_ratio);
+        }
+
+        // Layout algorithm change: rebuild the manager from scratch, re-inserting
+        // all tiled windows in their current workspace order so nothing is lost.
+        if new_config.layout != self.config.layout {
+            let num_ws = self.workspaces.len();
+            let mut new_manager = build_layout_manager(&new_config, num_ws);
+            for ws_idx in 0..num_ws {
+                for root in self.tiled_window_roots_in_workspace(ws_idx) {
+                    new_manager.insert(ws_idx, None, root);
+                }
+            }
+            self.layout_manager = new_manager;
+        }
+
+        // num_workspaces changes require a restart (adding/removing live workspaces
+        // while windows exist is not safe to do mid-session).
+        if new_config.num_workspaces != self.config.num_workspaces {
+            tracing::warn!(
+                "num_workspaces changed ({} → {}); restart beewm to apply",
+                self.config.num_workspaces,
+                new_config.num_workspaces,
+            );
+        }
+
+        // autostart_commands are intentionally not re-executed on reload.
+        // tap_to_click / natural_scroll take effect for devices added after
+        // this reload; already-connected devices keep their current setting.
+
+        self.config = new_config;
+        tracing::info!(
+            "Config reloaded: layout={:?}, border_width={}, gap={}, split_ratio={}",
+            self.config.layout,
+            self.config.border_width,
+            self.config.gap,
+            self.config.split_ratio,
+        );
+
+        // relayout() repositions all windows on the active workspace and sets
+        // needs_render = true so the new gap/border values are picked up.
+        self.relayout();
+    }
+
     pub fn install_syncobj_blocker_source(&mut self, installer: Box<SyncobjBlockerInstaller>) {
         self.syncobj_blocker_installer = Some(installer);
     }

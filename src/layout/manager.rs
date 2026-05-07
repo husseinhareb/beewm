@@ -60,6 +60,11 @@ pub trait LayoutManager<Id: Clone + Eq + Hash + 'static>: Debug {
         delta: (i32, i32),
     ) -> bool;
 
+    /// Update the default split / master ratio used for new splits.
+    /// For dwindle this only affects future insertions; for master-stack it
+    /// also affects the current rendered layout immediately.
+    fn set_default_split_ratio(&mut self, ratio: f64);
+
     /// Access the positional layout (for index-based fallback in relayout).
     /// Returns `None` for tree-based layouts that produce keyed geometries.
     fn positional_layout(&self) -> Option<&dyn Layout> {
@@ -131,6 +136,12 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         tree.geometries(screen)
             .into_iter()
             .find_map(|(candidate, geo)| (candidate == id).then_some(geo))
+    }
+
+    fn set_default_split_ratio(&mut self, ratio: f64) {
+        for tree in &mut self.trees {
+            tree.set_default_split_ratio(ratio);
+        }
     }
 
     fn resize(
@@ -263,6 +274,13 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
         master_stack_ordered_geometries(screen, &order, state.master_ratio, &state.stack_weights)
             .into_iter()
             .last()
+    }
+
+    fn set_default_split_ratio(&mut self, ratio: f64) {
+        let sanitized = sanitize_ratio(ratio);
+        for ws in &mut self.workspaces {
+            ws.master_ratio = sanitized;
+        }
     }
 
     fn resize(
