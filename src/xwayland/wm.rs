@@ -4,7 +4,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
-use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowType, XwmId};
+use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowProperty, WmWindowType, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
 
 use crate::compositor::state::{Beewm, root_surface};
@@ -325,6 +325,19 @@ impl XwmHandler for Beewm {
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
         self.remove_x11_window(&window);
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if matches!(property, WmWindowProperty::Title) {
+            let is_focused = self
+                .active_workspace_focused_window()
+                .and_then(|focused| focused.x11_surface().cloned())
+                .map(|focused_surface| focused_surface == window)
+                .unwrap_or(false);
+            if is_focused {
+                self.publish_focused_window_state();
+            }
+        }
     }
 
     fn configure_request(

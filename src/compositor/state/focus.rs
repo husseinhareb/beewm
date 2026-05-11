@@ -141,6 +141,7 @@ impl Beewm {
         }
 
         self.invalidate_borders();
+        self.publish_focused_window_state();
     }
 
     pub fn set_keyboard_focus(&mut self, focused: Option<WlSurface>) {

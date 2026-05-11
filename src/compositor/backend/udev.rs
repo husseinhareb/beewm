@@ -344,10 +344,24 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting udev event loop");
 
     while data.state.running {
-        let timeout = if data.state.active_grab.is_some() || data.state.needs_render {
+        // All event sources (DRM VBlank, Wayland fd, libinput, IPC, config
+        // watcher) wake calloop immediately when they have data, so the
+        // dispatch timeout is just an upper bound when the compositor is
+        // genuinely idle.
+        //
+        // - During an interactive grab we want 1 ms ticks so the cursor
+        //   tracks tightly even if a frame's worth of input gets coalesced.
+        // - When there is pending damage waiting for VBlank, we know the DRM
+        //   source will wake us; a 16 ms ceiling is just a safety net.
+        // - Otherwise sleep up to 100 ms so the compositor uses essentially
+        //   no CPU when the user isn't doing anything (the previous 20 ms
+        //   default woke calloop ~50 times/sec for nothing).
+        let timeout = if data.state.active_grab.is_some() {
             Duration::from_millis(1)
+        } else if data.state.needs_render {
+            Duration::from_millis(16)
         } else {
-            Duration::from_millis(20)
+            Duration::from_millis(100)
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
         // Process pending surface state (sends wl_surface.enter/leave)
@@ -364,6 +378,11 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // AND something visual has actually changed. Rendering after dispatch
         // keeps live resizes closer to the latest pointer and commit state.
         if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.state.needs_render {
+            // Clear the flag *before* rendering so subsequent damage that
+            // arrives while we wait for VBlank re-arms the next frame.
+            // Without this, every successful queue caused a redundant empty
+            // render on the following iteration just to clear the flag.
+            data.state.needs_render = false;
             render_frame(&mut data);
         }
     }
@@ -428,14 +447,11 @@ fn render_frame(data: &mut UdevData) {
             update_primary_scanout_output(&data.state, &output, &render_states);
 
             if result.is_empty {
-                // No damage — nothing to scan out.  Clear the render request
-                // so we don't spin; the next surface commit / relayout will
-                // set `needs_render = true` again.
-                data.state.needs_render = false;
+                // No damage — nothing to scan out. The caller already
+                // cleared `needs_render`; re-allow the next render and send
+                // frame callbacks now since no VBlank will fire to do it.
                 gpu.can_render = true;
                 gpu.pending_presentation_feedback = None;
-                // No VBlank will fire, so send frame callbacks now to keep
-                // clients from stalling.
                 let elapsed = data.state.start_time.elapsed();
                 send_frame_callbacks(
                     &data.state,
@@ -447,7 +463,9 @@ fn render_frame(data: &mut UdevData) {
                 tracing::error!("Failed to queue frame: {:?}", e);
                 gpu.can_render = true;
                 gpu.pending_presentation_feedback = None;
-                // Frame was never queued — no VBlank coming; unblock clients.
+                // Frame was never queued — no VBlank coming; unblock clients
+                // and re-arm the render so the next dispatch retries.
+                data.state.needs_render = true;
                 let elapsed = data.state.start_time.elapsed();
                 send_frame_callbacks(&data.state, &output, elapsed, None);
             } else {
@@ -464,7 +482,9 @@ fn render_frame(data: &mut UdevData) {
             tracing::error!("Render error: {:?}", e);
             gpu.can_render = true;
             gpu.pending_presentation_feedback = None;
-            // Render failed — no VBlank coming; unblock clients.
+            // Render failed — no VBlank coming; unblock clients and re-arm
+            // so we retry on the next iteration instead of getting stuck.
+            data.state.needs_render = true;
             let elapsed = data.state.start_time.elapsed();
             send_frame_callbacks(&data.state, &output, elapsed, None);
         }

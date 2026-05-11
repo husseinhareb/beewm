@@ -69,14 +69,27 @@ impl Beewm {
         ))
     }
 
+    /// Compute the effective inner gap for a layout cell of the given size.
+    ///
+    /// When a cell is large enough the returned gap equals the configured gap.
+    /// For tiny cells (deep dwindle trees) the gap shrinks so that a 1-pixel
+    /// window with its borders never overflows outside the cell boundary.
+    fn effective_inner_gap(&self, cell_w: u32, cell_h: u32) -> (i32, i32) {
+        let gap = self.config.gap as i32;
+        let bw = self.config.border_width as i32;
+        let gx = gap.min(((cell_w as i32 - 2 * bw - 1) / 2).max(0));
+        let gy = gap.min(((cell_h as i32 - 2 * bw - 1) / 2).max(0));
+        (gx, gy)
+    }
+
     pub(crate) fn configured_tiled_size(
         &self,
         geo: Geometry,
     ) -> Size<i32, smithay::utils::Logical> {
-        let gap = self.config.gap as i32;
+        let (gx, gy) = self.effective_inner_gap(geo.width, geo.height);
         let bw = self.config.border_width as i32;
-        let w = (geo.width as i32 - gap * 2 - bw * 2).max(1);
-        let h = (geo.height as i32 - gap * 2 - bw * 2).max(1);
+        let w = (geo.width as i32 - gx * 2 - bw * 2).max(1);
+        let h = (geo.height as i32 - gy * 2 - bw * 2).max(1);
         Size::from((w, h))
     }
 
@@ -401,7 +414,6 @@ impl Beewm {
         let Some(usable) = self.tiling_usable_geometry() else {
             return;
         };
-        let gap = self.config.gap as i32;
 
         let windows = &self.workspaces[self.active_workspace].windows;
         if windows.is_empty() {
@@ -428,8 +440,9 @@ impl Beewm {
             let Some(geo) = geo else {
                 continue;
             };
-            let x = geo.x + gap;
-            let y = geo.y + gap;
+            let (gx, gy) = self.effective_inner_gap(geo.width, geo.height);
+            let x = geo.x + gx;
+            let y = geo.y + gy;
             let size = self.configured_tiled_size(geo);
 
             if let Some(toplevel) = window.toplevel() {

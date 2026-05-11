@@ -64,6 +64,7 @@ pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";
 const WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspaces";
+const WINDOW_STATE_PATH: &str = "/tmp/beewm_window";
 static STATE_FILE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type SyncobjBlockerInstaller = dyn Fn(DrmSyncPointSource, Client);
@@ -267,6 +268,7 @@ impl Beewm {
         };
 
         state.publish_workspace_state();
+        state.publish_focused_window_state();
         state
     }
 
@@ -405,6 +407,43 @@ impl Beewm {
             );
         }
     }
+
+    /// Publish the title of the currently-focused window to
+    /// `/tmp/beewm_window`. Called by the focus + title-change hooks; status
+    /// bars / IPC subscribers can either poll this file or watch it with
+    /// inotify (beebar does the latter).
+    pub(crate) fn publish_focused_window_state(&self) {
+        let title = self
+            .active_workspace_focused_window()
+            .map(focused_window_title)
+            .unwrap_or_default();
+        if let Err(error) = write_state_file_atomically(Path::new(WINDOW_STATE_PATH), &title) {
+            tracing::warn!(
+                "Failed to publish focused window title to {}: {}",
+                WINDOW_STATE_PATH,
+                error
+            );
+        }
+    }
+}
+
+/// Resolve the human-readable title of a tracked window, looking on both the
+/// xdg-shell and XWayland sides. Returns an empty string when no title is
+/// set yet — a not-uncommon state right after window creation.
+pub fn focused_window_title(window: &smithay::desktop::Window) -> String {
+    if let Some(x11) = window.x11_surface() {
+        return x11.title();
+    }
+    if let Some(toplevel) = window.toplevel() {
+        return smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok().and_then(|role| role.title.clone()))
+                .unwrap_or_default()
+        });
+    }
+    String::new()
 }
 
 pub fn active_workspace_state_contents(active_workspace: usize) -> String {

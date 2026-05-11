@@ -136,8 +136,16 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     let mut new_pos = state.pointer_location + delta;
     new_pos.x = new_pos.x.clamp(0.0, output_geo.size.w as f64 - 1.0);
     new_pos.y = new_pos.y.clamp(0.0, output_geo.size.h as f64 - 1.0);
+    // Only schedule a render when the cursor crossed an integer-pixel
+    // boundary. High-DPI mice send sub-pixel events at >1 kHz; rendering on
+    // every event burned CPU rebuilding the element list for plane updates
+    // that the DRM driver coalesced anyway.
+    if new_pos.x.floor() != state.pointer_location.x.floor()
+        || new_pos.y.floor() != state.pointer_location.y.floor()
+    {
+        state.needs_render = true;
+    }
     state.pointer_location = new_pos;
-    state.needs_render = true;
 
     if handle_active_grab(state, new_pos) {
         return;
@@ -206,8 +214,12 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
     let output_geo = state.space.output_geometry(&output).unwrap();
     let pos = event.position_transformed(output_geo.size);
 
+    if pos.x.floor() != state.pointer_location.x.floor()
+        || pos.y.floor() != state.pointer_location.y.floor()
+    {
+        state.needs_render = true;
+    }
     state.pointer_location = pos;
-    state.needs_render = true;
 
     if handle_active_grab(state, pos) {
         return;

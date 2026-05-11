@@ -21,3 +21,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 xcursor = "0.3"
+
+# Aggressive release profile: cross-crate inlining + monomorphization-friendly
+# codegen so input → render hot paths fold into tight straight-line code. The
+# compositor is one binary that runs as long as the session, so longer build
+# times for faster runtime are the right trade-off.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false
+overflow-checks = false
+
+# Match the release tuning when building dependencies for `cargo run`/dev,
+# so startup of the compiled compositor isn't dragged down by un-inlined
+# smithay / wayland-server code while iterating on it.
+[profile.dev.package."*"]
+opt-level = 3

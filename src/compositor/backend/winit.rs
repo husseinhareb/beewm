@@ -325,10 +325,14 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut applied_cursor_status_serial = u64::MAX;
 
     while data.state.running {
-        let timeout = if data.state.active_grab.is_some() || data.state.needs_render {
+        // See run_udev for the rationale: rely on event sources to wake us
+        // and treat the timeout purely as an idle ceiling.
+        let timeout = if data.state.active_grab.is_some() {
             Duration::from_millis(1)
-        } else {
+        } else if data.state.needs_render {
             Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
 

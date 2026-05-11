@@ -250,6 +250,20 @@ impl XdgShellHandler for Beewm {
         self.adopt_floating_dialog_state(&surface);
     }
 
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        // Republish only when the title-changed surface is the focused one —
+        // background tabs/clients renaming themselves shouldn't cause the
+        // status bar to flicker through unrelated titles.
+        let is_focused = self
+            .active_workspace_focused_window()
+            .and_then(|window| window.toplevel().map(|toplevel| toplevel.wl_surface().clone()))
+            .as_ref()
+            == Some(surface.wl_surface());
+        if is_focused {
+            self.publish_focused_window_state();
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         // Remove windows that died before their first commit.
         let target_surface = surface.wl_surface();
