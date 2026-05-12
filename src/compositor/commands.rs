@@ -3,6 +3,17 @@ use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+// NOTE: Do NOT add `pre_exec` hooks to spawned commands. Rust's
+// `Command::spawn()` only uses the fork-safe `posix_spawn()` path when there
+// are no pre_exec callbacks; setting one forces the unsafe fork+exec path.
+// beewm runs several background threads (event broadcaster, IPC accept,
+// XWayland, libseat), and `fork()` in a multi-threaded program copies all
+// libc mutexes — including the malloc mutex — in their currently-held state,
+// which can deadlock the child before `exec` runs. When that happens the
+// parent blocks forever on the internal CLOEXEC error pipe and the entire
+// compositor (input, rendering, VT-switch hotkeys) freezes. Use
+// `process_group` / posix_spawn-compatible methods only.
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ChildEnvironment {
     vars: BTreeMap<OsString, OsString>,
@@ -91,19 +102,17 @@ fn configure_child(command: &mut Command, child_env: &ChildEnvironment) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // Detach the child from the compositor's process group / session so
-    // closing/killing the compositor doesn't take spawned terminals down with
-    // it, and so SIGINT on the foreground TTY doesn't propagate. This also
-    // prevents the parent from accidentally reaping signals destined for
-    // children and is the same approach Hyprland/sway take. `setsid` is a
-    // single syscall and runs in the child between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            // SAFETY: only async-signal-safe code runs here.
-            libc::setsid();
-            Ok(())
-        });
-    }
+    // Detach the child from the compositor's process group so closing/killing
+    // the compositor doesn't take spawned terminals down with it, and so
+    // SIGINT on the foreground TTY doesn't propagate to children. We use
+    // `process_group(0)` rather than a `pre_exec(setsid)` hook because the
+    // latter disables Rust's posix_spawn fast path and forces the unsafe
+    // fork+exec path; in a multi-threaded compositor that risks the child
+    // deadlocking on inherited libc mutexes (e.g. malloc) before `exec`,
+    // which would block this `spawn()` call forever and freeze the WM.
+    // `process_group` is implemented via `posix_spawnattr_setpgroup`, so it
+    // stays on the safe path.
+    command.process_group(0);
 }
 
 pub fn spawn_shell_command(cmd: &str, child_env: &ChildEnvironment) -> std::io::Result<()> {

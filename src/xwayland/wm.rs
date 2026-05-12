@@ -335,7 +335,7 @@ impl XwmHandler for Beewm {
                 .map(|focused_surface| focused_surface == window)
                 .unwrap_or(false);
             if is_focused {
-                self.publish_focused_window_state();
+                self.request_focus_publish();
             }
         }
     }
@@ -436,6 +436,59 @@ impl XwmHandler for Beewm {
     }
 
     fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let window_obj = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.windows.iter())
+            .find(|w| {
+                w.x11_surface()
+                    .map(|s| s == &window)
+                    .unwrap_or(false)
+            })
+            .cloned();
+
+        let Some(window_obj) = window_obj else { return };
+        let _ = window.set_fullscreen(true);
+
+        let output = match self.space.outputs().next().cloned() {
+            Some(o) => o,
+            None => return,
+        };
+        let output_geo = self.space.output_geometry(&output).unwrap();
+
+        let ws_idx = self.active_workspace;
+        for sibling in &self.workspaces[ws_idx].windows {
+            if *sibling != window_obj {
+                self.space.unmap_elem(sibling);
+            }
+        }
+
+        let _ = window.configure(output_geo);
+        self.space.map_element(window_obj.clone(), output_geo.loc, true);
+        self.fullscreen_window = Some(window_obj.clone());
+
+        if let Some(wl_surface) = window_obj.wl_surface().map(|s| s.into_owned()) {
+            self.set_keyboard_focus(Some(wl_surface));
+        }
+
+        self.needs_render = true;
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let is_our_fullscreen = self
+            .fullscreen_window
+            .as_ref()
+            .and_then(|w| w.x11_surface())
+            .map(|s| s == &window)
+            .unwrap_or(false);
+
+        if is_our_fullscreen {
+            let _ = window.set_fullscreen(false);
+            self.restore_fullscreen();
+        }
+    }
 
     fn disconnected(&mut self, _xwm: XwmId) {
         self.xwm = None;

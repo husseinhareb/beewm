@@ -7,6 +7,7 @@ use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotio
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
@@ -136,6 +137,53 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     let mut new_pos = state.pointer_location + delta;
     new_pos.x = new_pos.x.clamp(0.0, output_geo.size.w as f64 - 1.0);
     new_pos.y = new_pos.y.clamp(0.0, output_geo.size.h as f64 - 1.0);
+
+    // If the surface currently under the cursor has an active pointer lock, keep the
+    // cursor fixed and only deliver relative motion to the game.
+    let pointer = state.seat.get_pointer().unwrap();
+    let under_cursor = surface_under(state, state.pointer_location);
+    let is_locked = under_cursor
+        .as_ref()
+        .map(|(surface, _)| {
+            with_pointer_constraint(surface, &pointer, |constraint| {
+                constraint
+                    .map(|c| c.is_active() && matches!(*c, PointerConstraint::Locked(_)))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    if is_locked {
+        let serial = SERIAL_COUNTER.next_serial();
+        let pointer = state.seat.get_pointer().unwrap();
+        // Smithay's PointerInternal::relative_motion ignores the focus parameter
+        // and delivers only to its internal self.focus, which is only set by
+        // pointer.motion() calls. Call motion() first at the current (fixed) cursor
+        // position so smithay's internal focus is kept correct, then deliver the
+        // relative delta. Without this, relative_motion events are silently dropped
+        // when smithay's internal focus is None or stale.
+        pointer.motion(
+            state,
+            under_cursor.clone(),
+            &MotionEvent {
+                location: state.pointer_location,
+                serial,
+                time: Event::time_msec(&event),
+            },
+        );
+        pointer.relative_motion(
+            state,
+            under_cursor,
+            &RelativeMotionEvent {
+                delta,
+                delta_unaccel: event.delta_unaccel(),
+                utime: Event::time(&event),
+            },
+        );
+        pointer.frame(state);
+        return;
+    }
+
     // Only schedule a render when the cursor crossed an integer-pixel
     // boundary. High-DPI mice send sub-pixel events at >1 kHz; rendering on
     // every event burned CPU rebuilding the element list for plane updates

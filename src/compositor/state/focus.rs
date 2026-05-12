@@ -122,6 +122,9 @@ impl Beewm {
                         });
                         toplevel.send_pending_configure();
                     }
+                    if let Some(x11) = window.x11_surface() {
+                        let _ = x11.set_activated(false);
+                    }
                 }
             }
             if let Some(idx) = new_idx {
@@ -132,6 +135,9 @@ impl Beewm {
                         });
                         toplevel.send_pending_configure();
                     }
+                    if let Some(x11) = window.x11_surface() {
+                        let _ = x11.set_activated(true);
+                    }
                 }
             }
         }
@@ -141,7 +147,7 @@ impl Beewm {
         }
 
         self.invalidate_borders();
-        self.publish_focused_window_state();
+        self.request_focus_publish();
     }
 
     pub fn set_keyboard_focus(&mut self, focused: Option<WlSurface>) {
@@ -168,6 +174,9 @@ impl Beewm {
 
         // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.
         if focused.is_none() {
+            if let Some(prev) = self.prev_keyboard_focus.take() {
+                self.deactivate_pointer_constraint_for(&prev);
+            }
             self.note_keyboard_focus_change(None);
         }
     }

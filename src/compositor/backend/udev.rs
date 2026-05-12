@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
@@ -23,7 +22,7 @@ use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
 use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
-use smithay::reexports::input::{DeviceCapability, Libinput, ScrollMethod};
+use smithay::reexports::input::{Libinput, ScrollMethod};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
@@ -216,21 +215,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .handle()
         .insert_source(event_channel, |event, _, data| match event {
             ChannelEvent::Msg(stream) => {
-                if let Err(error) = stream.set_nonblocking(true) {
-                    tracing::warn!("Failed to set event subscriber to non-blocking: {}", error);
-                    return;
-                }
-                // Send the subscriber the current state immediately so it
-                // does not have to wait for the next state change.
+                // Build the initial-state snapshot on the main thread (safe,
+                // no I/O), then hand the stream + snapshot to the broadcaster
+                // thread which does all socket writes.
                 let title = data
                     .state
                     .active_workspace_focused_window()
                     .map(crate::compositor::state::focused_window_title)
                     .unwrap_or_default();
                 let workspace_num = data.state.active_workspace + 1;
-                let mut stream = stream;
-                let _ = write!(stream, "window>>{title}\nworkspace>>{workspace_num}\n");
-                data.state.event_subscribers.push(stream);
+                let initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
+                data.state.event_broadcaster.add_subscriber(stream, initial);
             }
             ChannelEvent::Closed => {
                 tracing::warn!("Event socket channel closed");
@@ -313,13 +308,6 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-                if device.has_capability(DeviceCapability::Keyboard) {
-                    data.state.keyboard_devices.push(device.clone());
-                }
-                return;
-            }
-            if let InputEvent::DeviceRemoved { device } = event {
-                data.state.keyboard_devices.retain(|d| d != &device);
                 return;
             }
             crate::compositor::input::handle_input(&mut data.state, event);
@@ -337,11 +325,17 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     data.gpu = Some(gd);
                     data.state.drm_syncobj_state = syncobj_state;
                     let display_handle = data.state.display_handle.clone();
-                    data.state._dmabuf_global = Some(
-                        data.state
-                            .dmabuf_state
-                            .create_global::<Beewm>(&display_handle, dmabuf_formats),
-                    );
+                    if crate::compositor::runtime_flags::flags().dmabuf_disabled {
+                        tracing::warn!(
+                            "Dmabuf global skipped by BEEWM_NO_DMABUF; clients will fall back to shm"
+                        );
+                    } else {
+                        data.state._dmabuf_global = Some(
+                            data.state
+                                .dmabuf_state
+                                .create_global::<Beewm>(&display_handle, dmabuf_formats),
+                        );
+                    }
                 }
                 Err(e) => tracing::warn!("Failed to init GPU {}: {}", path.display(), e),
             }
@@ -397,6 +391,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_millis(100)
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
+        // Run deferred work that was queued from inside dispatch callbacks
+        // and that cannot safely run there (would deadlock cached_state).
+        data.state.flush_pending_focus_publish();
         // Process pending surface state (sends wl_surface.enter/leave)
         // BEFORE flushing so clients receive enter events in the same
         // batch as configures and frame callbacks.
@@ -650,7 +647,10 @@ fn init_gpu(
         Some(gbm_device.clone()),
     )?;
 
-    let syncobj_state = if supports_syncobj_eventfd(&drm_fd) {
+    let syncobj_state = if crate::compositor::runtime_flags::flags().explicit_sync_disabled {
+        tracing::warn!("Explicit sync disabled by BEEWM_NO_EXPLICIT_SYNC");
+        None
+    } else if supports_syncobj_eventfd(&drm_fd) {
         Some(DrmSyncobjState::new::<Beewm>(
             display_handle,
             drm_fd.clone(),

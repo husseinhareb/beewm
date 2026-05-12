@@ -1,5 +1,7 @@
 use smithay::delegate_compositor;
 use smithay::delegate_cursor_shape;
+use smithay::delegate_pointer_constraints;
+use smithay::delegate_relative_pointer;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::delegate_data_device;
 use smithay::delegate_drm_syncobj;
@@ -20,7 +22,6 @@ use smithay::desktop::{
     find_popup_root_surface, layer_map_for_output, LayerSurface as DesktopLayerSurface,
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, Window, WindowSurfaceType,
 };
-use smithay::input::keyboard::LedState;
 use smithay::input::pointer::{CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
@@ -29,8 +30,9 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Point, Serial};
 use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, get_parent, send_surface_state,
     with_states,
@@ -100,7 +102,9 @@ impl CompositorHandler for Beewm {
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
-        Beewm::install_explicit_sync_hook(surface);
+        if !crate::compositor::runtime_flags::flags().explicit_sync_disabled {
+            Beewm::install_explicit_sync_hook(surface);
+        }
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -261,7 +265,7 @@ impl XdgShellHandler for Beewm {
             .as_ref()
             == Some(surface.wl_surface());
         if is_focused {
-            self.publish_focused_window_state();
+            self.request_focus_publish();
         }
     }
 
@@ -416,18 +420,22 @@ impl SeatHandler for Beewm {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Manage pointer-lock constraints: deactivate on the old focused surface and
+        // activate on the newly focused one so games get/lose their pointer lock
+        // automatically with keyboard focus.
+        if let Some(prev) = self.prev_keyboard_focus.take() {
+            self.deactivate_pointer_constraint_for(&prev);
+        }
+        if let Some(surface) = focused {
+            self.activate_pointer_constraint_for(surface);
+        }
+        self.prev_keyboard_focus = focused.cloned();
+
         self.note_keyboard_focus_change(focused);
         // Deliver the current clipboard/primary selection to the newly focused client.
         let client = focused.and_then(|s| s.client());
         set_data_device_focus::<Self>(&self.display_handle, seat, client.clone());
         set_primary_focus::<Self>(&self.display_handle, seat, client);
-    }
-
-    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
-        let leds = led_state.into();
-        for device in &mut self.keyboard_devices {
-            device.led_update(leds);
-        }
     }
 }
 
@@ -563,6 +571,32 @@ impl DrmSyncobjHandler for Beewm {
     }
 }
 
+impl PointerConstraintsHandler for Beewm {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &smithay::input::pointer::PointerHandle<Self>) {
+        // Activate the constraint immediately. Games (e.g. CS2) call lock_pointer and
+        // won't start processing WASD/mouse input until they receive the `locked` event.
+        // The Wayland spec requires activation when the surface has pointer focus; we
+        // satisfy this because games only call lock_pointer when they are focused.
+        // Deactivation happens in focus_changed when the surface loses keyboard focus.
+        with_pointer_constraint(surface, pointer, |constraint| {
+            if let Some(c) = constraint {
+                if !c.is_active() {
+                    c.activate();
+                }
+            }
+        });
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &smithay::input::pointer::PointerHandle<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        // Ignored: the cursor stays at its current position when the lock releases.
+    }
+}
+
 delegate_compositor!(Beewm);
 delegate_cursor_shape!(Beewm);
 delegate_shm!(Beewm);
@@ -579,6 +613,8 @@ delegate_viewporter!(Beewm);
 delegate_fractional_scale!(Beewm);
 delegate_single_pixel_buffer!(Beewm);
 delegate_drm_syncobj!(Beewm);
+delegate_pointer_constraints!(Beewm);
+delegate_relative_pointer!(Beewm);
 
 impl FractionalScaleHandler for Beewm {
     fn new_fractional_scale(&mut self, surface: WlSurface) {

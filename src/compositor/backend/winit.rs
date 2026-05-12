@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::os::fd::AsFd;
 use std::time::Duration;
 
@@ -238,19 +237,14 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .handle()
         .insert_source(event_channel, |event, _, data| match event {
             ChannelEvent::Msg(stream) => {
-                if let Err(error) = stream.set_nonblocking(true) {
-                    tracing::warn!("Failed to set event subscriber to non-blocking: {}", error);
-                    return;
-                }
                 let title = data
                     .state
                     .active_workspace_focused_window()
                     .map(crate::compositor::state::focused_window_title)
                     .unwrap_or_default();
                 let workspace_num = data.state.active_workspace + 1;
-                let mut stream = stream;
-                let _ = write!(stream, "window>>{title}\nworkspace>>{workspace_num}\n");
-                data.state.event_subscribers.push(stream);
+                let initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
+                data.state.event_broadcaster.add_subscriber(stream, initial);
             }
             ChannelEvent::Closed => {
                 tracing::warn!("Event socket channel closed");
@@ -360,6 +354,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_millis(100)
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
+        data.state.flush_pending_focus_publish();
 
         // Process pending surface state (sends wl_surface.enter/leave)
         // BEFORE flushing so clients receive enter events in the same

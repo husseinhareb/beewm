@@ -8,8 +8,6 @@ mod workspace;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +15,7 @@ use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::sync::Fence;
 use smithay::backend::session::libseat::LibSeatSession;
-use smithay::reexports::input::Device as LibinputDevice;
+
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::xkb;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
@@ -35,7 +33,9 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::drm_syncobj::{DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::pointer_constraints::{PointerConstraintsState, with_pointer_constraint};
 use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
@@ -54,6 +54,7 @@ use crate::model::workspace::Workspace;
 use crate::xwayland::PendingX11Window;
 
 use super::commands::ChildEnvironment;
+use super::event_broadcast::EventBroadcaster;
 use super::screencopy::{PendingScreencopyFrame, create_screencopy_global};
 
 use super::cursor::CursorThemeManager;
@@ -113,6 +114,14 @@ pub struct Beewm {
     /// When `Some`, takes priority over the client-requested `cursor_status`.
     pub compositor_cursor_icon: Option<CursorIcon>,
     pub _cursor_shape_manager_state: CursorShapeManagerState,
+    /// Keeps the zwp_relative_pointer_manager_v1 global alive so clients can
+    /// subscribe to relative mouse motion events (needed by games).
+    pub _relative_pointer_state: RelativePointerManagerState,
+    /// Protocol state for zwp_pointer_constraints_v1 (pointer lock / confinement).
+    pub _pointer_constraints_state: PointerConstraintsState,
+    /// The surface that held keyboard focus during the last focus_changed event.
+    /// Used to deactivate pointer-lock constraints when focus leaves a surface.
+    pub prev_keyboard_focus: Option<WlSurface>,
 
     // Session (for VT switching in TTY mode)
     pub session: Option<LibSeatSession>,
@@ -161,13 +170,18 @@ pub struct Beewm {
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
     /// Outstanding zwlr_screencopy_frame_v1 objects waiting for a buffer copy.
     pub pending_screencopy_frames: Vec<PendingScreencopyFrame>,
-    /// Libinput keyboard devices; used to sync LED state (Caps/Num/Scroll Lock) back to hardware.
-    pub keyboard_devices: Vec<LibinputDevice>,
     /// Compositor-specific environment for spawned child processes.
     pub(crate) child_env: ChildEnvironment,
-    /// Connected event-socket subscribers. beewm pushes `event>>data\n` lines
-    /// to each stream on every state change. Streams that error are dropped.
-    pub event_subscribers: Vec<UnixStream>,
+    /// Pushes `event>>data\n` lines to event-socket subscribers from a
+    /// dedicated background thread — the main loop never blocks on socket I/O.
+    pub event_broadcaster: EventBroadcaster,
+    /// When true, `publish_focused_window_state` will be called once after the
+    /// next `event_loop.dispatch()` returns. Setting this from inside dispatch
+    /// callbacks (focus_changed, title_changed, X11 property_notify) is safe;
+    /// calling `publish_focused_window_state` directly from those callbacks is
+    /// NOT, because it re-enters `with_states` on a surface whose cached_state
+    /// lock the caller is already holding, deadlocking the entire main loop.
+    pub(crate) focus_publish_pending: bool,
     /// Startup commands are delayed until both an output exists and XWayland startup has settled.
     pub(crate) startup_commands_spawned: bool,
     pub(crate) outputs_ready_for_startup: bool,
@@ -212,8 +226,10 @@ impl Beewm {
         let border_color_focused = hex_to_color32f(config.border_color_focused);
         let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
         let cursor_shape_manager_state_ = CursorShapeManagerState::new::<Self>(&display_handle);
+        let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
 
-        let mut state = Self {
+        let state = Self {
             running: true,
             config,
             start_time: std::time::Instant::now(),
@@ -245,6 +261,9 @@ impl Beewm {
             cursor_theme: CursorThemeManager::new(),
             compositor_cursor_icon: None,
             _cursor_shape_manager_state: cursor_shape_manager_state_,
+            _relative_pointer_state: relative_pointer_state,
+            _pointer_constraints_state: pointer_constraints_state,
+            prev_keyboard_focus: None,
             session: None,
             space: Space::default(),
             layout_manager,
@@ -268,8 +287,8 @@ impl Beewm {
             border_color_unfocused,
             syncobj_blocker_installer: None,
             pending_screencopy_frames: Vec::new(),
-            keyboard_devices: Vec::new(),
-            event_subscribers: Vec::new(),
+            event_broadcaster: EventBroadcaster::new(),
+            focus_publish_pending: false,
             child_env: ChildEnvironment::default(),
             startup_commands_spawned: false,
             outputs_ready_for_startup: false,
@@ -396,7 +415,10 @@ impl Beewm {
         });
     }
 
-    pub(crate) fn publish_workspace_state(&mut self) {
+    pub(crate) fn publish_workspace_state(&self) {
+        if super::runtime_flags::flags().workspace_publish_disabled {
+            return;
+        }
         let active_workspace = active_workspace_state_contents(self.active_workspace);
         if let Err(error) =
             write_state_file_atomically(Path::new(ACTIVE_WORKSPACE_STATE_PATH), &active_workspace)
@@ -418,14 +440,74 @@ impl Beewm {
         }
 
         let workspace_num = self.active_workspace + 1;
-        self.push_event(&format!("workspace>>{workspace_num}"));
+        self.event_broadcaster.push_event(&format!("workspace>>{workspace_num}"));
+    }
+
+    /// Mark the focused-window IPC state as needing a republish. Cheap and
+    /// safe to call from any dispatch callback. The actual file write +
+    /// event push happens in `flush_pending_focus_publish` after dispatch.
+    pub(crate) fn request_focus_publish(&mut self) {
+        self.focus_publish_pending = true;
+    }
+
+    /// If a republish was requested during the last dispatch, do it now.
+    /// MUST be called from the main loop AFTER `event_loop.dispatch()`
+    /// returns, never from inside a dispatch callback (see field doc on
+    /// `focus_publish_pending`).
+    pub(crate) fn flush_pending_focus_publish(&mut self) {
+        if !self.focus_publish_pending {
+            return;
+        }
+        self.focus_publish_pending = false;
+        self.publish_focused_window_state();
+    }
+
+    /// Deactivate any active pointer-lock or confinement constraint on `surface`.
+    /// Called when keyboard focus leaves a surface to release games from their lock.
+    pub fn deactivate_pointer_constraint_for(&mut self, surface: &WlSurface) {
+        let pointer = match self.seat.get_pointer() {
+            Some(p) => p,
+            None => return,
+        };
+        with_pointer_constraint(surface, &pointer, |constraint| {
+            if let Some(c) = constraint {
+                if c.is_active() {
+                    c.deactivate();
+                }
+            }
+        });
+    }
+
+    /// Activate a pending pointer-lock or confinement constraint on `surface`.
+    /// Called when keyboard focus arrives at a surface that has a pending constraint.
+    pub fn activate_pointer_constraint_for(&mut self, surface: &WlSurface) {
+        let pointer = match self.seat.get_pointer() {
+            Some(p) => p,
+            None => return,
+        };
+        with_pointer_constraint(surface, &pointer, |constraint| {
+            if let Some(c) = constraint {
+                if !c.is_active() {
+                    c.activate();
+                }
+            }
+        });
     }
 
     /// Publish the title of the currently-focused window.
     ///
     /// Writes to `/tmp/beewm_window` for compatibility with polling tools and
     /// pushes a `window>>title` event to all connected event-socket subscribers.
-    pub(crate) fn publish_focused_window_state(&mut self) {
+    ///
+    /// DO NOT call this directly from a Wayland dispatch callback (focus_changed,
+    /// title_changed, X11 property_notify, etc) - it calls `with_states` on the
+    /// focused toplevel, and those callbacks already hold that surface's
+    /// cached_state lock, so re-entering it deadlocks the main loop. Use
+    /// `request_focus_publish` from those paths instead.
+    pub(crate) fn publish_focused_window_state(&self) {
+        if super::runtime_flags::flags().focus_ipc_disabled {
+            return;
+        }
         let title = self
             .active_workspace_focused_window()
             .map(focused_window_title)
@@ -437,17 +519,7 @@ impl Beewm {
                 error
             );
         }
-        self.push_event(&format!("window>>{title}"));
-    }
-
-    /// Push a `event>>data\n` line to every connected event-socket subscriber.
-    /// Subscribers that error (disconnected, full buffer) are silently dropped.
-    pub(crate) fn push_event(&mut self, event: &str) {
-        let mut payload = String::with_capacity(event.len() + 1);
-        payload.push_str(event);
-        payload.push('\n');
-        self.event_subscribers
-            .retain_mut(|stream| stream.write_all(payload.as_bytes()).is_ok());
+        self.event_broadcaster.push_event(&format!("window>>{title}"));
     }
 }
 
