@@ -20,6 +20,7 @@ use smithay::desktop::{
     find_popup_root_surface, layer_map_for_output, LayerSurface as DesktopLayerSurface,
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, Window, WindowSurfaceType,
 };
+use smithay::input::keyboard::LedState;
 use smithay::input::pointer::{CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
@@ -420,6 +421,13 @@ impl SeatHandler for Beewm {
         let client = focused.and_then(|s| s.client());
         set_data_device_focus::<Self>(&self.display_handle, seat, client.clone());
         set_primary_focus::<Self>(&self.display_handle, seat, client);
+    }
+
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        let leds = led_state.into();
+        for device in &mut self.keyboard_devices {
+            device.led_update(leds);
+        }
     }
 }
 

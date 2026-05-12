@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
@@ -22,8 +23,7 @@ use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
 use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
-use smithay::reexports::input::Libinput;
-use smithay::reexports::input::ScrollMethod;
+use smithay::reexports::input::{DeviceCapability, Libinput, ScrollMethod};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
@@ -84,6 +84,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Beewm::new(&display, config);
     let (_ipc_server, ipc_channel) = ipc::start()?;
+    let (_event_server, event_channel) = ipc::start_event_listener()?;
 
     // Clone the display fd before moving display into UdevData — used to
     // wake calloop when clients send data.
@@ -211,6 +212,31 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
+    event_loop
+        .handle()
+        .insert_source(event_channel, |event, _, data| match event {
+            ChannelEvent::Msg(stream) => {
+                if let Err(error) = stream.set_nonblocking(true) {
+                    tracing::warn!("Failed to set event subscriber to non-blocking: {}", error);
+                    return;
+                }
+                // Send the subscriber the current state immediately so it
+                // does not have to wait for the next state change.
+                let title = data
+                    .state
+                    .active_workspace_focused_window()
+                    .map(crate::compositor::state::focused_window_title)
+                    .unwrap_or_default();
+                let workspace_num = data.state.active_workspace + 1;
+                let mut stream = stream;
+                let _ = write!(stream, "window>>{title}\nworkspace>>{workspace_num}\n");
+                data.state.event_subscribers.push(stream);
+            }
+            ChannelEvent::Closed => {
+                tracing::warn!("Event socket channel closed");
+            }
+        })?;
+
     // Watch the config file for changes and reload automatically on save.
     match config_watcher::make_config_watch_fd(&Config::config_path()) {
         Ok((watch_fd, config_filename)) => {
@@ -287,6 +313,13 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
+                if device.has_capability(DeviceCapability::Keyboard) {
+                    data.state.keyboard_devices.push(device.clone());
+                }
+                return;
+            }
+            if let InputEvent::DeviceRemoved { device } = event {
+                data.state.keyboard_devices.retain(|d| d != &device);
                 return;
             }
             crate::compositor::input::handle_input(&mut data.state, event);

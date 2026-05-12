@@ -8,6 +8,8 @@ mod workspace;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,6 +17,7 @@ use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::sync::Fence;
 use smithay::backend::session::libseat::LibSeatSession;
+use smithay::reexports::input::Device as LibinputDevice;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::xkb;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
@@ -158,8 +161,13 @@ pub struct Beewm {
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
     /// Outstanding zwlr_screencopy_frame_v1 objects waiting for a buffer copy.
     pub pending_screencopy_frames: Vec<PendingScreencopyFrame>,
+    /// Libinput keyboard devices; used to sync LED state (Caps/Num/Scroll Lock) back to hardware.
+    pub keyboard_devices: Vec<LibinputDevice>,
     /// Compositor-specific environment for spawned child processes.
     pub(crate) child_env: ChildEnvironment,
+    /// Connected event-socket subscribers. beewm pushes `event>>data\n` lines
+    /// to each stream on every state change. Streams that error are dropped.
+    pub event_subscribers: Vec<UnixStream>,
     /// Startup commands are delayed until both an output exists and XWayland startup has settled.
     pub(crate) startup_commands_spawned: bool,
     pub(crate) outputs_ready_for_startup: bool,
@@ -205,7 +213,7 @@ impl Beewm {
         let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
         let cursor_shape_manager_state_ = CursorShapeManagerState::new::<Self>(&display_handle);
 
-        let state = Self {
+        let mut state = Self {
             running: true,
             config,
             start_time: std::time::Instant::now(),
@@ -260,6 +268,8 @@ impl Beewm {
             border_color_unfocused,
             syncobj_blocker_installer: None,
             pending_screencopy_frames: Vec::new(),
+            keyboard_devices: Vec::new(),
+            event_subscribers: Vec::new(),
             child_env: ChildEnvironment::default(),
             startup_commands_spawned: false,
             outputs_ready_for_startup: false,
@@ -386,7 +396,7 @@ impl Beewm {
         });
     }
 
-    pub(crate) fn publish_workspace_state(&self) {
+    pub(crate) fn publish_workspace_state(&mut self) {
         let active_workspace = active_workspace_state_contents(self.active_workspace);
         if let Err(error) =
             write_state_file_atomically(Path::new(ACTIVE_WORKSPACE_STATE_PATH), &active_workspace)
@@ -406,13 +416,16 @@ impl Beewm {
                 error
             );
         }
+
+        let workspace_num = self.active_workspace + 1;
+        self.push_event(&format!("workspace>>{workspace_num}"));
     }
 
-    /// Publish the title of the currently-focused window to
-    /// `/tmp/beewm_window`. Called by the focus + title-change hooks; status
-    /// bars / IPC subscribers can either poll this file or watch it with
-    /// inotify (beebar does the latter).
-    pub(crate) fn publish_focused_window_state(&self) {
+    /// Publish the title of the currently-focused window.
+    ///
+    /// Writes to `/tmp/beewm_window` for compatibility with polling tools and
+    /// pushes a `window>>title` event to all connected event-socket subscribers.
+    pub(crate) fn publish_focused_window_state(&mut self) {
         let title = self
             .active_workspace_focused_window()
             .map(focused_window_title)
@@ -424,6 +437,17 @@ impl Beewm {
                 error
             );
         }
+        self.push_event(&format!("window>>{title}"));
+    }
+
+    /// Push a `event>>data\n` line to every connected event-socket subscriber.
+    /// Subscribers that error (disconnected, full buffer) are silently dropped.
+    pub(crate) fn push_event(&mut self, event: &str) {
+        let mut payload = String::with_capacity(event.len() + 1);
+        payload.push_str(event);
+        payload.push('\n');
+        self.event_subscribers
+            .retain_mut(|stream| stream.write_all(payload.as_bytes()).is_ok());
     }
 }
 

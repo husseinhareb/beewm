@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::time::Duration;
 
@@ -181,6 +182,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let state = Beewm::new(&display, config);
     let display_fd = display.as_fd().try_clone_to_owned()?;
     let (_ipc_server, ipc_channel) = ipc::start()?;
+    let (_event_server, event_channel) = ipc::start_event_listener()?;
 
     let mut data = WinitData {
         state,
@@ -229,6 +231,29 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             ChannelEvent::Msg(command) => ipc::apply_command(&mut data.state, command),
             ChannelEvent::Closed => {
                 tracing::warn!("Workspace IPC channel closed");
+            }
+        })?;
+
+    event_loop
+        .handle()
+        .insert_source(event_channel, |event, _, data| match event {
+            ChannelEvent::Msg(stream) => {
+                if let Err(error) = stream.set_nonblocking(true) {
+                    tracing::warn!("Failed to set event subscriber to non-blocking: {}", error);
+                    return;
+                }
+                let title = data
+                    .state
+                    .active_workspace_focused_window()
+                    .map(crate::compositor::state::focused_window_title)
+                    .unwrap_or_default();
+                let workspace_num = data.state.active_workspace + 1;
+                let mut stream = stream;
+                let _ = write!(stream, "window>>{title}\nworkspace>>{workspace_num}\n");
+                data.state.event_subscribers.push(stream);
+            }
+            ChannelEvent::Closed => {
+                tracing::warn!("Event socket channel closed");
             }
         })?;
 
