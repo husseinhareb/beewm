@@ -33,7 +33,9 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::drm_syncobj::{DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::output::OutputManagerState;
-use smithay::wayland::pointer_constraints::{PointerConstraintsState, with_pointer_constraint};
+use smithay::wayland::pointer_constraints::{
+    PointerConstraint, PointerConstraintsState, with_pointer_constraint,
+};
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -464,34 +466,43 @@ impl Beewm {
 
     /// Deactivate any active pointer-lock or confinement constraint on `surface`.
     /// Called when keyboard focus leaves a surface to release games from their lock.
-    pub fn deactivate_pointer_constraint_for(&mut self, surface: &WlSurface) {
+    pub fn deactivate_pointer_constraint_for(&mut self, surface: &WlSurface) -> bool {
         let pointer = match self.seat.get_pointer() {
             Some(p) => p,
-            None => return,
+            None => return false,
         };
+
+        let mut deactivated_locked = false;
         with_pointer_constraint(surface, &pointer, |constraint| {
             if let Some(c) = constraint {
+                let is_locked = matches!(*c, PointerConstraint::Locked(_));
                 if c.is_active() {
                     c.deactivate();
+                    deactivated_locked = is_locked;
                 }
             }
         });
+        deactivated_locked
     }
 
     /// Activate a pending pointer-lock or confinement constraint on `surface`.
     /// Called when keyboard focus arrives at a surface that has a pending constraint.
-    pub fn activate_pointer_constraint_for(&mut self, surface: &WlSurface) {
+    pub fn activate_pointer_constraint_for(&mut self, surface: &WlSurface) -> bool {
         let pointer = match self.seat.get_pointer() {
             Some(p) => p,
-            None => return,
+            None => return false,
         };
+
+        let mut locked_constraint = false;
         with_pointer_constraint(surface, &pointer, |constraint| {
             if let Some(c) = constraint {
+                locked_constraint = matches!(*c, PointerConstraint::Locked(_));
                 if !c.is_active() {
                     c.activate();
                 }
             }
         });
+        locked_constraint
     }
 
     /// Publish the title of the currently-focused window.

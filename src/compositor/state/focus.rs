@@ -175,7 +175,9 @@ impl Beewm {
         // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.
         if focused.is_none() {
             if let Some(prev) = self.prev_keyboard_focus.take() {
-                self.deactivate_pointer_constraint_for(&prev);
+                if self.deactivate_pointer_constraint_for(&prev) {
+                    self.set_cursor_status(smithay::input::pointer::CursorImageStatus::default_named());
+                }
             }
             self.note_keyboard_focus_change(None);
         }

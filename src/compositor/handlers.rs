@@ -32,7 +32,9 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Serial};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint};
+use smithay::wayland::pointer_constraints::{
+    PointerConstraint, PointerConstraintsHandler, with_pointer_constraint,
+};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, get_parent, send_surface_state,
     with_states,
@@ -269,6 +271,80 @@ impl XdgShellHandler for Beewm {
         }
     }
 
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        let Some(window) = self.mapped_window_for_surface(surface.wl_surface()) else {
+            surface.send_configure();
+            return;
+        };
+
+        let already_fullscreen = self
+            .fullscreen_window
+            .as_ref()
+            .map(|fullscreen| fullscreen == &window)
+            .unwrap_or(false);
+        if already_fullscreen {
+            return;
+        }
+        if self.fullscreen_window.is_some() {
+            self.restore_fullscreen();
+        }
+
+        let Some(output) = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .or_else(|| self.space.outputs().next().cloned())
+        else {
+            surface.send_configure();
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            surface.send_configure();
+            return;
+        };
+
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace
+                    .windows
+                    .iter()
+                    .any(|candidate| *candidate == window)
+                    .then_some(ws_idx)
+            })
+            .unwrap_or(self.active_workspace);
+
+        for sibling in &self.workspaces[ws_idx].windows {
+            if *sibling != window {
+                self.space.unmap_elem(sibling);
+            }
+        }
+
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Fullscreen);
+            state.size = Some(output_geo.size);
+        });
+        surface.send_configure();
+        self.space.map_element(window.clone(), output_geo.loc, true);
+        self.fullscreen_window = Some(window.clone());
+        self.set_keyboard_focus(Some(surface.wl_surface().clone()));
+        self.needs_render = true;
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let is_current_fullscreen = self
+            .fullscreen_window
+            .as_ref()
+            .and_then(|window| window.toplevel())
+            .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
+            .unwrap_or(false);
+
+        if is_current_fullscreen {
+            self.restore_fullscreen();
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         // Remove windows that died before their first commit.
         let target_surface = surface.wl_surface();
@@ -424,10 +500,14 @@ impl SeatHandler for Beewm {
         // activate on the newly focused one so games get/lose their pointer lock
         // automatically with keyboard focus.
         if let Some(prev) = self.prev_keyboard_focus.take() {
-            self.deactivate_pointer_constraint_for(&prev);
+            if self.deactivate_pointer_constraint_for(&prev) {
+                self.set_cursor_status(CursorImageStatus::default_named());
+            }
         }
         if let Some(surface) = focused {
-            self.activate_pointer_constraint_for(surface);
+            if self.activate_pointer_constraint_for(surface) {
+                self.set_cursor_status(CursorImageStatus::Hidden);
+            }
         }
         self.prev_keyboard_focus = focused.cloned();
 
@@ -578,13 +658,19 @@ impl PointerConstraintsHandler for Beewm {
         // The Wayland spec requires activation when the surface has pointer focus; we
         // satisfy this because games only call lock_pointer when they are focused.
         // Deactivation happens in focus_changed when the surface loses keyboard focus.
+        let mut locked_pointer = false;
         with_pointer_constraint(surface, pointer, |constraint| {
             if let Some(c) = constraint {
+                locked_pointer = matches!(*c, PointerConstraint::Locked(_));
                 if !c.is_active() {
                     c.activate();
                 }
             }
         });
+
+        if locked_pointer {
+            self.set_cursor_status(CursorImageStatus::Hidden);
+        }
     }
 
     fn cursor_position_hint(
