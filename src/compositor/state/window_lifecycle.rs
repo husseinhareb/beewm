@@ -11,26 +11,51 @@ use super::popup::should_map_toplevel_floating;
 use super::{Beewm, FloatingWindowData, root_surface};
 
 impl Beewm {
-    fn centered_floating_data(&self, window: &Window) -> Option<(WlSurface, FloatingWindowData)> {
+    pub(crate) fn centered_floating_data(&self, window: &Window) -> Option<(WlSurface, FloatingWindowData)> {
         let root = window
             .wl_surface()
             .map(|surface| root_surface(&surface.into_owned()))?;
         let output = self.space.outputs().next().cloned()?;
         let output_geo = self.space.output_geometry(&output)?;
-        let win_size = window.geometry().size;
-        let win_w = if win_size.w > 0 {
-            win_size.w
-        } else {
-            output_geo.size.w / 2
+        // Centre inside the non-exclusive zone so the dialog never slides under
+        // beebar or other layer-shell exclusive surfaces.
+        let non_exclusive = {
+            let lm = smithay::desktop::layer_map_for_output(&output);
+            lm.non_exclusive_zone()
         };
-        let win_h = if win_size.h > 0 {
-            win_size.h
-        } else {
-            output_geo.size.h / 2
+        let usable_origin = output_geo.loc + non_exclusive.loc;
+        let usable_size = non_exclusive.size;
+        // Prefer the client's natural geometry; fall back to xdg max_size, then
+        // to half the usable area. Clamp to the usable area so a stale tile-size
+        // geometry (sent before we knew the window was floating) cannot push
+        // the centred origin negative.
+        let geo_size = window.geometry().size;
+        let max_size = window
+            .toplevel()
+            .and_then(|toplevel| {
+                smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                    let mut cached = states
+                        .cached_state
+                        .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+                    Some(cached.current().max_size)
+                })
+            })
+            .unwrap_or_else(|| Size::from((0, 0)));
+        let pick = |natural: i32, capped: i32, fallback: i32| -> i32 {
+            let raw = if natural > 0 {
+                natural
+            } else if capped > 0 {
+                capped
+            } else {
+                fallback
+            };
+            raw.min(fallback).max(1)
         };
+        let win_w = pick(geo_size.w, max_size.w, usable_size.w);
+        let win_h = pick(geo_size.h, max_size.h, usable_size.h);
         let pos = Point::from((
-            output_geo.loc.x + (output_geo.size.w - win_w) / 2,
-            output_geo.loc.y + (output_geo.size.h - win_h) / 2,
+            usable_origin.x + (usable_size.w - win_w) / 2,
+            usable_origin.y + (usable_size.h - win_h) / 2,
         ));
 
         Some((
@@ -226,13 +251,27 @@ impl Beewm {
 
     /// Float a newly-mapped window centered on the screen using its own
     /// natural size.
+    ///
+    /// For Wayland toplevels we additionally send a `size = None` configure to
+    /// release any tile-size hint we may have sent in `new_toplevel` (before we
+    /// knew the surface was a dialog). The client will commit again at its
+    /// natural size; that commit is intercepted via `pending_float_centers` to
+    /// re-centre the window precisely.
     pub fn map_as_floating_centered(&mut self, window: &Window) {
         let Some((root, floating)) = self.centered_floating_data(window) else {
             return;
         };
 
-        self.floating_windows.insert(root, floating);
+        self.floating_windows.insert(root.clone(), floating);
         self.space.map_element(window.clone(), floating.position, true);
+
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.size = None;
+            });
+            toplevel.send_configure();
+            self.pending_float_centers.insert(root);
+        }
     }
 
     pub(crate) fn adopt_floating_dialog_state(&mut self, surface: &ToplevelSurface) {
@@ -262,18 +301,37 @@ impl Beewm {
             return;
         }
 
-        let Some((root, floating)) = self.centered_floating_data(&window) else {
+        let Some(root) = window
+            .wl_surface()
+            .map(|s| root_surface(&s.into_owned()))
+        else {
             return;
         };
         let Some(workspace_idx) = self.workspace_idx_for_surface(&root) else {
             return;
         };
 
+        // Ask the client to release its tiled size and commit at its natural
+        // (unconstrained) size.  We'll re-center the floating entry once the
+        // client responds with that commit.
+        surface.with_pending_state(|state| {
+            state.size = None;
+        });
+        surface.send_configure();
+        self.pending_float_centers.insert(root.clone());
+
         let was_floating = self.is_root_floating(&root);
         if !was_floating {
             self.remove_tiled_window(workspace_idx, &root);
         }
-        self.floating_windows.insert(root, floating);
+        // Insert a placeholder at the output centre; it will be corrected when
+        // the client commits at its natural size.
+        let placeholder = if let Some((_, floating)) = self.centered_floating_data(&window) {
+            floating
+        } else {
+            return;
+        };
+        self.floating_windows.insert(root, placeholder);
 
         if workspace_idx == self.active_workspace {
             self.relayout();

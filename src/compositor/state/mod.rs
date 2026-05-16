@@ -6,7 +6,7 @@ mod tiling;
 mod window_lifecycle;
 mod workspace;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,6 +158,11 @@ pub struct Beewm {
     /// The key is the root WlSurface; the value is where the window is placed
     /// and how large it should be when restored.
     pub floating_windows: HashMap<WlSurface, FloatingWindowData>,
+    /// Root WlSurfaces whose window was transitioned from tiled to floating
+    /// mid-session. We sent a `size = None` configure so the client will
+    /// re-commit at its natural size; on that next commit we re-center the
+    /// floating entry to match the client's actual size.
+    pub(crate) pending_float_centers: HashSet<WlSurface>,
     /// Active pointer grab (move, resize, or tiled swap). Only one can be
     /// active at a time.
     pub active_grab: Option<ActiveGrab>,
@@ -282,6 +287,7 @@ impl Beewm {
             fullscreen_window: None,
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
+            pending_float_centers: HashSet::new(),
             active_grab: None,
             tiled_swap_target: None,
             resolved_keybinds,

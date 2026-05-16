@@ -57,13 +57,14 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::dialog::XdgDialogHandler;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use super::state::{Beewm, lookup_client_compositor_state};
+use super::state::{Beewm, lookup_client_compositor_state, root_surface};
 use super::state::popup::should_map_toplevel_floating;
 
 impl Beewm {
@@ -124,15 +125,17 @@ impl CompositorHandler for Beewm {
         }) {
             let window = self.pending_windows.remove(pos);
             let ws_idx = self.active_workspace;
-            // Dialogs and fixed-size splash/loading windows should float
-            // centered instead of being tiled or inheriting a (0, 0) origin.
-            let should_float = should_map_toplevel_floating(&window);
             let split_target = self.focused_tiled_window_root(ws_idx);
             self.workspaces[ws_idx].add_window(window.clone());
             self.publish_workspace_state();
             self.track_window(&window);
-            // Propagate the first commit through the window's surface tree.
+            // Propagate the first commit through the window's surface tree so
+            // that cached state (including min/max size set by the client in its
+            // first-commit batch) is up-to-date before we decide whether to float.
             window.on_commit();
+            // Dialogs and fixed-size splash/loading windows should float
+            // centered instead of being tiled or inheriting a (0, 0) origin.
+            let should_float = should_map_toplevel_floating(&window);
             if should_float {
                 self.map_as_floating_centered(&window);
                 self.relayout();
@@ -155,6 +158,24 @@ impl CompositorHandler for Beewm {
         // scanning the whole visible space on every subsurface commit.
         if let Some(window) = self.mapped_window_for_surface(surface) {
             window.on_commit();
+
+            // If we previously sent a `size = None` configure to release this
+            // window from its tiled dimensions, re-center it now that the client
+            // has committed at its natural size.
+            let root = root_surface(surface);
+            if self.pending_float_centers.remove(&root) {
+                if let Some((_, floating)) = self.centered_floating_data(&window) {
+                    self.floating_windows.insert(root, floating);
+                    self.relayout();
+                    self.space.raise_element(&window, true);
+                    if let Some(wl_surface) =
+                        window.wl_surface().map(|s| s.into_owned())
+                    {
+                        self.set_keyboard_focus(Some(wl_surface));
+                    }
+                }
+            }
+
             self.needs_render = true;
         }
 

@@ -41,19 +41,48 @@ pub(crate) fn should_map_toplevel_floating(window: &Window) -> bool {
     };
 
     smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
-        let is_dialog = states
+        let (has_parent, is_modal, title, app_id) = states
             .data_map
             .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
             .map(|role| {
                 let role = role.lock().unwrap();
-                role.parent.is_some() || role.modal
+                (
+                    role.parent.is_some(),
+                    role.modal,
+                    role.title.clone(),
+                    role.app_id.clone(),
+                )
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false, None, None));
         let mut cached = states
             .cached_state
             .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
         let current = *cached.current();
-        is_dialog || (is_fixed_size(current.min_size) && current.min_size == current.max_size)
+        // A client that announces *any* maximum-size cap is telling us it has a
+        // preferred bounded size — dialog-like behaviour. We treat this as a
+        // floating hint even when min_size != max_size (many GTK dialogs only
+        // set max_size, or set min_size to a much smaller floor than max_size).
+        let has_size_cap = current.max_size.w > 0 || current.max_size.h > 0;
+        // Strictly fixed-size (min == max, both positive) is the textbook
+        // non-resizable-dialog signal. Keep it for the case where max_size is
+        // not set independently of min_size.
+        let is_fixed =
+            is_fixed_size(current.min_size) && current.min_size == current.max_size;
+        let should_float = has_parent || is_modal || has_size_cap || is_fixed;
+        tracing::debug!(
+            target = "beewm::floating",
+            ?title,
+            ?app_id,
+            has_parent,
+            is_modal,
+            min_size = ?current.min_size,
+            max_size = ?current.max_size,
+            has_size_cap,
+            is_fixed,
+            should_float,
+            "should_map_toplevel_floating decision",
+        );
+        should_float
     })
 }
 
