@@ -96,4 +96,29 @@ impl Beewm {
         self.layout_manager
             .remove(workspace_idx, &root_surface(surface));
     }
+
+    /// Re-raise every floating window of the active workspace so that they
+    /// sit above all tiled windows in the space's z-stack.
+    ///
+    /// Re-raising in `workspaces[ws].windows` insertion order preserves the
+    /// relative stacking of multiple floating windows: the most recently
+    /// inserted one ends up on top because it is raised last.
+    pub(crate) fn raise_floating_windows(&mut self) {
+        let ws_idx = self.active_workspace;
+        let floating: Vec<Window> = self.workspaces[ws_idx]
+            .windows
+            .iter()
+            .filter(|window| {
+                Self::window_root_surface(window)
+                    .map(|root| self.is_root_floating(&root))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for window in floating {
+            // `activate = false` so the floating windows' xdg activated state is
+            // not toggled — only their z-position is corrected.
+            self.space.raise_element(&window, false);
+        }
+    }
 }

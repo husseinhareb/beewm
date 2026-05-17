@@ -25,34 +25,51 @@ impl Beewm {
         };
         let usable_origin = output_geo.loc + non_exclusive.loc;
         let usable_size = non_exclusive.size;
-        // Prefer the client's natural geometry; fall back to xdg max_size, then
-        // to half the usable area. Clamp to the usable area so a stale tile-size
-        // geometry (sent before we knew the window was floating) cannot push
-        // the centred origin negative.
-        let geo_size = window.geometry().size;
-        let max_size = window
+
+        let (min_size, max_size) = window
             .toplevel()
-            .and_then(|toplevel| {
+            .map(|toplevel| {
                 smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
                     let mut cached = states
                         .cached_state
                         .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
-                    Some(cached.current().max_size)
+                    let current = cached.current();
+                    (current.min_size, current.max_size)
                 })
             })
-            .unwrap_or_else(|| Size::from((0, 0)));
-        let pick = |natural: i32, capped: i32, fallback: i32| -> i32 {
-            let raw = if natural > 0 {
-                natural
-            } else if capped > 0 {
-                capped
+            .unwrap_or_else(|| (Size::from((0, 0)), Size::from((0, 0))));
+        let bbox_size = window.bbox().size;
+        let geo_size = window.geometry().size;
+
+        // Pick the most authoritative size hint we have. The stale tile-size
+        // committed before we knew this window was floating tends to match the
+        // full usable area on one or both axes — treating bbox/geo == usable as
+        // "unreliable" prevents centring a tile-sized rectangle (which collapses
+        // to a corner placement).
+        let pick_axis = |max: i32, bbox: i32, geo: i32, fallback: i32, usable: i32| -> i32 {
+            let candidate = if max > 0 {
+                max
+            } else if bbox > 0 && bbox < usable {
+                bbox
+            } else if geo > 0 && geo < usable {
+                geo
             } else {
                 fallback
             };
-            raw.min(fallback).max(1)
+            candidate.min(usable).max(1)
         };
-        let win_w = pick(geo_size.w, max_size.w, usable_size.w);
-        let win_h = pick(geo_size.h, max_size.h, usable_size.h);
+
+        let default_w = ((usable_size.w / 3).max(320)).min(usable_size.w.max(1));
+        let default_h = ((usable_size.h / 3).max(200)).min(usable_size.h.max(1));
+        let mut win_w = pick_axis(max_size.w, bbox_size.w, geo_size.w, default_w, usable_size.w);
+        let mut win_h = pick_axis(max_size.h, bbox_size.h, geo_size.h, default_h, usable_size.h);
+        if min_size.w > 0 {
+            win_w = win_w.max(min_size.w).min(usable_size.w.max(1));
+        }
+        if min_size.h > 0 {
+            win_h = win_h.max(min_size.h).min(usable_size.h.max(1));
+        }
+
         let pos = Point::from((
             usable_origin.x + (usable_size.w - win_w) / 2,
             usable_origin.y + (usable_size.h - win_h) / 2,
@@ -336,6 +353,7 @@ impl Beewm {
         if workspace_idx == self.active_workspace {
             self.relayout();
             self.space.raise_element(&window, true);
+            self.raise_floating_windows();
             if let Some(wl_surface) = window.wl_surface().map(|surface| surface.into_owned()) {
                 self.set_keyboard_focus(Some(wl_surface));
             }

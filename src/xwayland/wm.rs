@@ -60,6 +60,10 @@ impl Beewm {
                 }
 
                 self.space.raise_element(&window, true);
+                // Keep floating windows above any tiled windows that were just
+                // raised; without this an X11 dialog opening while another
+                // tiled window is mapped would be occluded.
+                self.raise_floating_windows();
 
                 let geometry = self
                     .space
@@ -350,7 +354,7 @@ impl XwmHandler for Beewm {
         h: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        let mut geometry = self
+        let mapped = self
             .space
             .elements()
             .find(|candidate| {
@@ -359,20 +363,44 @@ impl XwmHandler for Beewm {
                     .map(|surface| surface == &window)
                     .unwrap_or(false)
             })
+            .cloned();
+
+        // Look up our authoritative floating geometry (if any) — for managed
+        // floating windows the compositor owns the position, so client-side
+        // configure requests must not be allowed to re-anchor the window at
+        // its own preferred coordinates (typically (0, 0)).
+        let floating = mapped
+            .as_ref()
+            .and_then(Self::window_root_surface)
+            .and_then(|root| self.floating_windows.get(&root).copied());
+
+        let mut geometry = mapped
+            .as_ref()
             .and_then(|window| self.space.element_geometry(window))
             .unwrap_or_else(|| window.geometry());
 
-        if let Some(x) = x {
-            geometry.loc.x = x;
-        }
-        if let Some(y) = y {
-            geometry.loc.y = y;
-        }
-        if let Some(w) = w {
-            geometry.size.w = w as i32;
-        }
-        if let Some(h) = h {
-            geometry.size.h = h as i32;
+        if let Some(floating) = floating {
+            // Pin the position; honour size requests only.
+            geometry.loc = floating.position;
+            if let Some(w) = w {
+                geometry.size.w = w as i32;
+            }
+            if let Some(h) = h {
+                geometry.size.h = h as i32;
+            }
+        } else {
+            if let Some(x) = x {
+                geometry.loc.x = x;
+            }
+            if let Some(y) = y {
+                geometry.loc.y = y;
+            }
+            if let Some(w) = w {
+                geometry.size.w = w as i32;
+            }
+            if let Some(h) = h {
+                geometry.size.h = h as i32;
+            }
         }
 
         if let Err(error) = window.configure(geometry) {
@@ -416,11 +444,24 @@ impl XwmHandler for Beewm {
 
         if let Some(root) = Self::window_root_surface(&mapped) {
             if self.is_root_floating(&root) {
+                // Preserve the compositor-chosen position; only adopt the size
+                // the client just configured itself with. configure_notify is
+                // driven by the X11 server's view of the window's geometry
+                // (which may include a client-side request we already rejected
+                // in configure_request) — re-anchoring here would let the
+                // dialog snap back to its preferred origin.
+                let stored_pos = self
+                    .floating_windows
+                    .get(&root)
+                    .copied()
+                    .map(|data| data.position)
+                    .unwrap_or(geometry.loc);
                 self.floating_windows.insert(
                     root,
-                    crate::compositor::types::FloatingWindowData::new(geometry.loc, geometry.size),
+                    crate::compositor::types::FloatingWindowData::new(stored_pos, geometry.size),
                 );
-                self.space.map_element(mapped, geometry.loc, false);
+                self.space.map_element(mapped, stored_pos, false);
+                self.raise_floating_windows();
                 self.needs_render = true;
             }
         }

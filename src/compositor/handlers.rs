@@ -150,6 +150,10 @@ impl CompositorHandler for Beewm {
                 self.set_keyboard_focus(Some(wl_surface));
             }
             self.space.raise_element(&window, true);
+            // After raising the new window, push every floating element back
+            // above the tiled stack so dialogs stay visible when a tiled window
+            // opens on top of them.
+            self.raise_floating_windows();
             self.needs_render = true;
             return;
         }
@@ -168,6 +172,7 @@ impl CompositorHandler for Beewm {
                     self.floating_windows.insert(root, floating);
                     self.relayout();
                     self.space.raise_element(&window, true);
+                    self.raise_floating_windows();
                     if let Some(wl_surface) =
                         window.wl_surface().map(|s| s.into_owned())
                     {
