@@ -1,5 +1,6 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
 
 use super::{Beewm, root_surface};
@@ -29,6 +30,7 @@ impl Beewm {
                 self.seat
                     .get_keyboard()
                     .and_then(|keyboard| keyboard.current_focus())
+                    .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
             })
             .flatten()
             .and_then(|surface| {
@@ -95,6 +97,59 @@ impl Beewm {
     pub(crate) fn remove_tiled_window(&mut self, workspace_idx: usize, surface: &WlSurface) {
         self.layout_manager
             .remove(workspace_idx, &root_surface(surface));
+    }
+
+    pub(crate) fn rectangle_covers_output(&self, geo: Rectangle<i32, Logical>) -> bool {
+        let Some(output_geo) = self
+            .space
+            .outputs()
+            .next()
+            .and_then(|output| self.space.output_geometry(output))
+        else {
+            return false;
+        };
+
+        geo.loc.x <= output_geo.loc.x
+            && geo.loc.y <= output_geo.loc.y
+            && geo.loc.x + geo.size.w >= output_geo.loc.x + output_geo.size.w
+            && geo.loc.y + geo.size.h >= output_geo.loc.y + output_geo.size.h
+    }
+
+    pub(crate) fn x11_window_covers_output(&self, window: &Window) -> bool {
+        window.x11_surface().is_some()
+            && self
+                .space
+                .element_geometry(window)
+                .map(|geo| self.rectangle_covers_output(geo))
+                .unwrap_or(false)
+    }
+
+    pub fn screen_owned_by_x11_window(&self) -> bool {
+        self.fullscreen_window
+            .as_ref()
+            .and_then(|window| window.x11_surface())
+            .is_some()
+            || self
+                .space
+                .elements()
+                .any(|window| self.x11_window_covers_output(window))
+    }
+
+    /// True when something is occupying the whole output and we should treat
+    /// the screen as fullscreen-owned for layer suppression / scanout
+    /// purposes. Covers the two paths that block layers:
+    /// 1. An app fullscreened via xdg-shell or `_NET_WM_STATE_FULLSCREEN`
+    ///    (the usual `fullscreen_window` field).
+    /// 2. An X11 window that has sized itself to cover the output. Some games
+    ///    do this without keeping `_NET_WM_STATE_FULLSCREEN` set, so using
+    ///    only `fullscreen_window` lets borders/layers reappear and prevents
+    ///    direct scanout.
+    pub fn screen_owned_by_window(&self) -> bool {
+        if self.fullscreen_window.is_some() {
+            return true;
+        }
+
+        self.screen_owned_by_x11_window()
     }
 
     /// Re-raise every floating window of the active workspace so that they

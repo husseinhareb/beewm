@@ -1,7 +1,7 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Point, Size};
+use smithay::utils::{Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
@@ -26,18 +26,27 @@ impl Beewm {
         let usable_origin = output_geo.loc + non_exclusive.loc;
         let usable_size = non_exclusive.size;
 
-        let (min_size, max_size) = window
-            .toplevel()
-            .map(|toplevel| {
-                smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
-                    let mut cached = states
-                        .cached_state
-                        .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
-                    let current = cached.current();
-                    (current.min_size, current.max_size)
-                })
+        let (min_size, max_size) = if let Some(toplevel) = window.toplevel() {
+            smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                let mut cached = states
+                    .cached_state
+                    .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+                let current = cached.current();
+                (current.min_size, current.max_size)
             })
-            .unwrap_or_else(|| (Size::from((0, 0)), Size::from((0, 0))));
+        } else if let Some(x11) = window.x11_surface() {
+            // For X11 dialogs (gnome-keyring-prompter, polkit, GTK dialogs)
+            // WM_NORMAL_HINTS is the authoritative source of preferred size.
+            // The fallback geometry path below works without this but loses a
+            // pixel or two whenever the X11 client's natural geometry doesn't
+            // match its declared hints.
+            (
+                x11.min_size().unwrap_or_else(|| Size::from((0, 0))),
+                x11.max_size().unwrap_or_else(|| Size::from((0, 0))),
+            )
+        } else {
+            (Size::from((0, 0)), Size::from((0, 0)))
+        };
         let bbox_size = window.bbox().size;
         let geo_size = window.geometry().size;
 
@@ -45,9 +54,11 @@ impl Beewm {
         // committed before we knew this window was floating tends to match the
         // full usable area on one or both axes — treating bbox/geo == usable as
         // "unreliable" prevents centring a tile-sized rectangle (which collapses
-        // to a corner placement).
+        // to a corner placement). A max_size that meets or exceeds usable is a
+        // "no real max" sentinel (32767, display dimensions) and equally
+        // unreliable; fall through to bbox/geo just like for an unset cap.
         let pick_axis = |max: i32, bbox: i32, geo: i32, fallback: i32, usable: i32| -> i32 {
-            let candidate = if max > 0 {
+            let candidate = if max > 0 && max < usable {
                 max
             } else if bbox > 0 && bbox < usable {
                 bbox
@@ -292,18 +303,20 @@ impl Beewm {
     }
 
     pub(crate) fn adopt_floating_dialog_state(&mut self, surface: &ToplevelSurface) {
-        let pending_should_float = self
-            .pending_windows
-            .iter()
-            .find(|window| {
-                window
-                    .toplevel()
-                    .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
-                    .unwrap_or(false)
-            })
-            .map(should_map_toplevel_floating)
-            .unwrap_or(false);
-        if pending_should_float {
+        // The signal that triggered this call (parent_changed / modal_changed)
+        // *is* the floating intent — even if the cached XDG role data doesn't
+        // yet match `should_map_toplevel_floating` (parent property writes can
+        // lag the parent_changed event by a commit). Record the intent so the
+        // first-commit path floats the window regardless.
+        let is_pending = self.pending_windows.iter().any(|window| {
+            window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
+                .unwrap_or(false)
+        });
+        if is_pending {
+            self.pending_should_float
+                .insert(root_surface(surface.wl_surface()));
             surface.with_pending_state(|state| {
                 state.size = None;
             });
@@ -439,6 +452,9 @@ impl Beewm {
                     state.size = Some(output_geo.size);
                 });
                 toplevel.send_configure();
+            } else if let Some(x11_surface) = window.x11_surface() {
+                let _ = x11_surface.set_fullscreen(true);
+                let _ = x11_surface.configure(output_geo);
             }
             self.space.map_element(window.clone(), output_geo.loc, true);
             self.fullscreen_window = Some(window);
@@ -462,6 +478,11 @@ impl Beewm {
                 state.size = restore_floating.map(|floating| floating.size);
             });
             toplevel.send_configure();
+        } else if let Some(x11_surface) = fs_window.x11_surface() {
+            let _ = x11_surface.set_fullscreen(false);
+            if let Some(floating) = restore_floating {
+                let _ = x11_surface.configure(Rectangle::new(floating.position, floating.size));
+            }
         }
 
         if let Some(floating) = restore_floating {

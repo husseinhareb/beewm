@@ -4,6 +4,7 @@ pub(crate) mod config_watcher;
 mod cursor;
 mod event_broadcast;
 mod feedback;
+pub(crate) mod focus_target;
 mod handlers;
 mod input;
 mod ipc;

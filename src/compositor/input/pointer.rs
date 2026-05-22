@@ -8,7 +8,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
-use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
 };
@@ -57,7 +56,7 @@ pub(in crate::compositor) fn surface_under(
         .next()
         .cloned()
         .or_else(|| state.space.outputs().next().cloned())?;
-    let fullscreen_active = state.fullscreen_window.is_some();
+    let fullscreen_active = state.screen_owned_by_window();
 
     let layer_hit = |layer: WlrLayer| -> Option<(WlSurface, Point<f64, Logical>)> {
         let layer_map = layer_map_for_output(&output);
@@ -114,12 +113,15 @@ fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
     })
 }
 
-fn keyboard_focus_target_under_pointer(state: &Beewm, surface: &WlSurface) -> Option<WlSurface> {
+fn keyboard_focus_target_under_pointer(
+    state: &Beewm,
+    surface: &WlSurface,
+) -> Option<crate::compositor::focus_target::KeyboardFocusTarget> {
     if let Some(window) = state.mapped_window_for_surface(surface) {
-        return window.wl_surface().map(|surface| surface.into_owned());
+        return crate::compositor::focus_target::KeyboardFocusTarget::from_window(&window);
     }
 
-    surface_accepts_keyboard_focus(state, surface).then(|| surface.clone())
+    surface_accepts_keyboard_focus(state, surface).then(|| surface.clone().into())
 }
 
 pub(super) fn handle_pointer_motion<I: InputBackend>(
@@ -376,6 +378,19 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
         let pos = state.pointer_location;
         if let Some((surface, _)) = surface_under(state, pos) {
             if let Some(target) = keyboard_focus_target_under_pointer(state, &surface) {
+                let x11_target = match &target {
+                    crate::compositor::focus_target::KeyboardFocusTarget::X11(x11) => {
+                        Some(x11.clone())
+                    }
+                    crate::compositor::focus_target::KeyboardFocusTarget::Wayland(_) => None,
+                };
+                if let Some(x11) = x11_target {
+                    // Keep XWayland's stacking in sync even when focus was
+                    // already on this window. Steam can keep the focus border
+                    // while an old sibling remains above it in the X server.
+                    state.raise_x11_window(&x11);
+                }
+
                 let already_focused = state
                     .seat
                     .get_keyboard()
@@ -383,7 +398,7 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
                     .map(|f| f == target)
                     .unwrap_or(false);
                 if !already_focused {
-                    state.set_keyboard_focus(Some(target));
+                    state.set_keyboard_focus_target(Some(target));
                 }
             }
         }

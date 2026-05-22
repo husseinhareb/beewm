@@ -5,6 +5,7 @@ use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
 
+use crate::compositor::focus_target::KeyboardFocusTarget;
 use crate::config::FocusDirection;
 
 use super::{Beewm, root_surface};
@@ -49,9 +50,11 @@ impl Beewm {
     }
 
     pub fn active_workspace_focused_index(&self) -> Option<usize> {
-        if let Some(surface) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
-            if let Some(idx) = self.window_index_for_surface(self.active_workspace, &surface) {
-                return Some(idx);
+        if let Some(target) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
+            if let Some(surface) = target.wl_surface() {
+                if let Some(idx) = self.window_index_for_surface(self.active_workspace, &surface) {
+                    return Some(idx);
+                }
             }
         }
         self.workspaces[self.active_workspace].focused_idx
@@ -150,7 +153,28 @@ impl Beewm {
         self.request_focus_publish();
     }
 
+    /// Convenience entrypoint for callers that have only a wl_surface in
+    /// hand (xdg-shell paths). Looks the surface up against the live window
+    /// map so an X11 client surface gets routed through `X11Surface`'s
+    /// KeyboardTarget rather than the bare wl_surface.
     pub fn set_keyboard_focus(&mut self, focused: Option<WlSurface>) {
+        let target = focused.map(|surface| self.focus_target_for_surface(&surface));
+        self.set_keyboard_focus_target(target);
+    }
+
+    /// Resolve a wl_surface to the right keyboard-focus variant. Falls back
+    /// to `Wayland` when the surface isn't a tracked window (e.g. layer
+    /// surfaces — those don't have X11 input focus to worry about).
+    pub(crate) fn focus_target_for_surface(&self, surface: &WlSurface) -> KeyboardFocusTarget {
+        match self.mapped_window_for_surface(surface) {
+            Some(window) => {
+                KeyboardFocusTarget::from_window(&window).unwrap_or_else(|| surface.clone().into())
+            }
+            None => surface.clone().into(),
+        }
+    }
+
+    pub fn set_keyboard_focus_target(&mut self, focused: Option<KeyboardFocusTarget>) {
         let serial = SERIAL_COUNTER.next_serial();
 
         // Dismiss any active popup grab before re-focusing. We unset the keyboard
@@ -169,11 +193,12 @@ impl Beewm {
             }
         }
 
+        let is_none = focused.is_none();
         let keyboard = self.seat.get_keyboard().unwrap();
-        keyboard.set_focus(self, focused.clone(), serial);
+        keyboard.set_focus(self, focused, serial);
 
         // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.
-        if focused.is_none() {
+        if is_none {
             if let Some(prev) = self.prev_keyboard_focus.take() {
                 if self.deactivate_pointer_constraint_for(&prev) {
                     self.set_cursor_status(smithay::input::pointer::CursorImageStatus::default_named());
@@ -194,12 +219,35 @@ impl Beewm {
 
         self.workspaces[self.active_workspace].focused_idx = Some(idx);
 
-        if let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) {
-            self.set_keyboard_focus(Some(surface));
+        if let Some(target) = KeyboardFocusTarget::from_window(&window) {
+            self.set_keyboard_focus_target(Some(target));
         }
 
         self.space.raise_element(&window, true);
+        // Sync the X11 z-order. Without this, XWayland still thinks the
+        // previously-focused X11 window is on top and routes pointer events
+        // accordingly — observable as "Steam has the focus border but clicks
+        // do nothing" after returning from a game.
+        if let Some(x11) = window.x11_surface() {
+            self.raise_x11_window(x11);
+        }
         self.needs_render = true;
+    }
+
+    /// Tell XWayland to raise this X11 window in the X server's stacking
+    /// order. Keep separate from `space.raise_element` because that one only
+    /// touches the wl_surface scene graph — X11 pointer event routing is
+    /// driven by the X server's own z-order.
+    pub(crate) fn raise_x11_window(&mut self, surface: &smithay::xwayland::X11Surface) {
+        if let Some(xwm) = self.xwm.as_mut() {
+            if let Err(error) = xwm.raise_window(surface) {
+                tracing::warn!(
+                    target: "beewm::xwayland",
+                    "Failed to raise X11 window in X server stacking order: {}",
+                    error,
+                );
+            }
+        }
     }
 }
 

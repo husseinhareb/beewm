@@ -3,6 +3,7 @@ mod keyboard;
 mod pointer;
 
 use smithay::backend::input::{InputBackend, InputEvent};
+use smithay::wayland::seat::WaylandFocus;
 
 use super::state::Beewm;
 
@@ -15,7 +16,12 @@ const MIN_FLOATING_WINDOW_SIZE: i32 = 1;
 /// Returns `true` when keyboard focus is currently on a layer-shell surface
 /// (e.g. wofi).  In that case focus-follows-mouse must NOT steal focus away.
 fn layer_surface_has_keyboard_focus(state: &Beewm) -> bool {
-    let Some(focused) = state.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
+    let Some(focused) = state
+        .seat
+        .get_keyboard()
+        .and_then(|kb| kb.current_focus())
+        .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
+    else {
         return false;
     };
     if state.mapped_window_for_surface(&focused).is_some() {

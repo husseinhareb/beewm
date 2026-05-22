@@ -111,6 +111,32 @@ impl CompositorHandler for Beewm {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Diagnostic: aggregate commits per root-surface in 1s windows.
+        // Set RUST_LOG=beewm::commit=info to see "surface=<id> commits=<n>/s"
+        // lines and identify whether a specific client (e.g. a game) is
+        // committing at the expected rate.
+        {
+            let root = root_surface(surface);
+            let key = root.id().protocol_id();
+            let now = std::time::Instant::now();
+            let entry = self
+                .commit_rate_log
+                .entry(key)
+                .or_insert((0, now));
+            entry.0 = entry.0.saturating_add(1);
+            let elapsed = now.duration_since(entry.1);
+            if elapsed >= std::time::Duration::from_secs(1) {
+                tracing::info!(
+                    target: "beewm::commit",
+                    surface = key,
+                    commits = entry.0,
+                    window_s = elapsed.as_secs_f64(),
+                    "surface commit rate"
+                );
+                *entry = (0, now);
+            }
+        }
+
         self.popup_manager.commit(surface);
 
         // Process buffer attachment for the surface tree — required for
@@ -135,7 +161,12 @@ impl CompositorHandler for Beewm {
             window.on_commit();
             // Dialogs and fixed-size splash/loading windows should float
             // centered instead of being tiled or inheriting a (0, 0) origin.
-            let should_float = should_map_toplevel_floating(&window);
+            let window_root = window
+                .wl_surface()
+                .map(|s| root_surface(&s.into_owned()))
+                .unwrap_or_else(|| root_surface(surface));
+            let intent_recorded = self.pending_should_float.remove(&window_root);
+            let should_float = should_map_toplevel_floating(&window) || intent_recorded;
             if should_float {
                 self.map_as_floating_centered(&window);
                 self.relayout();
@@ -144,16 +175,26 @@ impl CompositorHandler for Beewm {
                 self.relayout();
             }
 
-            // Focus the new window
-            if let Some(toplevel) = window.toplevel() {
-                let wl_surface = toplevel.wl_surface().clone();
-                self.set_keyboard_focus(Some(wl_surface));
+            // A fullscreen window owns the keyboard and the whole screen;
+            // newly-mapped tiled windows that arrive while it's active must
+            // not steal its focus, otherwise the user is left typing into an
+            // invisible window underneath and directional focus gets stuck.
+            let fullscreen_blocks_focus = self
+                .fullscreen_window
+                .as_ref()
+                .map(|fs| fs != &window)
+                .unwrap_or(false);
+            if !fullscreen_blocks_focus {
+                if let Some(toplevel) = window.toplevel() {
+                    let wl_surface = toplevel.wl_surface().clone();
+                    self.set_keyboard_focus(Some(wl_surface));
+                }
+                self.space.raise_element(&window, true);
+                // After raising the new window, push every floating element back
+                // above the tiled stack so dialogs stay visible when a tiled window
+                // opens on top of them.
+                self.raise_floating_windows();
             }
-            self.space.raise_element(&window, true);
-            // After raising the new window, push every floating element back
-            // above the tiled stack so dialogs stay visible when a tiled window
-            // opens on top of them.
-            self.raise_floating_windows();
             self.needs_render = true;
             return;
         }
@@ -166,6 +207,11 @@ impl CompositorHandler for Beewm {
             // If we previously sent a `size = None` configure to release this
             // window from its tiled dimensions, re-center it now that the client
             // has committed at its natural size.
+            //
+            // Do NOT re-set keyboard focus here: the initial-commit path already
+            // focused the window. The natural-size recommit can arrive many
+            // milliseconds later, and re-focusing at that point would steal
+            // focus from whatever the user clicked on in the meantime.
             let root = root_surface(surface);
             if self.pending_float_centers.remove(&root) {
                 if let Some((_, floating)) = self.centered_floating_data(&window) {
@@ -173,11 +219,6 @@ impl CompositorHandler for Beewm {
                     self.relayout();
                     self.space.raise_element(&window, true);
                     self.raise_floating_windows();
-                    if let Some(wl_surface) =
-                        window.wl_surface().map(|s| s.into_owned())
-                    {
-                        self.set_keyboard_focus(Some(wl_surface));
-                    }
                 }
             }
 
@@ -229,12 +270,16 @@ impl CompositorHandler for Beewm {
                     let keyboard = self.seat.get_keyboard().unwrap();
                     let already_focused = keyboard
                         .current_focus()
-                        .as_ref()
-                        .map(|f| *f == wl_surface)
+                        .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
+                        .map(|focused| focused == wl_surface)
                         .unwrap_or(false);
                     if !already_focused {
                         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                        keyboard.set_focus(self, Some(wl_surface), serial);
+                        keyboard.set_focus(
+                            self,
+                            Some(super::focus_target::KeyboardFocusTarget::Wayland(wl_surface)),
+                            serial,
+                        );
                         tracing::debug!("Layer surface focused after configure");
                     }
                 }
@@ -380,6 +425,7 @@ impl XdgShellHandler for Beewm {
                 .unwrap_or(false)
         }) {
             self.pending_windows.remove(pos);
+            self.pending_should_float.remove(target_surface);
             return;
         }
 
@@ -396,6 +442,7 @@ impl XdgShellHandler for Beewm {
                         .seat
                         .get_keyboard()
                         .and_then(|keyboard| keyboard.current_focus())
+                        .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
                     {
                         Some(current_focus) => {
                             let mut root = current_focus;
@@ -477,7 +524,16 @@ impl XdgShellHandler for Beewm {
             Ok(r) => r,
             Err(_) => return,
         };
-        let grab = match self.popup_manager.grab_popup(root, popup, &seat, serial) {
+        // PopupManager::grab_popup wants the keyboard-focus form of the root,
+        // not the raw wl_surface. Resolve through `focus_target_for_surface`
+        // so popups rooted on an X11 window keep keyboard focus on the X11
+        // surface (preserving X11 input focus) instead of falling back to a
+        // plain wl_surface.
+        let root_target = self.focus_target_for_surface(&root);
+        let grab = match self
+            .popup_manager
+            .grab_popup(root_target, popup, &seat, serial)
+        {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!("Popup grab denied: {:?}", e);
@@ -509,7 +565,7 @@ impl XdgShellHandler for Beewm {
 }
 
 impl SeatHandler for Beewm {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = super::focus_target::KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -521,7 +577,17 @@ impl SeatHandler for Beewm {
         self.set_cursor_status(image);
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(
+        &mut self,
+        seat: &Seat<Self>,
+        focused: Option<&super::focus_target::KeyboardFocusTarget>,
+    ) {
+        // Smithay hands us the focus target it just routed enter/leave to.
+        // Pull the underlying wl_surface for pointer-constraint + selection
+        // bookkeeping, which is still wl_surface-keyed.
+        let focused_surface = focused
+            .and_then(|target| target.wl_surface().map(|s| s.into_owned()));
+
         // Manage pointer-lock constraints: deactivate on the old focused surface and
         // activate on the newly focused one so games get/lose their pointer lock
         // automatically with keyboard focus.
@@ -530,16 +596,16 @@ impl SeatHandler for Beewm {
                 self.set_cursor_status(CursorImageStatus::default_named());
             }
         }
-        if let Some(surface) = focused {
+        if let Some(surface) = focused_surface.as_ref() {
             if self.activate_pointer_constraint_for(surface) {
                 self.set_cursor_status(CursorImageStatus::Hidden);
             }
         }
-        self.prev_keyboard_focus = focused.cloned();
+        self.prev_keyboard_focus = focused_surface.clone();
 
-        self.note_keyboard_focus_change(focused);
+        self.note_keyboard_focus_change(focused_surface.as_ref());
         // Deliver the current clipboard/primary selection to the newly focused client.
-        let client = focused.and_then(|s| s.client());
+        let client = focused_surface.as_ref().and_then(|s| s.client());
         set_data_device_focus::<Self>(&self.display_handle, seat, client.clone());
         set_primary_focus::<Self>(&self.display_handle, seat, client);
     }

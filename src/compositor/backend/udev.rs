@@ -1,12 +1,12 @@
 use std::os::fd::AsFd;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
 use smithay::backend::allocator::Format;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
+use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
@@ -62,6 +62,44 @@ struct GpuData {
     /// True when a vblank has fired and we may render the next frame.
     can_render: bool,
     pending_presentation_feedback: Option<smithay::desktop::utils::OutputPresentationFeedback>,
+    /// Rolling counters for the `beewm::frame` instrumentation. Reset whenever
+    /// a summary line is emitted so the file stays digestible at high refresh
+    /// rates instead of growing one log line per frame.
+    frame_stats: FrameStats,
+}
+
+#[derive(Debug)]
+struct FrameStats {
+    window_start: Instant,
+    frames: u32,
+    empty_frames: u32,
+    scanout_frames: u32,
+    composition_frames: u32,
+    overlay_frames: u32,
+    cursor_plane_frames: u32,
+    render_time_total: Duration,
+    render_time_max: Duration,
+    /// Last primary-path classification — used to log scanout↔composition
+    /// transitions immediately (one line per change) on top of the periodic
+    /// summary, so the cause of an FPS drop is easy to spot in the log.
+    last_primary_was_scanout: Option<bool>,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            frames: 0,
+            empty_frames: 0,
+            scanout_frames: 0,
+            composition_frames: 0,
+            overlay_frames: 0,
+            cursor_plane_frames: 0,
+            render_time_total: Duration::ZERO,
+            render_time_max: Duration::ZERO,
+            last_primary_was_scanout: None,
+        }
+    }
 }
 
 /// Top-level calloop data for the DRM/udev backend —
@@ -75,8 +113,70 @@ struct UdevData {
 
 delegate_backend_xwayland!(UdevData, state);
 
+/// Surface the most common misconfiguration that prevents beewm from
+/// acquiring DRM master: NVIDIA proprietary driver loaded without
+/// `nvidia-drm.modeset=1`. Without that flag the kernel does not expose
+/// KMS for the device and any GBM-based Wayland compositor is forced into
+/// unprivileged mode — direct scan-out and hardware planes both fail and
+/// games end up capped at ~20 fps. We can't fix this from inside the
+/// process (it's a kernel-module parameter read at module load), but we
+/// can tell the user exactly what to do instead of silently degrading.
+///
+/// Detection goes via `/proc/modules` (world-readable) rather than
+/// `/sys/module/nvidia_drm/parameters/modeset` alone, because that sysfs
+/// file is root-only on recent NVIDIA driver releases — a naive
+/// `read_to_string` returns `Permission denied` and silently misses the
+/// problem.
+fn warn_if_nvidia_modeset_disabled() {
+    let proc_modules = match std::fs::read_to_string("/proc/modules") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let nvidia_drm_loaded = proc_modules
+        .lines()
+        .any(|line| line.starts_with("nvidia_drm "));
+    if !nvidia_drm_loaded {
+        return;
+    }
+
+    let param_path = "/sys/module/nvidia_drm/parameters/modeset";
+    let fix_instructions = "    sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*/& \
+        nvidia-drm.modeset=1 nvidia-drm.fbdev=1/' /etc/default/grub\n    \
+        sudo grub-mkconfig -o /boot/grub/grub.cfg\n    \
+        sudo reboot";
+
+    match std::fs::read_to_string(param_path) {
+        Ok(value) if value.trim() == "Y" => { /* modeset enabled, nothing to do */ }
+        Ok(value) => {
+            tracing::error!(
+                "nvidia-drm modeset is disabled (modeset={}). Beewm will run in \
+                 unprivileged DRM mode: no direct scan-out, software cursor, and \
+                 game framerates capped to a fraction of display refresh. To fix \
+                 (GRUB):\n\n{}\n\nVerify after reboot with: sudo cat {}",
+                value.trim(),
+                fix_instructions,
+                param_path,
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                "NVIDIA proprietary driver detected but the modeset parameter \
+                 ({}) is not readable as your user. If beewm logs \"Unable to \
+                 become drm master\" below, modeset is likely disabled. To fix \
+                 (GRUB):\n\n{}\n\nVerify with: sudo cat {}",
+                param_path,
+                fix_instructions,
+                param_path,
+            );
+        }
+        Err(_) => { /* file missing or other unrelated error */ }
+    }
+}
+
 /// Run the compositor on real hardware from a TTY using DRM/KMS.
 pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_nvidia_modeset_disabled();
+
     let mut event_loop: EventLoop<UdevData> = EventLoop::try_new()?;
     let display: Display<Beewm> = Display::new()?;
     let display_handle = display.handle();
@@ -428,16 +528,31 @@ fn render_frame(data: &mut UdevData) {
     };
     gpu.can_render = false;
 
+    let frame_start = Instant::now();
+
     let window_elements =
         window_render_elements(&mut gpu.renderer, &data.state.space, &gpu.output, 1.0);
 
+    // True when an xdg-shell fullscreen or a fullscreen-sized X11 game covers
+    // the output. Both should suppress top-layers so the game can be promoted
+    // onto the primary plane by smithay's DrmCompositor.
+    let fullscreen_active = data.state.screen_owned_by_window();
+
     let border_elements = data.state.border_elements();
-    let cursor_elements = data.state.cursor_elements(&mut gpu.renderer);
+    // When a game owns the screen, drop the compositor cursor element so it
+    // doesn't sit on top of the primary plane and block direct scanout. The
+    // game still gets to draw its own cursor through its surface (or use a
+    // relative pointer / hidden cursor), so the user-visible change is just
+    // "no compositor pointer overlay while a fullscreen app is up".
+    let cursor_elements = if fullscreen_active {
+        Vec::new()
+    } else {
+        data.state.cursor_elements(&mut gpu.renderer)
+    };
 
     // Render layer-shell surfaces (waybar, beebar, etc.) at the correct Z-order.
     // Clone output so we can borrow it for layer_map while also using gpu.renderer.
     let output = gpu.output.clone();
-    let fullscreen_active = data.state.fullscreen_window.is_some();
 
     let layers_below = layer_render_elements(
         &mut gpu.renderer,
@@ -453,6 +568,12 @@ fn render_frame(data: &mut UdevData) {
     );
 
     process_pending_screencopies(&mut data.state, &mut gpu.renderer, &output);
+
+    let count_windows = window_elements.len();
+    let count_borders = border_elements.len();
+    let count_cursor = cursor_elements.len();
+    let count_layers_above = layers_above.len();
+    let count_layers_below = layers_below.len();
 
     // Build final element list front-to-back (first = topmost).
     let mut elements: Vec<OutputRenderElement> = Vec::new();
@@ -474,9 +595,13 @@ fn render_frame(data: &mut UdevData) {
     match result {
         Ok(result) => {
             let render_states = result.states.clone();
+            let is_scanout = matches!(result.primary_element, PrimaryPlaneElement::Element(_));
+            let overlay_count = result.overlay_elements.len();
+            let cursor_plane_used = result.cursor_element.is_some();
+            let is_empty = result.is_empty;
             update_primary_scanout_output(&data.state, &output, &render_states);
 
-            if result.is_empty {
+            if is_empty {
                 // No damage — nothing to scan out. The caller already
                 // cleared `needs_render`; re-allow the next render and send
                 // frame callbacks now since no VBlank will fire to do it.
@@ -505,6 +630,21 @@ fn render_frame(data: &mut UdevData) {
                     &render_states,
                 ));
             }
+
+            record_frame_stats(
+                &mut gpu.frame_stats,
+                frame_start.elapsed(),
+                is_scanout,
+                is_empty,
+                overlay_count,
+                cursor_plane_used,
+                fullscreen_active,
+                count_windows,
+                count_borders,
+                count_cursor,
+                count_layers_above,
+                count_layers_below,
+            );
             // For the normal non-empty case, frame callbacks are sent from the
             // VBlank handler once the hardware confirms the frame is on screen.
         }
@@ -518,6 +658,95 @@ fn render_frame(data: &mut UdevData) {
             let elapsed = data.state.start_time.elapsed();
             send_frame_callbacks(&data.state, &output, elapsed, None);
         }
+    }
+}
+
+/// Update per-frame counters and emit `beewm::frame` log lines at digestible
+/// rates: one line on every scanout↔composition transition (with the full
+/// element breakdown of *that* frame) and one summary every ~1 second.
+#[allow(clippy::too_many_arguments)]
+fn record_frame_stats(
+    stats: &mut FrameStats,
+    render_time: Duration,
+    is_scanout: bool,
+    is_empty: bool,
+    overlay_count: usize,
+    cursor_plane_used: bool,
+    fullscreen_active: bool,
+    count_windows: usize,
+    count_borders: usize,
+    count_cursor: usize,
+    count_layers_above: usize,
+    count_layers_below: usize,
+) {
+    stats.frames += 1;
+    if is_empty {
+        stats.empty_frames += 1;
+    }
+    if is_scanout {
+        stats.scanout_frames += 1;
+    } else {
+        stats.composition_frames += 1;
+    }
+    if overlay_count > 0 {
+        stats.overlay_frames += 1;
+    }
+    if cursor_plane_used {
+        stats.cursor_plane_frames += 1;
+    }
+    stats.render_time_total += render_time;
+    if render_time > stats.render_time_max {
+        stats.render_time_max = render_time;
+    }
+
+    let transition = stats
+        .last_primary_was_scanout
+        .map(|prev| prev != is_scanout)
+        .unwrap_or(true);
+    stats.last_primary_was_scanout = Some(is_scanout);
+    if transition {
+        tracing::info!(
+            target: "beewm::frame",
+            is_scanout,
+            fullscreen_active,
+            overlay_count,
+            cursor_plane_used,
+            count_windows,
+            count_borders,
+            count_cursor,
+            count_layers_above,
+            count_layers_below,
+            render_us = render_time.as_micros() as u64,
+            "primary-plane path changed: {}",
+            if is_scanout { "DIRECT SCANOUT" } else { "GPU COMPOSITION" },
+        );
+    }
+
+    let elapsed = stats.window_start.elapsed();
+    if elapsed >= Duration::from_secs(1) {
+        let frames = stats.frames as f64;
+        let secs = elapsed.as_secs_f64();
+        let avg_us = if stats.frames > 0 {
+            (stats.render_time_total.as_micros() / stats.frames as u128) as u64
+        } else {
+            0
+        };
+        tracing::info!(
+            target: "beewm::frame",
+            fps = frames / secs,
+            frames = stats.frames,
+            scanout = stats.scanout_frames,
+            composition = stats.composition_frames,
+            empty = stats.empty_frames,
+            overlay = stats.overlay_frames,
+            cursor_plane = stats.cursor_plane_frames,
+            avg_render_us = avg_us,
+            max_render_us = stats.render_time_max.as_micros() as u64,
+            fullscreen_active,
+            "frame-stats over {:.2}s",
+            secs,
+        );
+        *stats = FrameStats::new();
     }
 }
 
@@ -718,6 +947,7 @@ fn init_gpu(
             output,
             can_render: true, // allow first frame immediately
             pending_presentation_feedback: None,
+            frame_stats: FrameStats::new(),
         },
         dmabuf_formats,
         syncobj_state,

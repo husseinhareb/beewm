@@ -347,7 +347,7 @@ where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Texture + Clone + Send + 'static,
 {
-    let fullscreen_active = state.fullscreen_window.is_some();
+    let fullscreen_active = state.screen_owned_by_window();
     let window_elements = window_render_elements(renderer, &state.space, output, 1.0);
     let border_elements = state.border_elements();
     let cursor_elements = if overlay_cursor {

@@ -3,6 +3,7 @@ use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::desktop::{Window, layer_map_for_output};
 use smithay::utils::{Coordinate, Logical, Physical, Rectangle};
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use super::Beewm;
@@ -135,8 +136,22 @@ impl Beewm {
         if bw == 0 || self.has_layer_surface_overlapping_borders(bw) {
             return Vec::new();
         }
+        // When something is owning the whole screen (real fullscreen or an X11
+        // override-redirect game), skip border generation entirely. Borders
+        // around a fullscreen-sized window would otherwise sit *on top of*
+        // its primary-plane content and prevent direct scanout.
+        if self.screen_owned_by_window() {
+            return Vec::new();
+        }
 
-        let focused_surface = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        // Resolve the focused wl_surface from the seat's KeyboardFocusTarget
+        // (could be either a Wayland or an X11 variant). We compare against
+        // window root surfaces below, so a single wl_surface is what we need.
+        let focused_surface = self
+            .seat
+            .get_keyboard()
+            .and_then(|kb| kb.current_focus())
+            .and_then(|target| target.wl_surface().map(|s| s.into_owned()));
         let focused_color = self.border_color_focused;
         let unfocused_color = self.border_color_unfocused;
         let dragged_root = match &self.active_grab {
@@ -179,9 +194,16 @@ impl Beewm {
                 })
                 .collect();
 
-            let is_focused = window
-                .toplevel()
-                .and_then(|tl| focused_surface.as_ref().map(|fs| *fs == *tl.wl_surface()))
+            // Match against the *window root* surface, which works for both
+            // Wayland toplevels and X11 surfaces. The previous check only
+            // looked at `window.toplevel()` and silently returned None for
+            // X11 windows, so XWayland clients (Steam, games) were always
+            // drawn with the unfocused border colour.
+            let window_root = Beewm::window_root_surface(window);
+            let is_focused = window_root
+                .as_ref()
+                .zip(focused_surface.as_ref())
+                .map(|(root, focused)| root == focused)
                 .unwrap_or(false);
             let is_swap_highlighted = Self::window_root_surface(window)
                 .as_ref()

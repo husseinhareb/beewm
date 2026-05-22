@@ -62,17 +62,9 @@ fn normal_layer_order_keeps_top_surfaces_above_windows() {
 }
 
 #[test]
-fn fullscreen_moves_all_layer_surfaces_behind_windows() {
+fn fullscreen_suppresses_layer_surfaces_for_scanout() {
     assert!(layers_rendered_above_windows(true).is_empty());
-    assert_eq!(
-        layers_rendered_below_windows(true),
-        &[
-            WlrLayer::Overlay,
-            WlrLayer::Top,
-            WlrLayer::Bottom,
-            WlrLayer::Background,
-        ]
-    );
+    assert!(layers_rendered_below_windows(true).is_empty());
     assert!(layers_hit_tested_before_windows(true).is_empty());
     assert!(layers_hit_tested_after_windows(true).is_empty());
 }

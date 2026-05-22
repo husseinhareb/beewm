@@ -377,7 +377,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                 let render_result = match winit_backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
-                        let fullscreen_active = data.state.fullscreen_window.is_some();
+                        let fullscreen_active = data.state.screen_owned_by_window();
                         let window_elements =
                             window_render_elements(renderer, &data.state.space, output, 1.0);
                         let layers_above = layer_render_elements(

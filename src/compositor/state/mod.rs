@@ -163,6 +163,12 @@ pub struct Beewm {
     /// re-commit at its natural size; on that next commit we re-center the
     /// floating entry to match the client's actual size.
     pub(crate) pending_float_centers: HashSet<WlSurface>,
+    /// Toplevel surfaces that announced a floating intent (set_parent, modal,
+    /// xdg-dialog) BEFORE their initial commit — at that point the window is
+    /// still in `pending_windows` and we can't yet act on the signal. Recorded
+    /// here so the first-commit path can honour the intent even if the static
+    /// `should_map_toplevel_floating` heuristic doesn't match yet.
+    pub(crate) pending_should_float: HashSet<WlSurface>,
     /// Active pointer grab (move, resize, or tiled swap). Only one can be
     /// active at a time.
     pub active_grab: Option<ActiveGrab>,
@@ -176,7 +182,7 @@ pub struct Beewm {
     /// Installs acquire-fence event sources into the active backend loop.
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
     /// Outstanding zwlr_screencopy_frame_v1 objects waiting for a buffer copy.
-    pub pending_screencopy_frames: Vec<PendingScreencopyFrame>,
+    pub(crate) pending_screencopy_frames: Vec<PendingScreencopyFrame>,
     /// Compositor-specific environment for spawned child processes.
     pub(crate) child_env: ChildEnvironment,
     /// Pushes `event>>data\n` lines to event-socket subscribers from a
@@ -194,6 +200,17 @@ pub struct Beewm {
     pub(crate) outputs_ready_for_startup: bool,
     pub(crate) xwayland_start_pending: bool,
     pub(crate) pending_x11_windows: Vec<PendingX11Window>,
+    /// Per-root-surface commit counters for the `beewm::commit` rate trace.
+    /// Keyed by `WlSurface::id().protocol_id()`; value is `(commits in current
+    /// 1s window, window start time)`. Used purely as diagnostic output.
+    pub(crate) commit_rate_log: HashMap<u32, (u32, std::time::Instant)>,
+    /// X11 windows that sent `_NET_WM_STATE_FULLSCREEN` before they were
+    /// mapped into a workspace. Games (especially via Proton) frequently
+    /// emit the fullscreen request as part of the same X11 dispatch batch as
+    /// `MapWindow`, and our handler ignored requests for unknown windows —
+    /// so the game silently stayed windowed. We now record the intent here
+    /// and replay it in `map_x11_window` once the window is tracked.
+    pub(crate) pending_x11_fullscreen: Vec<smithay::xwayland::X11Surface>,
 }
 
 impl Beewm {
@@ -288,6 +305,7 @@ impl Beewm {
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
             pending_float_centers: HashSet::new(),
+            pending_should_float: HashSet::new(),
             active_grab: None,
             tiled_swap_target: None,
             resolved_keybinds,
@@ -302,6 +320,8 @@ impl Beewm {
             outputs_ready_for_startup: false,
             xwayland_start_pending: false,
             pending_x11_windows: Vec::new(),
+            commit_rate_log: HashMap::new(),
+            pending_x11_fullscreen: Vec::new(),
         };
 
         state.publish_workspace_state();

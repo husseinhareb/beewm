@@ -48,6 +48,21 @@ impl Beewm {
                 self.publish_workspace_state();
                 self.track_window(&window);
 
+                if surface.is_fullscreen() || self.x11_surface_covers_output(&surface) {
+                    self.insert_tiled_window(workspace_idx, &window, split_target.as_ref());
+                    self.pending_x11_fullscreen
+                        .retain(|pending| pending != &surface);
+                    tracing::info!(
+                        target: "beewm::xwayland",
+                        title = %surface.title(),
+                        class = %surface.class(),
+                        geometry = ?surface.geometry(),
+                        "mapped X11 window covers output; promoting to fullscreen",
+                    );
+                    self.apply_x11_fullscreen(&surface);
+                    return;
+                }
+
                 if should_float {
                     self.map_as_floating_centered(&window);
                 } else {
@@ -55,15 +70,30 @@ impl Beewm {
                     self.relayout();
                 }
 
-                if let Some(wl_surface) = window.wl_surface().map(|surface| surface.into_owned()) {
-                    self.set_keyboard_focus(Some(wl_surface));
+                // Match the xdg-shell path: when something is already fullscreen
+                // (a game, typically) don't let a freshly mapped X11 window steal
+                // its keyboard. The new window is still inserted into the
+                // workspace so it appears once fullscreen exits.
+                let fullscreen_blocks_focus = self
+                    .fullscreen_window
+                    .as_ref()
+                    .map(|fs| fs != &window)
+                    .unwrap_or(false);
+                if !fullscreen_blocks_focus {
+                    if let Some(wl_surface) =
+                        window.wl_surface().map(|surface| surface.into_owned())
+                    {
+                        self.set_keyboard_focus(Some(wl_surface));
+                    }
+                    self.space.raise_element(&window, true);
+                    // Sync X11 stacking with our scene-graph stacking so X
+                    // pointer event routing matches what the user sees.
+                    self.raise_x11_window(&surface);
+                    // Keep floating windows above any tiled windows that were
+                    // just raised; without this an X11 dialog opening while
+                    // another tiled window is mapped would be occluded.
+                    self.raise_floating_windows();
                 }
-
-                self.space.raise_element(&window, true);
-                // Keep floating windows above any tiled windows that were just
-                // raised; without this an X11 dialog opening while another
-                // tiled window is mapped would be occluded.
-                self.raise_floating_windows();
 
                 let geometry = self
                     .space
@@ -93,13 +123,98 @@ impl Beewm {
                     );
                 }
 
+                // Replay a deferred fullscreen intent (game-style: client
+                // sends _NET_WM_STATE_FULLSCREEN before the window is mapped).
+                if let Some(pos) = self
+                    .pending_x11_fullscreen
+                    .iter()
+                    .position(|pending| pending == &surface)
+                {
+                    let pending = self.pending_x11_fullscreen.remove(pos);
+                    tracing::info!(
+                        target: "beewm::xwayland",
+                        title = %pending.title(),
+                        "replaying queued fullscreen for now-mapped X11 window",
+                    );
+                    self.apply_x11_fullscreen(&pending);
+                }
+
                 self.needs_render = true;
             }
         }
     }
 
+    /// Promote a managed X11 window to fullscreen. Returns false when the
+    /// window isn't tracked in any workspace yet (caller should defer).
+    fn apply_x11_fullscreen(&mut self, window: &X11Surface) -> bool {
+        let Some((ws_idx, window_obj)) = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace
+                    .windows
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .x11_surface()
+                            .map(|surface| surface == window)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .map(|window_obj| (ws_idx, window_obj))
+            })
+        else {
+            return false;
+        };
+
+        let already_fullscreen = self
+            .fullscreen_window
+            .as_ref()
+            .map(|fullscreen| fullscreen == &window_obj)
+            .unwrap_or(false);
+        if already_fullscreen {
+            return true;
+        }
+        if self.fullscreen_window.is_some() {
+            self.restore_fullscreen();
+        }
+
+        let _ = window.set_fullscreen(true);
+
+        let output = match self.space.outputs().next().cloned() {
+            Some(o) => o,
+            None => return true,
+        };
+        let output_geo = self.space.output_geometry(&output).unwrap();
+
+        for sibling in &self.workspaces[ws_idx].windows {
+            if *sibling != window_obj {
+                self.space.unmap_elem(sibling);
+            }
+        }
+
+        let _ = window.configure(output_geo);
+        self.space
+            .map_element(window_obj.clone(), output_geo.loc, true);
+        self.fullscreen_window = Some(window_obj.clone());
+
+        if let Some(wl_surface) = window_obj.wl_surface().map(|s| s.into_owned()) {
+            self.set_keyboard_focus(Some(wl_surface));
+        }
+
+        self.needs_render = true;
+        true
+    }
+
+    fn x11_surface_covers_output(&self, surface: &X11Surface) -> bool {
+        self.rectangle_covers_output(surface.geometry())
+    }
+
     fn remove_x11_window(&mut self, surface: &X11Surface) {
         let _ = self.take_pending_x11_window(surface);
+        self.pending_x11_fullscreen
+            .retain(|pending| pending != surface);
 
         let Some((workspace_idx, window_idx)) =
             self.workspaces
@@ -152,6 +267,7 @@ impl Beewm {
                 .seat
                 .get_keyboard()
                 .and_then(|keyboard| keyboard.current_focus())
+                .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
             {
                 Some(current_focus) => tracked_surface
                     .as_ref()
@@ -211,7 +327,17 @@ impl Beewm {
 }
 
 fn should_map_x11_floating(surface: &X11Surface) -> bool {
-    matches!(
+    // A client that explicitly publishes _NET_WM_WINDOW_TYPE_NORMAL is
+    // declaring "I am a regular tileable app window." Honour that even when
+    // other heuristics below might match — many X11 apps (Zed, editors,
+    // browsers) set a WM_NORMAL_HINTS max_size as a "no real max" sentinel
+    // (display dimensions, INT_MAX) which we must not interpret as a dialog
+    // signal.
+    if matches!(surface.window_type(), Some(WmWindowType::Normal)) {
+        return false;
+    }
+
+    let by_type = matches!(
         surface.window_type(),
         Some(
             WmWindowType::Dialog
@@ -224,13 +350,28 @@ fn should_map_x11_floating(surface: &X11Surface) -> bool {
                 | WmWindowType::Tooltip
                 | WmWindowType::Utility
         )
-    ) || surface.is_popup()
-        || surface.is_transient_for().is_some()
-        || surface
-            .min_size()
-            .zip(surface.max_size())
-            .map(|(min_size, max_size)| min_size == max_size)
-            .unwrap_or(false)
+    );
+
+    let by_relation = surface.is_popup() || surface.is_transient_for().is_some();
+
+    // A textbook fixed-size dialog: min == max with both axes positive.
+    let is_fixed = surface
+        .min_size()
+        .zip(surface.max_size())
+        .map(|(min, max)| min == max && min.w > 0 && min.h > 0)
+        .unwrap_or(false);
+
+    // Bounded max_size *that is plausibly a real cap*, not a "no real max"
+    // sentinel. Threshold below typical screen-height (1024) is enough to
+    // catch gnome-keyring (~400x250), polkit prompts (~400x300), file pickers
+    // (~800x600) while excluding apps that publish display dimensions or
+    // 32767 as their max.
+    let has_dialog_size_cap = surface
+        .max_size()
+        .map(|max| max.w > 0 && max.h > 0 && max.w <= 1280 && max.h <= 1024)
+        .unwrap_or(false);
+
+    by_type || by_relation || is_fixed || has_dialog_size_cap
 }
 
 impl XWaylandShellHandler for Beewm {
@@ -479,62 +620,32 @@ impl XwmHandler for Beewm {
     fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let Some((ws_idx, window_obj)) = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .find_map(|(ws_idx, workspace)| {
-                workspace
-                    .windows
-                    .iter()
-                    .find(|candidate| {
-                        candidate
-                            .x11_surface()
-                            .map(|surface| surface == &window)
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .map(|window_obj| (ws_idx, window_obj))
-            })
-        else {
-            return;
-        };
-
-        let already_fullscreen = self
-            .fullscreen_window
-            .as_ref()
-            .map(|fullscreen| fullscreen == &window_obj)
-            .unwrap_or(false);
-        if already_fullscreen {
-            return;
-        }
-        if self.fullscreen_window.is_some() {
-            self.restore_fullscreen();
-        }
-
-        let _ = window.set_fullscreen(true);
-
-        let output = match self.space.outputs().next().cloned() {
-            Some(o) => o,
-            None => return,
-        };
-        let output_geo = self.space.output_geometry(&output).unwrap();
-
-        for sibling in &self.workspaces[ws_idx].windows {
-            if *sibling != window_obj {
-                self.space.unmap_elem(sibling);
+        tracing::info!(
+            target: "beewm::xwayland",
+            title = %window.title(),
+            class = %window.class(),
+            mapped = window.is_mapped(),
+            has_wl_surface = window.wl_surface().is_some(),
+            "X11 fullscreen_request",
+        );
+        if !self.apply_x11_fullscreen(&window) {
+            // Window not yet in a workspace — typical for games that emit
+            // _NET_WM_STATE_FULLSCREEN in the same dispatch batch as their
+            // MapRequest. Remember the intent and replay it once the window
+            // has been mapped through `map_x11_window`.
+            if !self
+                .pending_x11_fullscreen
+                .iter()
+                .any(|pending| pending == &window)
+            {
+                tracing::info!(
+                    target: "beewm::xwayland",
+                    title = %window.title(),
+                    "queued fullscreen request for unmapped X11 window",
+                );
+                self.pending_x11_fullscreen.push(window);
             }
         }
-
-        let _ = window.configure(output_geo);
-        self.space.map_element(window_obj.clone(), output_geo.loc, true);
-        self.fullscreen_window = Some(window_obj.clone());
-
-        if let Some(wl_surface) = window_obj.wl_surface().map(|s| s.into_owned()) {
-            self.set_keyboard_focus(Some(wl_surface));
-        }
-
-        self.needs_render = true;
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -546,6 +657,19 @@ impl XwmHandler for Beewm {
             .unwrap_or(false);
 
         if is_our_fullscreen {
+            if self.x11_surface_covers_output(&window) {
+                tracing::info!(
+                    target: "beewm::xwayland",
+                    title = %window.title(),
+                    class = %window.class(),
+                    geometry = ?window.geometry(),
+                    "ignoring X11 unfullscreen while surface still covers output",
+                );
+                let _ = window.set_fullscreen(true);
+                self.needs_render = true;
+                return;
+            }
+
             let _ = window.set_fullscreen(false);
             self.restore_fullscreen();
         }
