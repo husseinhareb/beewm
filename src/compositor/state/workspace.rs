@@ -72,6 +72,11 @@ impl Beewm {
             return;
         }
 
+        // Restore fullscreen before moving, mirroring switch_workspace. Without
+        // this, fullscreen_window keeps pointing at the moved window, leaving
+        // layer suppression active on the source workspace and siblings unmapped.
+        self.restore_fullscreen();
+
         let focus_idx = match self.active_workspace_focused_index() {
             Some(i) => i,
             None => return,
