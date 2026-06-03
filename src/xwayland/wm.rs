@@ -25,7 +25,10 @@ impl Beewm {
                     "mapping override-redirect X11 window",
                 );
                 self.track_window(&window);
-                self.space.map_element(window, surface.geometry().loc, true);
+                // Use activate=false: override-redirect windows are menus/tooltips
+                // that should not "activate" and deactivate all other windows in the
+                // space (which would strip _NET_WM_STATE_FOCUSED from the parent app).
+                self.space.map_element(window, surface.geometry().loc, false);
                 self.needs_render = true;
             }
             PendingX11Kind::Managed => {

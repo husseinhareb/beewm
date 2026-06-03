@@ -118,6 +118,19 @@ fn keyboard_focus_target_under_pointer(
     surface: &WlSurface,
 ) -> Option<crate::compositor::focus_target::KeyboardFocusTarget> {
     if let Some(window) = state.mapped_window_for_surface(surface) {
+        // Override-redirect X11 windows (menus, tooltips, dropdowns) must never
+        // receive keyboard focus. They are self-managed and not expected to be
+        // focused by the WM. Focusing them triggers X11Surface::leave() on the
+        // previously focused window, which calls set_input_focus(NONE) and
+        // generates a FocusOut event — causing apps like Steam to dismiss their
+        // popup menus as the user moves the cursor toward them.
+        if window
+            .x11_surface()
+            .map(|x11| x11.is_override_redirect())
+            .unwrap_or(false)
+        {
+            return None;
+        }
         return crate::compositor::focus_target::KeyboardFocusTarget::from_window(&window);
     }
 
