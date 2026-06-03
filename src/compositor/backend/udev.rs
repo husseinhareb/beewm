@@ -419,7 +419,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     for (device_id, path) in udev.device_list() {
         tracing::info!("Found DRM device: {} at {}", device_id, path.display());
         if data.gpu.is_none() {
-            match init_gpu(&mut session, &event_loop, &display_handle, path) {
+            match init_gpu(&mut session, &event_loop, &display_handle, path, data.state.config.refresh_rate) {
                 Ok((gd, dmabuf_formats, syncobj_state)) => {
                     data.state.space.map_output(&gd.output, (0, 0));
                     data.gpu = Some(gd);
@@ -755,6 +755,7 @@ fn init_gpu(
     event_loop: &EventLoop<UdevData>,
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     path: &Path,
+    refresh_rate: Option<u32>,
 ) -> Result<(GpuData, Vec<Format>, Option<DrmSyncobjState>), Box<dyn std::error::Error>> {
     // Open DRM device via session
     let fd = session.open(path, OFlags::RDWR | OFlags::CLOEXEC)?;
@@ -771,13 +772,33 @@ fn init_gpu(
     for conn_handle in resources.connectors() {
         if let Ok(conn_info) = drm_fd.get_connector(*conn_handle, false) {
             if conn_info.state() == connector::State::Connected && !conn_info.modes().is_empty() {
-                // Pick the preferred mode, or first available
-                let mode = conn_info
+                let preferred = conn_info
                     .modes()
                     .iter()
                     .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
                     .copied()
                     .unwrap_or(conn_info.modes()[0]);
+
+                let mode = if let Some(target_hz) = refresh_rate {
+                    let preferred_size = preferred.size();
+                    conn_info
+                        .modes()
+                        .iter()
+                        .find(|m| m.size() == preferred_size && m.vrefresh() == target_hz)
+                        .copied()
+                        .or_else(|| {
+                            tracing::warn!(
+                                "No mode found for {}x{}@{}Hz, falling back to preferred mode",
+                                preferred_size.0,
+                                preferred_size.1,
+                                target_hz,
+                            );
+                            None
+                        })
+                        .unwrap_or(preferred)
+                } else {
+                    preferred
+                };
 
                 selected_connector = Some(*conn_handle);
                 selected_mode = Some(mode);

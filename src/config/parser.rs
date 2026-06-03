@@ -77,6 +77,11 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.keyboard_layout = value.to_string();
             }
+            "refresh_rate" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                let hz: u32 = parse_number(value, line_no, directive)?;
+                config.refresh_rate = Some(hz);
+            }
             "exec" | "exec_once" | "autostart" => {
                 config
                     .autostart_commands
@@ -307,10 +312,7 @@ fn parse_action(action_text: &str, line_no: usize) -> Result<Action, ConfigError
             }
             Ok(Action::MoveToWorkspace(workspace))
         }
-        _ => Err(ConfigError::Parse {
-            line: line_no,
-            message: format!("unknown binding action '{}'", name),
-        }),
+        _ => Ok(Action::Spawn(action_text.to_string())),
     }
 }
 
