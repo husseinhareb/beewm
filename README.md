@@ -45,3 +45,11 @@ exec nm-applet
 
 bindsym $mod+Return exec kitty
 ```
+
+## Troubleshooting
+
+- **Low in-game FPS / low GPU usage** — see
+  [`docs/diagnosing-low-fps.md`](docs/diagnosing-low-fps.md) for the frame-pacing
+  model, the `beewm::presentation` / `beewm::commit` / `beewm::dmabuf` /
+  `beewm::sync` / `beewm::frame` diagnostic logs, and an A/B procedure to confirm
+  the pacing fix on your hardware.

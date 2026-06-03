@@ -36,8 +36,8 @@ use smithay::wayland::pointer_constraints::{
     PointerConstraint, PointerConstraintsHandler, with_pointer_constraint,
 };
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState, get_parent, send_surface_state,
-    with_states,
+    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
+    get_parent, send_surface_state, with_states,
 };
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
@@ -62,10 +62,35 @@ use smithay::wayland::shell::xdg::dialog::XdgDialogHandler;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::backend::renderer::{BufferType, buffer_type};
+use super::diagnostics::BufferKind;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::state::{Beewm, lookup_client_compositor_state, root_surface};
 use super::state::popup::should_map_toplevel_floating;
+
+/// Classify the buffer a surface just committed (for the `beewm::dmabuf` /
+/// `beewm::commit` traces). Reads `current()` because beewm's `commit()` runs
+/// after smithay has already promoted the pending state.
+fn committed_buffer_kind(surface: &WlSurface) -> BufferKind {
+    with_states(surface, |states| {
+        match states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .buffer
+            .as_ref()
+        {
+            Some(BufferAssignment::NewBuffer(buffer)) => match buffer_type(buffer) {
+                Some(BufferType::Shm) => BufferKind::Shm,
+                Some(BufferType::Dma) => BufferKind::Dmabuf,
+                Some(_) => BufferKind::Other,
+                None => BufferKind::Other,
+            },
+            _ => BufferKind::None,
+        }
+    })
+}
 
 impl Beewm {
     fn prime_surface_scale_state(&self, surface: &WlSurface) {
@@ -111,30 +136,25 @@ impl CompositorHandler for Beewm {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        // Diagnostic: aggregate commits per root-surface in 1s windows.
-        // Set RUST_LOG=beewm::commit=info to see "surface=<id> commits=<n>/s"
-        // lines and identify whether a specific client (e.g. a game) is
-        // committing at the expected rate.
+        // Diagnostic: aggregate per-root-surface commit rate, how promptly the
+        // client responds to our frame callbacks, and whether it is on the
+        // dmabuf fast path. See `diagnostics.rs` for the log format.
+        //   RUST_LOG=beewm::commit=info,beewm::dmabuf=warn
+        // A game committing far below the monitor refresh rate, with a *small*
+        // callback-to-commit latency, means the compositor is throttling it; a
+        // *large* latency means the client/GPU is the bottleneck. An shm count
+        // > 0 means the client fell off the dmabuf path and will be slow.
+        //
+        // Gated on the targets being enabled so a production session (no
+        // `RUST_LOG`) pays nothing — `committed_buffer_kind` takes a surface
+        // lock we don't otherwise need on this path.
+        if tracing::enabled!(target: "beewm::commit", tracing::Level::INFO)
+            || tracing::enabled!(target: "beewm::dmabuf", tracing::Level::WARN)
         {
-            let root = root_surface(surface);
-            let key = root.id().protocol_id();
-            let now = std::time::Instant::now();
-            let entry = self
-                .commit_rate_log
-                .entry(key)
-                .or_insert((0, now));
-            entry.0 = entry.0.saturating_add(1);
-            let elapsed = now.duration_since(entry.1);
-            if elapsed >= std::time::Duration::from_secs(1) {
-                tracing::info!(
-                    target: "beewm::commit",
-                    surface = key,
-                    commits = entry.0,
-                    window_s = elapsed.as_secs_f64(),
-                    "surface commit rate"
-                );
-                *entry = (0, now);
-            }
+            let key = root_surface(surface).id().protocol_id();
+            let cb_latency = self.last_frame_callbacks_sent_at.map(|t| t.elapsed());
+            let buffer = committed_buffer_kind(surface);
+            self.commit_tracker.record(key, cb_latency, buffer);
         }
 
         self.popup_manager.commit(surface);

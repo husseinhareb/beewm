@@ -14,6 +14,22 @@
 //!
 //! These exist purely as a debugging aid; once the freeze is root-caused
 //! they should all be removed (or promoted to real config options).
+//!
+//! There is also one *behaviour* toggle (not a kill-switch) used to A/B test
+//! the frame-pacing fix for low in-game FPS:
+//!
+//! | Env var                          | Effect                                      |
+//! |----------------------------------|---------------------------------------------|
+//! | `BEEWM_FRAME_CALLBACK_AT_VBLANK` | Send `wl_surface.frame` callbacks at vblank |
+//!
+//! By default beewm sends frame callbacks as soon as a frame has been queued
+//! for scan-out, so a client can render its next frame *in parallel* with the
+//! current one being displayed (pipelined). Setting this variable restores the
+//! older "send callbacks only after the vblank fires" behaviour, which couples
+//! client render + compositor composite into a single refresh interval and can
+//! cap fast clients (games) well below the display refresh rate. Keeping the
+//! toggle lets users confirm on their own hardware that the pacing change is
+//! what restored full frame rate.
 
 use std::sync::OnceLock;
 
@@ -24,6 +40,10 @@ pub struct RuntimeFlags {
     pub event_broadcaster_disabled: bool,
     pub explicit_sync_disabled: bool,
     pub dmabuf_disabled: bool,
+    /// When true, restore the legacy behaviour of sending `wl_surface.frame`
+    /// callbacks from the vblank handler instead of right after the frame is
+    /// queued for scan-out. Used to A/B test the frame-pacing fix.
+    pub frame_callback_at_vblank: bool,
 }
 
 impl RuntimeFlags {
@@ -39,6 +59,7 @@ impl RuntimeFlags {
             event_broadcaster_disabled: on("BEEWM_NO_EVENT_BROADCASTER"),
             explicit_sync_disabled: on("BEEWM_NO_EXPLICIT_SYNC"),
             dmabuf_disabled: on("BEEWM_NO_DMABUF"),
+            frame_callback_at_vblank: on("BEEWM_FRAME_CALLBACK_AT_VBLANK"),
         };
         if flags.focus_ipc_disabled
             || flags.workspace_publish_disabled
@@ -53,6 +74,12 @@ impl RuntimeFlags {
                 flags.event_broadcaster_disabled,
                 flags.explicit_sync_disabled,
                 flags.dmabuf_disabled,
+            );
+        }
+        if flags.frame_callback_at_vblank {
+            tracing::warn!(
+                "BEEWM_FRAME_CALLBACK_AT_VBLANK set: using legacy at-vblank frame \
+                 callbacks (no pipelining) — expect lower in-game FPS"
             );
         }
         flags

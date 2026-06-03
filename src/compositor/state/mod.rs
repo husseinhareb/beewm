@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
@@ -56,6 +57,7 @@ use crate::model::workspace::Workspace;
 use crate::xwayland::PendingX11Window;
 
 use super::commands::ChildEnvironment;
+use super::diagnostics::{CommitTracker, SyncStats};
 use super::event_broadcast::EventBroadcaster;
 use super::screencopy::{PendingScreencopyFrame, create_screencopy_global};
 
@@ -200,10 +202,16 @@ pub struct Beewm {
     pub(crate) outputs_ready_for_startup: bool,
     pub(crate) xwayland_start_pending: bool,
     pub(crate) pending_x11_windows: Vec<PendingX11Window>,
-    /// Per-root-surface commit counters for the `beewm::commit` rate trace.
-    /// Keyed by `WlSurface::id().protocol_id()`; value is `(commits in current
-    /// 1s window, window start time)`. Used purely as diagnostic output.
-    pub(crate) commit_rate_log: HashMap<u32, (u32, std::time::Instant)>,
+    /// Per-root-surface commit-rate / responsiveness / buffer-type tracker for
+    /// the `beewm::commit` + `beewm::dmabuf` traces. Diagnostic output only.
+    pub(crate) commit_tracker: CommitTracker,
+    /// Wall-clock time of the most recent `wl_surface.frame` callback batch.
+    /// Used to measure how long after we invite a client to draw it actually
+    /// commits its next buffer — the key signal for splitting compositor-side
+    /// throttling from client-side / GPU-side stalls.
+    pub(crate) last_frame_callbacks_sent_at: Option<Instant>,
+    /// Explicit-sync acquire-fence activity for the `beewm::sync` trace.
+    pub(crate) sync_stats: SyncStats,
     /// X11 windows that sent `_NET_WM_STATE_FULLSCREEN` before they were
     /// mapped into a workspace. Games (especially via Proton) frequently
     /// emit the fullscreen request as part of the same X11 dispatch batch as
@@ -327,7 +335,9 @@ impl Beewm {
             outputs_ready_for_startup: false,
             xwayland_start_pending: false,
             pending_x11_windows: Vec::new(),
-            commit_rate_log: HashMap::new(),
+            commit_tracker: CommitTracker::default(),
+            last_frame_callbacks_sent_at: None,
+            sync_stats: SyncStats::new(),
             pending_x11_fullscreen: Vec::new(),
         };
 
@@ -458,6 +468,9 @@ impl Beewm {
                 Ok((blocker, source)) => {
                     add_blocker(surface, blocker);
                     installer(source, client);
+                    // A commit was held waiting on a client GPU fence; the
+                    // matching clear is counted in the backend's fence source.
+                    state.sync_stats.record_install();
                 }
                 Err(error) => {
                     tracing::warn!("Failed to install explicit-sync blocker: {}", error);

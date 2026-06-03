@@ -2,6 +2,7 @@ pub mod backend;
 pub(crate) mod commands;
 pub(crate) mod config_watcher;
 mod cursor;
+pub(crate) mod diagnostics;
 mod event_broadcast;
 mod feedback;
 pub(crate) mod focus_target;

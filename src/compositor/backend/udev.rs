@@ -8,7 +8,7 @@ use smithay::backend::allocator::Format;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime};
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime, DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
@@ -27,12 +27,14 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::utils::{Monotonic, Time};
+use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder};
 use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::compositor::commands::ChildEnvironment;
 use crate::compositor::config_watcher;
+use crate::compositor::diagnostics::PresentStats;
 use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
@@ -45,6 +47,23 @@ use crate::compositor::render::{
 use crate::compositor::screencopy::process_pending_screencopies;
 use crate::compositor::state::{Beewm, ClientState, lookup_client_compositor_state};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
+
+/// How the `wp_linux_dmabuf` global should be advertised.
+///
+/// Modern clients — Mesa EGL and especially XWayland/glamor (which is how Steam
+/// games render) — use the dmabuf *feedback* protocol (v4) to discover the
+/// render device and the format/modifier tranches the compositor can import. If
+/// we only expose the legacy v3 global they cannot negotiate a shared buffer and
+/// silently fall back to slow shared-memory buffers, which tanks the frame rate
+/// and GPU utilisation. We therefore build feedback whenever possible and only
+/// fall back to v3 if the device id / feedback can't be obtained.
+enum DmabufSetup {
+    /// v4 global with a default feedback tranche (preferred). Boxed because the
+    /// feedback owns the full format/modifier tables.
+    Feedback(Box<DmabufFeedback>),
+    /// v3 global with a flat format list (fallback).
+    Legacy(Vec<Format>),
+}
 
 /// Per-GPU state for the DRM backend.
 struct GpuData {
@@ -66,6 +85,9 @@ struct GpuData {
     /// a summary line is emitted so the file stays digestible at high refresh
     /// rates instead of growing one log line per frame.
     frame_stats: FrameStats,
+    /// Vblank-cadence counters for the `beewm::presentation` instrumentation —
+    /// proves whether the compositor presents at the real refresh rate.
+    present_stats: PresentStats,
 }
 
 #[derive(Debug)]
@@ -206,6 +228,8 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             let client = client.clone();
             if let Err(error) =
                 loop_handle.insert_source(source, move |(), _, data: &mut UdevData| {
+                    // An acquire fence signalled; release the held commit(s).
+                    data.state.sync_stats.record_clear();
                     if let Some(client_state) = lookup_client_compositor_state(&client) {
                         let display_handle = data.state.display_handle.clone();
                         client_state.blocker_cleared(&mut data.state, &display_handle);
@@ -420,7 +444,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Found DRM device: {} at {}", device_id, path.display());
         if data.gpu.is_none() {
             match init_gpu(&mut session, &event_loop, &display_handle, path, data.state.config.refresh_rate) {
-                Ok((gd, dmabuf_formats, syncobj_state)) => {
+                Ok((gd, dmabuf_setup, syncobj_state)) => {
                     data.state.space.map_output(&gd.output, (0, 0));
                     data.gpu = Some(gd);
                     data.state.drm_syncobj_state = syncobj_state;
@@ -430,11 +454,20 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             "Dmabuf global skipped by BEEWM_NO_DMABUF; clients will fall back to shm"
                         );
                     } else {
-                        data.state._dmabuf_global = Some(
-                            data.state
+                        let global = match dmabuf_setup {
+                            DmabufSetup::Feedback(feedback) => data
+                                .state
                                 .dmabuf_state
-                                .create_global::<Beewm>(&display_handle, dmabuf_formats),
-                        );
+                                .create_global_with_default_feedback::<Beewm>(
+                                    &display_handle,
+                                    &feedback,
+                                ),
+                            DmabufSetup::Legacy(formats) => data
+                                .state
+                                .dmabuf_state
+                                .create_global::<Beewm>(&display_handle, formats),
+                        };
+                        data.state._dmabuf_global = Some(global);
                     }
                 }
                 Err(e) => tracing::warn!("Failed to init GPU {}: {}", path.display(), e),
@@ -514,6 +547,14 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             // render on the following iteration just to clear the flag.
             data.state.needs_render = false;
             render_frame(&mut data);
+            // render_frame queued this frame's wl_surface.frame callbacks (the
+            // pipelining fix). Flush them now so the client starts its next
+            // frame immediately, in parallel with this one scanning out —
+            // otherwise they wait for the next dispatch cycle, which at high
+            // refresh rates is a whole frame interval and defeats the point.
+            if let Err(err) = data.display.flush_clients() {
+                tracing::warn!("Failed to flush Wayland clients after render: {}", err);
+            }
         }
     }
 
@@ -537,6 +578,16 @@ fn render_frame(data: &mut UdevData) {
     // the output. Both should suppress top-layers so the game can be promoted
     // onto the primary plane by smithay's DrmCompositor.
     let fullscreen_active = data.state.screen_owned_by_window();
+    // Whether the screen-owning window is an XWayland (X11) surface — many
+    // games run through XWayland, and `beewm::frame` surfaces this so the log
+    // shows which path is being exercised.
+    let fullscreen_is_x11 = data
+        .state
+        .fullscreen_window
+        .as_ref()
+        .and_then(|w| w.x11_surface())
+        .is_some()
+        || data.state.screen_owned_by_x11_window();
 
     let border_elements = data.state.border_elements();
     // Cursor visibility is driven entirely by Wayland client/pointer state, not
@@ -615,6 +666,7 @@ fn render_frame(data: &mut UdevData) {
                     elapsed,
                     Some(output_frame_interval(&output)),
                 );
+                data.state.last_frame_callbacks_sent_at = Some(Instant::now());
             } else if let Err(e) = gpu.compositor.queue_frame(()) {
                 tracing::error!("Failed to queue frame: {:?}", e);
                 gpu.can_render = true;
@@ -624,12 +676,33 @@ fn render_frame(data: &mut UdevData) {
                 data.state.needs_render = true;
                 let elapsed = data.state.start_time.elapsed();
                 send_frame_callbacks(&data.state, &output, elapsed, None);
+                data.state.last_frame_callbacks_sent_at = Some(Instant::now());
             } else {
                 gpu.pending_presentation_feedback = Some(collect_presentation_feedback(
                     &data.state,
                     &output,
                     &render_states,
                 ));
+                // Frame-pacing fix: invite clients to draw their *next* frame
+                // as soon as this one is queued for scan-out, so the client
+                // renders in parallel with the current frame being displayed
+                // instead of serializing client-render + our composite into the
+                // single refresh interval that follows the vblank. This is what
+                // lets fast clients (games, native or XWayland) actually reach
+                // the monitor refresh rate. `wp_presentation` feedback is still
+                // emitted at the real vblank below, so reported timing stays
+                // accurate. Set BEEWM_FRAME_CALLBACK_AT_VBLANK to restore the
+                // legacy at-vblank behaviour for comparison.
+                if !crate::compositor::runtime_flags::flags().frame_callback_at_vblank {
+                    let elapsed = data.state.start_time.elapsed();
+                    send_frame_callbacks(
+                        &data.state,
+                        &output,
+                        elapsed,
+                        Some(output_frame_interval(&output)),
+                    );
+                    data.state.last_frame_callbacks_sent_at = Some(Instant::now());
+                }
             }
 
             record_frame_stats(
@@ -640,6 +713,7 @@ fn render_frame(data: &mut UdevData) {
                 overlay_count,
                 cursor_plane_used,
                 fullscreen_active,
+                fullscreen_is_x11,
                 count_windows,
                 count_borders,
                 count_cursor,
@@ -674,6 +748,7 @@ fn record_frame_stats(
     overlay_count: usize,
     cursor_plane_used: bool,
     fullscreen_active: bool,
+    fullscreen_is_x11: bool,
     count_windows: usize,
     count_borders: usize,
     count_cursor: usize,
@@ -710,6 +785,7 @@ fn record_frame_stats(
             target: "beewm::frame",
             is_scanout,
             fullscreen_active,
+            fullscreen_is_x11,
             overlay_count,
             cursor_plane_used,
             count_windows,
@@ -744,6 +820,7 @@ fn record_frame_stats(
             avg_render_us = avg_us,
             max_render_us = stats.render_time_max.as_micros() as u64,
             fullscreen_active,
+            fullscreen_is_x11,
             "frame-stats over {:.2}s",
             secs,
         );
@@ -757,7 +834,7 @@ fn init_gpu(
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     path: &Path,
     refresh_rate: Option<u32>,
-) -> Result<(GpuData, Vec<Format>, Option<DrmSyncobjState>), Box<dyn std::error::Error>> {
+) -> Result<(GpuData, DmabufSetup, Option<DrmSyncobjState>), Box<dyn std::error::Error>> {
     // Open DRM device via session
     let fd = session.open(path, OFlags::RDWR | OFlags::CLOEXEC)?;
     let device_fd: DeviceFd = fd.into();
@@ -835,7 +912,60 @@ fn init_gpu(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
+
+    // Decide how to advertise the dmabuf global. Prefer v4 feedback built from
+    // the render device + the formats the GL renderer can actually import, so
+    // Mesa/XWayland clients use the GPU fast path instead of falling back to
+    // shm (the classic cause of ~20-30 fps games). Fall back to the legacy v3
+    // global only if we can't read the device id or build the feedback.
     let dmabuf_formats = renderer_formats.clone();
+    let format_count = dmabuf_formats.len();
+    // Prefer the *render* node's device id as the feedback main device: it is
+    // the unprivileged node (e.g. /dev/dri/renderD128) clients open to allocate
+    // GBM buffers. Fall back to the primary node, then to the raw fd dev id.
+    let main_device = DrmNode::from_path(path)
+        .ok()
+        .map(|node| {
+            node.node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .unwrap_or(node)
+                .dev_id()
+        })
+        .or_else(|| drm_fd.dev_id().ok());
+    let dmabuf_setup = match main_device {
+        Some(dev_id) => match DmabufFeedbackBuilder::new(dev_id, dmabuf_formats.clone()).build() {
+            Ok(feedback) => {
+                tracing::info!(
+                    target: "beewm::dmabuf",
+                    main_device = dev_id,
+                    formats = format_count,
+                    "advertising dmabuf with default feedback (v4); clients can use the GPU fast path",
+                );
+                if format_count == 0 {
+                    tracing::warn!(
+                        target: "beewm::dmabuf",
+                        "renderer reported zero dmabuf import formats — clients will be forced to shm",
+                    );
+                }
+                DmabufSetup::Feedback(Box::new(feedback))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "beewm::dmabuf",
+                    "failed to build dmabuf feedback ({}); falling back to legacy v3 global",
+                    e,
+                );
+                DmabufSetup::Legacy(dmabuf_formats)
+            }
+        },
+        None => {
+            tracing::warn!(
+                target: "beewm::dmabuf",
+                "could not determine DRM device id; falling back to legacy v3 dmabuf global",
+            );
+            DmabufSetup::Legacy(dmabuf_formats)
+        }
+    };
 
     let renderer = unsafe { GlesRenderer::new(egl_context)? };
 
@@ -880,6 +1010,22 @@ fn init_gpu(
     );
     output.set_preferred(output_mode);
 
+    // Surface the exact present timing the rest of the pipeline will use. The
+    // frame interval here drives both the `wp_presentation` refresh reported to
+    // clients (XWayland/games use it to schedule vblanks) and the
+    // `beewm::presentation` cadence baseline, so a wrong value here would
+    // silently mis-pace every client.
+    let frame_interval = output_frame_interval(&output);
+    tracing::info!(
+        target: "beewm::presentation",
+        width = output_mode.size.w,
+        height = output_mode.size.h,
+        refresh_mhz = output_mode.refresh,
+        refresh_hz = output_mode.refresh as f64 / 1000.0,
+        frame_interval_us = frame_interval.as_micros() as u64,
+        "selected output mode",
+    );
+
     // Create DRM compositor
     let cursor_size = drm_device.cursor_size();
 
@@ -902,12 +1048,20 @@ fn init_gpu(
         tracing::warn!("Explicit sync disabled by BEEWM_NO_EXPLICIT_SYNC");
         None
     } else if supports_syncobj_eventfd(&drm_fd) {
+        tracing::info!(
+            target: "beewm::sync",
+            "explicit sync enabled (linux-drm-syncobj-v1 with eventfd waits)"
+        );
         Some(DrmSyncobjState::new::<Beewm>(
             display_handle,
             drm_fd.clone(),
         ))
     } else {
-        tracing::info!("DRM syncobj eventfd unsupported on {}", path.display());
+        tracing::info!(
+            target: "beewm::sync",
+            "DRM syncobj eventfd unsupported on {} — explicit sync off",
+            path.display()
+        );
         None
     };
 
@@ -916,12 +1070,14 @@ fn init_gpu(
         drm_notifier,
         |event, metadata, data: &mut UdevData| match event {
             DrmEvent::VBlank(_crtc) => {
+                let mut feedback_presented = false;
                 if let Some(gpu) = data.gpu.as_mut() {
                     if let Err(e) = gpu.compositor.frame_submitted() {
                         tracing::error!("frame_submitted error: {:?}", e);
                     }
                     gpu.can_render = true;
-                    let refresh = Refresh::fixed(output_frame_interval(&gpu.output));
+                    let interval = output_frame_interval(&gpu.output);
+                    let refresh = Refresh::fixed(interval);
                     let presentation_time = metadata
                         .as_ref()
                         .and_then(|meta| match meta.time {
@@ -940,19 +1096,29 @@ fn init_gpu(
                             sequence,
                             smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
                         );
+                        feedback_presented = true;
                     }
+                    // beewm::presentation — measure the real interval between
+                    // page-flip completions against the nominal refresh.
+                    gpu.present_stats.record_vblank(interval, feedback_presented);
                 }
 
-                // Frame is now on screen — send frame callbacks so clients
-                // render their next frame in sync with the display VBlank.
-                let elapsed = data.state.start_time.elapsed();
-                if let Some(gpu) = data.gpu.as_ref() {
-                    send_frame_callbacks(
-                        &data.state,
-                        &gpu.output,
-                        elapsed,
-                        Some(output_frame_interval(&gpu.output)),
-                    );
+                // By default frame callbacks were already sent right after the
+                // frame was queued (see render_frame), so the client has been
+                // rendering its next frame in parallel with this one's scan-out.
+                // Only send them here when the operator opted into the legacy
+                // at-vblank pacing for A/B comparison.
+                if crate::compositor::runtime_flags::flags().frame_callback_at_vblank {
+                    let elapsed = data.state.start_time.elapsed();
+                    if let Some(gpu) = data.gpu.as_ref() {
+                        send_frame_callbacks(
+                            &data.state,
+                            &gpu.output,
+                            elapsed,
+                            Some(output_frame_interval(&gpu.output)),
+                        );
+                    }
+                    data.state.last_frame_callbacks_sent_at = Some(Instant::now());
                 }
             }
             DrmEvent::Error(e) => tracing::error!("DRM error: {:?}", e),
@@ -970,8 +1136,9 @@ fn init_gpu(
             can_render: true, // allow first frame immediately
             pending_presentation_feedback: None,
             frame_stats: FrameStats::new(),
+            present_stats: PresentStats::new(),
         },
-        dmabuf_formats,
+        dmabuf_setup,
         syncobj_state,
     ))
 }

@@ -1,5 +1,5 @@
 use std::os::fd::AsFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
@@ -464,6 +464,10 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                 if submitted {
                     data.state.needs_render = false;
+                    // Mirror the udev backend so the `beewm::commit`
+                    // callback-to-commit latency is meaningful when developing
+                    // against the nested winit backend.
+                    data.state.last_frame_callbacks_sent_at = Some(Instant::now());
                 }
             }
         }
