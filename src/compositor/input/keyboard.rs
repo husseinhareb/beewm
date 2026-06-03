@@ -1,6 +1,6 @@
 use smithay::backend::input::{Event, InputBackend, KeyState, KeyboardKeyEvent};
 use smithay::backend::session::Session;
-use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState};
+use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, xkb};
 use smithay::utils::SERIAL_COUNTER;
 
 use crate::compositor::commands::spawn_shell_command;
@@ -36,7 +36,7 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
                     return FilterResult::Intercept(());
                 }
 
-                if let Some(action) = match_keybind(state, modifiers, &keysym_handle) {
+                if let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle) {
                     execute_action(state, action);
                     return FilterResult::Intercept(());
                 }
@@ -49,6 +49,7 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
 fn match_keybind(
     state: &Beewm,
     modifiers: &ModifiersState,
+    keycode: xkb::Keycode,
     keysym_handle: &KeysymHandle<'_>,
 ) -> Option<Action> {
     let raw = keysym_handle.raw_syms();
@@ -59,12 +60,20 @@ fn match_keybind(
     };
 
     for bind in &state.resolved_keybinds {
-        if modifiers.logo == bind.logo
-            && modifiers.shift == bind.shift
-            && modifiers.ctrl == bind.ctrl
-            && modifiers.alt == bind.alt
-            && bind.keysym == keysym
+        if modifiers.logo != bind.logo
+            || modifiers.shift != bind.shift
+            || modifiers.ctrl != bind.ctrl
+            || modifiers.alt != bind.alt
         {
+            continue;
+        }
+        // Prefer physical-position matching (keycode from US layout); fall back
+        // to keysym for special keys (XF86 media keys, etc.) not in the US map.
+        let matches = match bind.keycode {
+            Some(expected) => keycode == expected,
+            None => bind.keysym == keysym,
+        };
+        if matches {
             return Some(bind.action.clone());
         }
     }

@@ -17,7 +17,7 @@ use smithay::backend::renderer::sync::Fence;
 use smithay::backend::session::libseat::LibSeatSession;
 
 use smithay::desktop::{PopupManager, Space, Window};
-use smithay::input::keyboard::xkb;
+use smithay::input::keyboard::{XkbConfig, xkb};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::backend::{ClientData, GlobalId};
@@ -240,8 +240,15 @@ impl Beewm {
         let mut seat = seat_state.new_wl_seat(&display_handle, "beewm");
 
         // Initialize keyboard and pointer on the seat
-        seat.add_keyboard(Default::default(), 200, 25)
-            .expect("Failed to add keyboard");
+        seat.add_keyboard(
+            XkbConfig {
+                layout: &config.keyboard_layout,
+                ..Default::default()
+            },
+            200,
+            25,
+        )
+        .expect("Failed to add keyboard");
         seat.add_pointer();
 
         let num_ws = config.num_workspaces;
@@ -384,6 +391,22 @@ impl Beewm {
                 self.config.num_workspaces,
                 new_config.num_workspaces,
             );
+        }
+
+        // keyboard_layout: re-apply XKB config so the running session picks it up.
+        if new_config.keyboard_layout != self.config.keyboard_layout {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                let result = keyboard.set_xkb_config(
+                    self,
+                    XkbConfig {
+                        layout: &new_config.keyboard_layout,
+                        ..Default::default()
+                    },
+                );
+                if let Err(e) = result {
+                    tracing::warn!("Failed to apply keyboard_layout '{}': {:?}", new_config.keyboard_layout, e);
+                }
+            }
         }
 
         // autostart_commands are intentionally not re-executed on reload.
@@ -644,7 +667,11 @@ pub(crate) fn root_surface(surface: &WlSurface) -> WlSurface {
 }
 
 /// Pre-resolve keybinds so the hot-path is a simple integer comparison.
+/// Keycodes are looked up in a base US QWERTY keymap so that bindings fire on
+/// physical key position rather than the symbol the active layout produces.
 fn resolve_keybinds(keybinds: &[Keybind]) -> Vec<ResolvedKeybind> {
+    let us_keycode_map = build_us_keysym_to_keycode_map();
+
     keybinds
         .iter()
         .map(|bind| {
@@ -662,16 +689,52 @@ fn resolve_keybinds(keybinds: &[Keybind]) -> Vec<ResolvedKeybind> {
                 }
             }
             let keysym = xkb::keysym_from_name(&bind.key, xkb::KEYSYM_CASE_INSENSITIVE);
+            let keycode = us_keycode_map.get(&keysym).copied();
             ResolvedKeybind {
                 logo,
                 shift,
                 ctrl,
                 alt,
+                keycode,
                 keysym,
                 action: bind.action.clone(),
             }
         })
         .collect()
+}
+
+/// Build a map from keysym → XKB keycode using a base US QWERTY layout so
+/// that keybind resolution is position-based instead of symbol-based.
+fn build_us_keysym_to_keycode_map() -> std::collections::HashMap<xkb::Keysym, xkb::Keycode> {
+    let mut map = std::collections::HashMap::new();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let Some(keymap) = xkb::Keymap::new_from_names(
+        &context,
+        "",
+        "",
+        "us",
+        "",
+        None,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    ) else {
+        tracing::warn!("Failed to build US keymap for position-based keybind resolution");
+        return map;
+    };
+
+    let min = keymap.min_keycode();
+    let max = keymap.max_keycode();
+    let mut code = min;
+    loop {
+        let syms = keymap.key_get_syms_by_level(code, 0, 0);
+        if let Some(&sym) = syms.first() {
+            map.entry(sym).or_insert(code);
+        }
+        if code == max {
+            break;
+        }
+        code = xkb::Keycode::new(code.raw() + 1);
+    }
+    map
 }
 
 pub(crate) fn lookup_client_compositor_state(client: &Client) -> Option<&CompositorClientState> {

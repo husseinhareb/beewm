@@ -13,6 +13,11 @@ pub struct ResolvedKeybind {
     pub shift: bool,
     pub ctrl: bool,
     pub alt: bool,
+    /// Physical key position in the US QWERTY layout (XKB keycode). When set,
+    /// matching uses keycode so the binding fires on the same physical key
+    /// regardless of the active keyboard layout. Falls back to `keysym` when
+    /// the key has no level-0 entry in the US layout (e.g. XF86 media keys).
+    pub keycode: Option<xkb::Keycode>,
     pub keysym: xkb::Keysym,
     pub action: Action,
 }

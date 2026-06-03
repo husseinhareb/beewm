@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_WORKSPACE_KEYS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+const DEFAULT_KEYBOARD_LAYOUT: &str = "us";
 
 /// A keybinding definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,7 @@ pub struct Config {
     pub focus_follows_mouse: bool,
     pub tap_to_click: bool,
     pub natural_scroll: bool,
+    pub keyboard_layout: String,
     pub autostart_commands: Vec<String>,
     pub keybinds: Vec<Keybind>,
 }
@@ -91,6 +93,7 @@ impl Default for Config {
             focus_follows_mouse: true,
             tap_to_click: true,
             natural_scroll: false,
+            keyboard_layout: DEFAULT_KEYBOARD_LAYOUT.to_string(),
             autostart_commands: Vec::new(),
             keybinds: Self::default_keybinds_for(num_workspaces),
         }
@@ -267,6 +270,7 @@ impl Config {
         ));
         text.push_str(&format!("tap_to_click {}\n", default.tap_to_click));
         text.push_str(&format!("natural_scroll {}\n", default.natural_scroll));
+        text.push_str(&format!("keyboard_layout {}\n", default.keyboard_layout));
         text.push_str("# Start commands once when beewm launches.\n");
         text.push_str("# exec waybar\n");
         text.push_str("# exec nm-applet\n\n");

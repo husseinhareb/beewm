@@ -73,6 +73,10 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.natural_scroll = parse_bool(value, line_no, directive)?;
             }
+            "keyboard_layout" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.keyboard_layout = value.to_string();
+            }
             "exec" | "exec_once" | "autostart" => {
                 config
                     .autostart_commands
