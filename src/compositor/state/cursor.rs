@@ -9,18 +9,7 @@ use super::{ActiveGrab, Beewm};
 
 impl Beewm {
     pub fn effective_cursor_icon(&self) -> Option<CursorIcon> {
-        // Compositor-driven cursor (hovering borders, move grab) takes priority
-        // over whatever the client has requested.
-        if let Some(icon) = self.compositor_cursor_icon {
-            return Some(icon);
-        }
-        match &self.cursor_status {
-            CursorImageStatus::Hidden => None,
-            CursorImageStatus::Named(icon) => Some(*icon),
-            // Surface cursors are rendered separately; fall back to Default here
-            // so the compositor's software cursor overlay is still visible.
-            CursorImageStatus::Surface(_) => Some(CursorIcon::Default),
-        }
+        resolve_cursor_icon(self.compositor_cursor_icon, &self.cursor_status)
     }
 
     pub fn set_cursor_status(&mut self, status: CursorImageStatus) {
@@ -83,6 +72,36 @@ impl Beewm {
         renderer: &mut GlesRenderer,
     ) -> Vec<MemoryRenderBufferRenderElement<GlesRenderer>> {
         self.cursor_elements_for_renderer(renderer)
+    }
+}
+
+/// Resolve which cursor icon (if any) the compositor should render, purely from
+/// Wayland/input protocol state.
+///
+/// Visibility is decided by the client's pointer/cursor state, never by whether
+/// a window is fullscreen:
+/// - A compositor-owned cursor (border-resize hover, move/resize grab) always
+///   wins, since the interaction belongs to the compositor.
+/// - Otherwise the focused client's `wl_pointer.set_cursor` request drives it:
+///   `Hidden` (a null cursor surface, or an active pointer-lock constraint that
+///   set the status to hidden) renders nothing; `Named` uses that themed icon;
+///   `Surface` falls back to the default arrow because surface cursors are not
+///   yet composited here.
+fn resolve_cursor_icon(
+    compositor_cursor_icon: Option<CursorIcon>,
+    cursor_status: &CursorImageStatus,
+) -> Option<CursorIcon> {
+    // Compositor-driven cursor (hovering borders, move grab) takes priority
+    // over whatever the client has requested.
+    if let Some(icon) = compositor_cursor_icon {
+        return Some(icon);
+    }
+    match cursor_status {
+        CursorImageStatus::Hidden => None,
+        CursorImageStatus::Named(icon) => Some(*icon),
+        // Surface cursors are rendered separately; fall back to Default here
+        // so the compositor's software cursor overlay is still visible.
+        CursorImageStatus::Surface(_) => Some(CursorIcon::Default),
     }
 }
 
@@ -165,4 +184,49 @@ fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_cursor_icon;
+    use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+
+    // The fullscreen state is intentionally not a parameter of
+    // `resolve_cursor_icon`: cursor visibility must never depend on presentation
+    // state. These tests pin the protocol-driven behavior.
+
+    #[test]
+    fn named_client_cursor_is_shown() {
+        assert_eq!(
+            resolve_cursor_icon(None, &CursorImageStatus::Named(CursorIcon::Text)),
+            Some(CursorIcon::Text),
+        );
+    }
+
+    #[test]
+    fn hidden_client_cursor_renders_nothing() {
+        // A client that hid its pointer (null cursor surface) or a surface under
+        // an active pointer lock keeps the compositor from drawing an overlay.
+        assert_eq!(resolve_cursor_icon(None, &CursorImageStatus::Hidden), None);
+    }
+
+    #[test]
+    fn compositor_cursor_overrides_client_status() {
+        // Border-resize / move grabs own the cursor even if the client set one.
+        assert_eq!(
+            resolve_cursor_icon(
+                Some(CursorIcon::Grabbing),
+                &CursorImageStatus::Named(CursorIcon::Default),
+            ),
+            Some(CursorIcon::Grabbing),
+        );
+    }
+
+    #[test]
+    fn compositor_cursor_overrides_hidden_status() {
+        assert_eq!(
+            resolve_cursor_icon(Some(CursorIcon::EResize), &CursorImageStatus::Hidden),
+            Some(CursorIcon::EResize),
+        );
+    }
 }

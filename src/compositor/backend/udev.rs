@@ -539,16 +539,17 @@ fn render_frame(data: &mut UdevData) {
     let fullscreen_active = data.state.screen_owned_by_window();
 
     let border_elements = data.state.border_elements();
-    // When a game owns the screen, drop the compositor cursor element so it
-    // doesn't sit on top of the primary plane and block direct scanout. The
-    // game still gets to draw its own cursor through its surface (or use a
-    // relative pointer / hidden cursor), so the user-visible change is just
-    // "no compositor pointer overlay while a fullscreen app is up".
-    let cursor_elements = if fullscreen_active {
-        Vec::new()
-    } else {
-        data.state.cursor_elements(&mut gpu.renderer)
-    };
+    // Cursor visibility is driven entirely by Wayland client/pointer state, not
+    // by fullscreen presentation. `effective_cursor_icon()` returns `None` (so
+    // `cursor_elements` is empty) exactly when the focused client hid the cursor
+    // (e.g. a null cursor surface) or when an active pointer-lock constraint
+    // requires it. Fullscreen alone never hides the pointer here.
+    //
+    // The element is tagged `Kind::Cursor`, so smithay's `DrmCompositor`
+    // promotes it onto the hardware cursor plane; a fullscreen game can still be
+    // direct-scanned-out onto the primary plane with the cursor on its own
+    // plane, so keeping the element does not block direct scanout.
+    let cursor_elements = data.state.cursor_elements(&mut gpu.renderer);
 
     // Render layer-shell surfaces (waybar, beebar, etc.) at the correct Z-order.
     // Clone output so we can borrow it for layer_map while also using gpu.renderer.
