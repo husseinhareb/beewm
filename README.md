@@ -46,6 +46,18 @@ exec nm-applet
 bindsym $mod+Return exec kitty
 ```
 
+## Screen sharing & recording
+
+beewm supports screen sharing/recording (OBS, Chromium/Firefox WebRTC,
+Discord/Slack/Zoom, etc.) through `xdg-desktop-portal` + PipeWire, backed by
+`xdg-desktop-portal-wlr` and beewm's `zwlr_screencopy` implementation. beewm
+exports the session environment to the D-Bus/systemd activation environment at
+startup so the (bus-activated) portal can find the display.
+
+One-time setup: install the portal stack and run `./portal/install.sh`. See
+[`docs/screen-sharing.md`](docs/screen-sharing.md) for the full setup, testing
+(OBS/browsers), and troubleshooting guide.
+
 ## Troubleshooting
 
 - **Low in-game FPS / low GPU usage** — see

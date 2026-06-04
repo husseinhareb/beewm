@@ -296,6 +296,10 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     data.state.child_env = child_env;
+    // udev is the real TTY session: beewm owns the seat, so it is safe (and
+    // necessary) to push the session env to D-Bus/systemd so the screen-sharing
+    // portal and PipeWire can find the display.
+    data.state.session_env_managed = true;
 
     event_loop
         .handle()

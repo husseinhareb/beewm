@@ -12,6 +12,7 @@
 //! | `BEEWM_NO_EXPLICIT_SYNC`       | DRM syncobj / explicit-sync surface hooks  |
 //! | `BEEWM_NO_DMABUF`              | wp_linux_dmabuf global (force shm clients) |
 //! | `BEEWM_DISABLE_ANIMATIONS`     | All compositor-driven window animations    |
+//! | `BEEWM_NO_SESSION_ENV_EXPORT`  | Pushing session env to D-Bus/systemd (portals) |
 //!
 //! These exist purely as a debugging aid; once the freeze is root-caused
 //! they should all be removed (or promoted to real config options).
@@ -46,6 +47,12 @@ pub struct RuntimeFlags {
     /// scheduling, so being able to turn them off without editing the config
     /// helps isolate rendering bugs.
     pub animations_disabled: bool,
+    /// When true, do NOT push the session environment (WAYLAND_DISPLAY,
+    /// XDG_CURRENT_DESKTOP, …) into the D-Bus activation / systemd user
+    /// environment at startup. Exporting it is what lets the screen-sharing
+    /// portal find the display; this switch exists only to isolate problems
+    /// (e.g. a hanging `systemctl`/`dbus-update-activation-environment`).
+    pub session_env_export_disabled: bool,
     /// When true, restore the legacy behaviour of sending `wl_surface.frame`
     /// callbacks from the vblank handler instead of right after the frame is
     /// queued for scan-out. Used to A/B test the frame-pacing fix.
@@ -66,6 +73,7 @@ impl RuntimeFlags {
             explicit_sync_disabled: on("BEEWM_NO_EXPLICIT_SYNC"),
             dmabuf_disabled: on("BEEWM_NO_DMABUF"),
             animations_disabled: on("BEEWM_DISABLE_ANIMATIONS"),
+            session_env_export_disabled: on("BEEWM_NO_SESSION_ENV_EXPORT"),
             frame_callback_at_vblank: on("BEEWM_FRAME_CALLBACK_AT_VBLANK"),
         };
         if flags.focus_ipc_disabled
@@ -74,15 +82,17 @@ impl RuntimeFlags {
             || flags.explicit_sync_disabled
             || flags.dmabuf_disabled
             || flags.animations_disabled
+            || flags.session_env_export_disabled
         {
             tracing::warn!(
-                "BEEWM runtime kill-switches active: focus_ipc_disabled={} workspace_publish_disabled={} event_broadcaster_disabled={} explicit_sync_disabled={} dmabuf_disabled={} animations_disabled={}",
+                "BEEWM runtime kill-switches active: focus_ipc_disabled={} workspace_publish_disabled={} event_broadcaster_disabled={} explicit_sync_disabled={} dmabuf_disabled={} animations_disabled={} session_env_export_disabled={}",
                 flags.focus_ipc_disabled,
                 flags.workspace_publish_disabled,
                 flags.event_broadcaster_disabled,
                 flags.explicit_sync_disabled,
                 flags.dmabuf_disabled,
                 flags.animations_disabled,
+                flags.session_env_export_disabled,
             );
         }
         if flags.frame_callback_at_vblank {

@@ -1,6 +1,6 @@
 use smithay::xwayland::X11Surface;
 
-use crate::compositor::commands::spawn_startup_commands;
+use crate::compositor::commands::{export_session_environment, spawn_startup_commands};
 use crate::compositor::state::Beewm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,13 @@ impl Beewm {
             return;
         }
 
+        // Push the session env to the bus/systemd *before* launching clients so
+        // the (bus-activated) screen-sharing portal can see the display. Only
+        // for the real (udev/TTY) session — the nested winit backend must not
+        // clobber the host session's portal environment.
+        if self.session_env_managed {
+            export_session_environment(&self.child_env);
+        }
         spawn_startup_commands(&self.config.autostart_commands, &self.child_env);
         self.startup_commands_spawned = true;
     }

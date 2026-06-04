@@ -100,6 +100,19 @@ impl Beewm {
             frame.buffer_done();
         }
 
+        tracing::debug!(
+            target = "beewm::screencast",
+            output = output.name(),
+            buffer_w = geometry.buffer_region.size.w,
+            buffer_h = geometry.buffer_region.size.h,
+            stride = geometry.shm_stride,
+            scale = geometry.output_scale,
+            ?geometry.shm_format,
+            region = ?geometry.logical_region,
+            overlay_cursor,
+            "screencopy frame requested (source advertised to capture client)",
+        );
+
         self.pending_screencopy_frames.push(PendingScreencopyFrame {
             frame,
             output,
@@ -251,6 +264,26 @@ pub(crate) fn process_pending_screencopies<R>(
     R::TextureId: Texture + Clone + Send + 'static,
     R::Error: std::fmt::Debug,
 {
+    // Fail and drop any frames whose output is no longer mapped (unplugged
+    // mid-capture). Otherwise the client would wait forever for a `ready`/
+    // `failed` that can never come, and the entry would leak.
+    let live_outputs: Vec<Output> = state.space.outputs().cloned().collect();
+    state.pending_screencopy_frames.retain(|pending| {
+        if live_outputs.contains(&pending.output) {
+            return true;
+        }
+        tracing::debug!(
+            target = "beewm::screencast",
+            output = pending.output.name(),
+            "output gone while capture pending; failing screencopy frame",
+        );
+        pending.frame.failed();
+        if let Some(buffer) = &pending.buffer {
+            buffer.release();
+        }
+        false
+    });
+
     let mut index = 0;
     while index < state.pending_screencopy_frames.len() {
         let should_process = state.pending_screencopy_frames[index].output == *output
@@ -324,6 +357,12 @@ fn process_screencopy_frame<R>(
                 .frame
                 .ready((secs >> 32) as u32, secs as u32, now.subsec_nanos());
             buffer.release();
+            tracing::trace!(
+                target = "beewm::screencast",
+                output = pending.output.name(),
+                with_damage = pending.copy_with_damage,
+                "screencopy frame submitted to capture client",
+            );
         }
         Ok(false) => {
             warn!("Failed to write screencopy pixels into client buffer");

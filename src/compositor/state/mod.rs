@@ -152,6 +152,12 @@ pub struct Beewm {
     pub border_commit_serial: u64,
     /// Set when visual state changed and a new frame should be rendered.
     pub needs_render: bool,
+    /// Whether beewm owns the real session and may push its environment
+    /// (WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP, …) into the D-Bus/systemd
+    /// activation environment so bus-activated portals/PipeWire find the
+    /// display. Only the udev (TTY) backend sets this; the nested winit backend
+    /// leaves it false so it never clobbers the host session's portal env.
+    pub session_env_managed: bool,
     /// Compositor-driven window animations (open / layout-resize). Purely
     /// visual: the logical layout in `space`/`layout_manager` is always exact.
     pub animations: AnimationManager,
@@ -332,6 +338,7 @@ impl Beewm {
             border_ids: Vec::new(),
             border_commit_serial: 0,
             needs_render: true,
+            session_env_managed: false,
             animations,
             xwm: None,
             xdisplay: None,

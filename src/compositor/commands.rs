@@ -25,6 +25,12 @@ impl ChildEnvironment {
         let mut env = Self::default();
         env.set("WAYLAND_DISPLAY", socket_name);
         env.set("XDG_SESSION_TYPE", "wayland");
+        // Desktop identity. xdg-desktop-portal selects a backend config file
+        // named `<desktop>-portals.conf` by matching the (colon-separated)
+        // XDG_CURRENT_DESKTOP list, so this is what lets beewm route the
+        // ScreenCast portal to xdg-desktop-portal-wlr (see portal/ in the repo).
+        env.set("XDG_CURRENT_DESKTOP", "beewm");
+        env.set("XDG_SESSION_DESKTOP", "beewm");
         env.set("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
         env.set("NIXOS_OZONE_WL", "1");
         env
@@ -32,6 +38,29 @@ impl ChildEnvironment {
 
     pub(crate) fn set(&mut self, key: impl Into<OsString>, value: impl Into<OsString>) {
         self.vars.insert(key.into(), value.into());
+    }
+
+    /// The subset of session variables that D-Bus/systemd-activated services
+    /// (xdg-desktop-portal, xdg-desktop-portal-wlr, PipeWire) need in order to
+    /// see the live Wayland session. These are pushed into the D-Bus activation
+    /// and systemd user-manager environments at startup so screen sharing works
+    /// (those services are *not* children of beewm and otherwise never inherit
+    /// `WAYLAND_DISPLAY`/`XDG_CURRENT_DESKTOP`).
+    pub(crate) fn session_activation_pairs(&self) -> Vec<(OsString, OsString)> {
+        const KEYS: &[&str] = &[
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_DESKTOP",
+            "XDG_SESSION_TYPE",
+            "XDG_RUNTIME_DIR",
+        ];
+        KEYS.iter()
+            .filter_map(|key| {
+                let key = OsString::from(key);
+                self.vars.get(&key).map(|value| (key, value.clone()))
+            })
+            .collect()
     }
 
     pub(crate) fn set_sanitize_display(&mut self, sanitize_display: bool) {
@@ -135,6 +164,89 @@ pub fn spawn_shell_command(cmd: &str, child_env: &ChildEnvironment) -> std::io::
     command.spawn().map(|_| ())
 }
 
+/// Push the live session environment into the D-Bus activation environment and
+/// the systemd user manager, so D-Bus/systemd-activated services started later
+/// (xdg-desktop-portal, xdg-desktop-portal-wlr, pipewire, wireplumber) inherit
+/// `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, etc.
+///
+/// This is the fix for "screen sharing finds no monitor": the portal that
+/// browsers/OBS/Electron talk to is bus-activated and would otherwise have no
+/// idea which Wayland display to capture. We run this once at startup, before
+/// autostart clients, mirroring what sway/Hyprland/niri sessions do.
+///
+/// Fire-and-forget and best-effort: both helpers are tiny one-shots, and a
+/// missing `dbus-update-activation-environment`/`systemctl` is logged but never
+/// fatal. Values are passed explicitly as `KEY=VALUE` so the result does not
+/// depend on what the helper itself happens to inherit.
+pub(crate) fn export_session_environment(child_env: &ChildEnvironment) {
+    if crate::compositor::runtime_flags::flags().session_env_export_disabled {
+        tracing::warn!(
+            target = "beewm::portal",
+            "BEEWM_NO_SESSION_ENV_EXPORT set: not exporting session env to D-Bus/systemd; \
+             screen sharing portals may not find the display",
+        );
+        return;
+    }
+
+    let pairs = child_env.session_activation_pairs();
+    if pairs.is_empty() {
+        return;
+    }
+
+    let keys: Vec<String> = pairs
+        .iter()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    tracing::info!(
+        target = "beewm::portal",
+        ?keys,
+        "exporting session environment to D-Bus activation + systemd user manager",
+    );
+
+    // `dbus-update-activation-environment --systemd KEY=VALUE …` updates both
+    // the D-Bus activation environment and (with --systemd) the systemd user
+    // manager in one call — the canonical incantation for Wayland sessions.
+    let kv_args: Vec<OsString> = pairs
+        .iter()
+        .map(|(k, v)| {
+            let mut arg = k.clone();
+            arg.push("=");
+            arg.push(v);
+            arg
+        })
+        .collect();
+
+    let mut dbus = Command::new("dbus-update-activation-environment");
+    dbus.arg("--systemd").args(&kv_args);
+    configure_child(&mut dbus, child_env);
+    match dbus.spawn() {
+        Ok(_) => tracing::debug!(
+            target = "beewm::portal",
+            "spawned dbus-update-activation-environment",
+        ),
+        Err(error) => tracing::warn!(
+            target = "beewm::portal",
+            %error,
+            "failed to run dbus-update-activation-environment (install dbus); \
+             portals may not see the Wayland session",
+        ),
+    }
+
+    // Also import into the systemd user manager directly, in case
+    // dbus-update-activation-environment is unavailable but systemd is present.
+    let key_args: Vec<OsString> = pairs.iter().map(|(k, _)| k.clone()).collect();
+    let mut systemctl = Command::new("systemctl");
+    systemctl.arg("--user").arg("import-environment").args(&key_args);
+    configure_child(&mut systemctl, child_env);
+    if let Err(error) = systemctl.spawn() {
+        tracing::debug!(
+            target = "beewm::portal",
+            %error,
+            "systemctl --user import-environment unavailable (non-systemd session?)",
+        );
+    }
+}
+
 pub fn spawn_startup_commands(commands: &[String], child_env: &ChildEnvironment) {
     for cmd in commands {
         tracing::info!("Running startup command: {}", cmd);
@@ -146,7 +258,49 @@ pub fn spawn_startup_commands(commands: &[String], child_env: &ChildEnvironment)
 
 #[cfg(test)]
 mod tests {
-    use super::try_split_simple_command;
+    use super::{ChildEnvironment, try_split_simple_command};
+
+    #[test]
+    fn wayland_env_sets_desktop_identity() {
+        let env = ChildEnvironment::wayland("wayland-1");
+        let pairs = env.session_activation_pairs();
+        let lookup = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        // The session env that must reach the bus-activated portal.
+        assert_eq!(lookup("WAYLAND_DISPLAY").as_deref(), Some("wayland-1"));
+        assert_eq!(lookup("XDG_CURRENT_DESKTOP").as_deref(), Some("beewm"));
+        assert_eq!(lookup("XDG_SESSION_DESKTOP").as_deref(), Some("beewm"));
+        assert_eq!(lookup("XDG_SESSION_TYPE").as_deref(), Some("wayland"));
+    }
+
+    #[test]
+    fn session_pairs_only_include_set_keys() {
+        // DISPLAY is only present once XWayland is up; absent by default.
+        let env = ChildEnvironment::wayland("wayland-1");
+        assert!(
+            !env.session_activation_pairs()
+                .iter()
+                .any(|(k, _)| k == "DISPLAY")
+        );
+
+        let mut env = env;
+        env.set("DISPLAY", ":1");
+        assert!(
+            env.session_activation_pairs()
+                .iter()
+                .any(|(k, v)| k == "DISPLAY" && v == ":1")
+        );
+        // Non-session vars are never exported to the activation environment.
+        assert!(
+            !env.session_activation_pairs()
+                .iter()
+                .any(|(k, _)| k == "NIXOS_OZONE_WL")
+        );
+    }
 
     #[test]
     fn simple_command_takes_direct_path() {
