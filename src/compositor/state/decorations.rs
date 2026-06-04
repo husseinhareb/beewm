@@ -175,7 +175,9 @@ impl Beewm {
         let mut border_fragments = Vec::new();
 
         for (win_idx, window) in windows.iter().enumerate() {
-            let geo = match self.space.element_geometry(window) {
+            // Use the animated visual rectangle so borders track the window as
+            // it expands/resizes; falls back to the real geometry when idle.
+            let geo = match self.visual_geometry(window) {
                 Some(g) => g,
                 None => continue,
             };

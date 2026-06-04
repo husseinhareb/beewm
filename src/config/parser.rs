@@ -82,6 +82,51 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let hz: u32 = parse_number(value, line_no, directive)?;
                 config.refresh_rate = Some(hz);
             }
+            "enable_animations" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.enable_animations = parse_bool(value, line_no, directive)?;
+            }
+            "window_open_animation" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.window_open_animation = parse_bool(value, line_no, directive)?;
+            }
+            "window_close_animation" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.window_close_animation = parse_bool(value, line_no, directive)?;
+            }
+            "layout_animation" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.layout_animation = parse_bool(value, line_no, directive)?;
+            }
+            "disable_animations_for_fullscreen" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.disable_animations_for_fullscreen =
+                    parse_bool(value, line_no, directive)?;
+            }
+            "open_animation_duration_ms" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.open_animation_duration_ms = parse_number(value, line_no, directive)?;
+            }
+            "close_animation_duration_ms" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.close_animation_duration_ms = parse_number(value, line_no, directive)?;
+            }
+            "layout_animation_duration_ms" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.layout_animation_duration_ms = parse_number(value, line_no, directive)?;
+            }
+            "animation_duration_ms" => {
+                // Convenience: set all three durations at once.
+                let value = expect_single_argument(parts, line_no, directive)?;
+                let ms: u64 = parse_number(value, line_no, directive)?;
+                config.open_animation_duration_ms = ms;
+                config.close_animation_duration_ms = ms;
+                config.layout_animation_duration_ms = ms;
+            }
+            "animation_easing" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.animation_easing = value.to_string();
+            }
             "exec" | "exec_once" | "autostart" => {
                 config
                     .autostart_commands

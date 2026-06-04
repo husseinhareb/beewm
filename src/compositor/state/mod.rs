@@ -51,6 +51,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWaylandClientData};
 
+use crate::compositor::animation::AnimationManager;
 use crate::config::{Config, Keybind, LayoutKind};
 use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
@@ -151,6 +152,9 @@ pub struct Beewm {
     pub border_commit_serial: u64,
     /// Set when visual state changed and a new frame should be rendered.
     pub needs_render: bool,
+    /// Compositor-driven window animations (open / layout-resize). Purely
+    /// visual: the logical layout in `space`/`layout_manager` is always exact.
+    pub animations: AnimationManager,
     /// X11 window manager state for the compositor-managed XWayland instance.
     pub xwm: Option<X11Wm>,
     /// DISPLAY number exported to spawned child processes once XWayland is ready.
@@ -277,6 +281,7 @@ impl Beewm {
         let resolved_keybinds = resolve_keybinds(&config.keybinds);
         let border_color_focused = hex_to_color32f(config.border_color_focused);
         let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
+        let animations = AnimationManager::from_config(&config);
         let cursor_shape_manager_state_ = CursorShapeManagerState::new::<Self>(&display_handle);
         let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
@@ -327,6 +332,7 @@ impl Beewm {
             border_ids: Vec::new(),
             border_commit_serial: 0,
             needs_render: true,
+            animations,
             xwm: None,
             xdisplay: None,
             fullscreen_window: None,
@@ -438,6 +444,7 @@ impl Beewm {
         // this reload; already-connected devices keep their current setting.
 
         self.config = new_config;
+        self.animations.update_from_config(&self.config);
         tracing::info!(
             "Config reloaded: layout={:?}, border_width={}, gap={}, split_ratio={}",
             self.config.layout,

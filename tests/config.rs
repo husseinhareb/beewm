@@ -289,6 +289,47 @@ fn writes_default_config_file_when_missing() {
     assert!(!written.contains("bindsym $mod+k focus_prev"));
     assert!(written.contains("bindsym $mod+0 workspace 10"));
     assert!(written.contains("bindsym $mod+Shift+0 move_to_workspace 10"));
+    // Animation defaults are written and round-trip back into the config.
+    assert!(written.contains("enable_animations true"));
+    assert!(written.contains("animation_easing ease_out"));
+    assert!(config.enable_animations);
+    assert_eq!(config.open_animation_duration_ms, 180);
 
     remove_dir_all_if_exists(&root);
+}
+
+#[test]
+fn parses_animation_settings() {
+    let config = Config::parse(
+        r#"
+        enable_animations no
+        window_open_animation off
+        window_close_animation true
+        layout_animation yes
+        disable_animations_for_fullscreen false
+        open_animation_duration_ms 200
+        close_animation_duration_ms 120
+        layout_animation_duration_ms 240
+        animation_easing ease_in_out
+        "#,
+    )
+    .expect("animation config should parse");
+
+    assert!(!config.enable_animations);
+    assert!(!config.window_open_animation);
+    assert!(config.window_close_animation);
+    assert!(config.layout_animation);
+    assert!(!config.disable_animations_for_fullscreen);
+    assert_eq!(config.open_animation_duration_ms, 200);
+    assert_eq!(config.close_animation_duration_ms, 120);
+    assert_eq!(config.layout_animation_duration_ms, 240);
+    assert_eq!(config.animation_easing, "ease_in_out");
+}
+
+#[test]
+fn animation_duration_ms_sets_all_three() {
+    let config = Config::parse("animation_duration_ms 100\n").expect("should parse");
+    assert_eq!(config.open_animation_duration_ms, 100);
+    assert_eq!(config.close_animation_duration_ms, 100);
+    assert_eq!(config.layout_animation_duration_ms, 100);
 }

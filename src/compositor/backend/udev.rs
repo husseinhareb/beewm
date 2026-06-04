@@ -504,6 +504,11 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting udev event loop");
 
     while data.state.running {
+        // Advance window animations first: while any animation is active this
+        // sets `needs_render` so we keep repainting (gated by `can_render` /
+        // VBlank, so no busy loop), and clears back to idle when they finish.
+        data.state.tick_animations(Instant::now());
+
         // All event sources (DRM VBlank, Wayland fd, libinput, IPC, config
         // watcher) wake calloop immediately when they have data, so the
         // dispatch timeout is just an upper bound when the compositor is
@@ -571,8 +576,14 @@ fn render_frame(data: &mut UdevData) {
 
     let frame_start = Instant::now();
 
-    let window_elements =
-        window_render_elements(&mut gpu.renderer, &data.state.space, &gpu.output, 1.0);
+    let window_elements = window_render_elements(
+        &mut gpu.renderer,
+        &data.state.space,
+        &gpu.output,
+        1.0,
+        &data.state.animations,
+        Instant::now(),
+    );
 
     // True when an xdg-shell fullscreen or a fullscreen-sized X11 game covers
     // the output. Both should suppress top-layers so the game can be promoted

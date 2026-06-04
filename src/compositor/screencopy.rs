@@ -26,12 +26,13 @@ use smithay::wayland::shm::with_buffer_contents_mut;
 use tracing::warn;
 
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
-use crate::compositor::render::{layer_render_elements, window_render_elements};
+use crate::compositor::render::{WindowElement, layer_render_elements, window_render_elements};
 use crate::compositor::state::Beewm;
 
 render_elements! {
     pub(crate) ScreencopyRenderElement<R> where R: ImportAll + ImportMem;
     Surface=WaylandSurfaceRenderElement<R>,
+    Window=WindowElement<R>,
     Border=SolidColorRenderElement,
     Cursor=MemoryRenderBufferRenderElement<R>,
 }
@@ -348,7 +349,14 @@ where
     R::TextureId: Texture + Clone + Send + 'static,
 {
     let fullscreen_active = state.screen_owned_by_window();
-    let window_elements = window_render_elements(renderer, &state.space, output, 1.0);
+    let window_elements = window_render_elements(
+        renderer,
+        &state.space,
+        output,
+        1.0,
+        &state.animations,
+        std::time::Instant::now(),
+    );
     let border_elements = state.border_elements();
     let cursor_elements = if overlay_cursor {
         state.cursor_elements_for_renderer(renderer)

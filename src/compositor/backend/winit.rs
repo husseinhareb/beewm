@@ -29,7 +29,7 @@ use crate::compositor::feedback::{
 };
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
-use crate::compositor::render::{layer_render_elements, window_render_elements};
+use crate::compositor::render::{WindowElement, layer_render_elements, window_render_elements};
 use crate::compositor::screencopy::process_pending_screencopies;
 use crate::compositor::state::{Beewm, ClientState};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
@@ -44,12 +44,19 @@ delegate_backend_xwayland!(WinitData, state);
 
 enum WinitRenderElement {
     Surface(Box<WaylandSurfaceRenderElement<GlowRenderer>>),
+    Window(Box<WindowElement<GlowRenderer>>),
     Border(SolidColorRenderElement),
 }
 
 impl From<WaylandSurfaceRenderElement<GlowRenderer>> for WinitRenderElement {
     fn from(value: WaylandSurfaceRenderElement<GlowRenderer>) -> Self {
         Self::Surface(Box::new(value))
+    }
+}
+
+impl From<WindowElement<GlowRenderer>> for WinitRenderElement {
+    fn from(value: WindowElement<GlowRenderer>) -> Self {
+        Self::Window(Box::new(value))
     }
 }
 
@@ -63,6 +70,7 @@ impl Element for WinitRenderElement {
     fn id(&self) -> &Id {
         match self {
             Self::Surface(element) => element.id(),
+            Self::Window(element) => element.id(),
             Self::Border(element) => element.id(),
         }
     }
@@ -70,6 +78,7 @@ impl Element for WinitRenderElement {
     fn current_commit(&self) -> CommitCounter {
         match self {
             Self::Surface(element) => element.current_commit(),
+            Self::Window(element) => element.current_commit(),
             Self::Border(element) => element.current_commit(),
         }
     }
@@ -77,6 +86,7 @@ impl Element for WinitRenderElement {
     fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
         match self {
             Self::Surface(element) => element.location(scale),
+            Self::Window(element) => element.location(scale),
             Self::Border(element) => element.location(scale),
         }
     }
@@ -84,6 +94,7 @@ impl Element for WinitRenderElement {
     fn src(&self) -> Rectangle<f64, Buffer> {
         match self {
             Self::Surface(element) => element.src(),
+            Self::Window(element) => element.src(),
             Self::Border(element) => element.src(),
         }
     }
@@ -91,6 +102,7 @@ impl Element for WinitRenderElement {
     fn transform(&self) -> Transform {
         match self {
             Self::Surface(element) => element.transform(),
+            Self::Window(element) => element.transform(),
             Self::Border(element) => element.transform(),
         }
     }
@@ -98,6 +110,7 @@ impl Element for WinitRenderElement {
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         match self {
             Self::Surface(element) => element.geometry(scale),
+            Self::Window(element) => element.geometry(scale),
             Self::Border(element) => element.geometry(scale),
         }
     }
@@ -109,6 +122,7 @@ impl Element for WinitRenderElement {
     ) -> DamageSet<i32, Physical> {
         match self {
             Self::Surface(element) => element.damage_since(scale, commit),
+            Self::Window(element) => element.damage_since(scale, commit),
             Self::Border(element) => element.damage_since(scale, commit),
         }
     }
@@ -116,6 +130,7 @@ impl Element for WinitRenderElement {
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         match self {
             Self::Surface(element) => element.opaque_regions(scale),
+            Self::Window(element) => element.opaque_regions(scale),
             Self::Border(element) => element.opaque_regions(scale),
         }
     }
@@ -123,6 +138,7 @@ impl Element for WinitRenderElement {
     fn alpha(&self) -> f32 {
         match self {
             Self::Surface(element) => element.alpha(),
+            Self::Window(element) => element.alpha(),
             Self::Border(element) => element.alpha(),
         }
     }
@@ -130,6 +146,7 @@ impl Element for WinitRenderElement {
     fn kind(&self) -> Kind {
         match self {
             Self::Surface(element) => element.kind(),
+            Self::Window(element) => element.kind(),
             Self::Border(element) => element.kind(),
         }
     }
@@ -153,6 +170,14 @@ impl RenderElement<GlowRenderer> for WinitRenderElement {
                 damage,
                 opaque_regions,
             ),
+            Self::Window(element) => RenderElement::<GlowRenderer>::draw(
+                element.as_ref(),
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
             Self::Border(element) => RenderElement::<GlowRenderer>::draw(
                 element,
                 frame,
@@ -167,6 +192,7 @@ impl RenderElement<GlowRenderer> for WinitRenderElement {
     fn underlying_storage(&self, renderer: &mut GlowRenderer) -> Option<UnderlyingStorage<'_>> {
         match self {
             Self::Surface(element) => element.as_ref().underlying_storage(renderer),
+            Self::Window(element) => element.as_ref().underlying_storage(renderer),
             Self::Border(element) => element.underlying_storage(renderer),
         }
     }
@@ -344,6 +370,11 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut applied_cursor_status_serial = u64::MAX;
 
     while data.state.running {
+        // Advance window animations before computing the dispatch timeout: while
+        // any animation is active this sets `needs_render`, so the loop keeps
+        // repainting at ~refresh rate and settles back to idle once they finish.
+        data.state.tick_animations(Instant::now());
+
         // See run_udev for the rationale: rely on event sources to wake us
         // and treat the timeout purely as an idle ceiling.
         let timeout = if data.state.active_grab.is_some() {
@@ -378,8 +409,14 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let render_result = match winit_backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
                         let fullscreen_active = data.state.screen_owned_by_window();
-                        let window_elements =
-                            window_render_elements(renderer, &data.state.space, output, 1.0);
+                        let window_elements = window_render_elements(
+                            renderer,
+                            &data.state.space,
+                            output,
+                            1.0,
+                            &data.state.animations,
+                            Instant::now(),
+                        );
                         let layers_above = layer_render_elements(
                             renderer,
                             output,

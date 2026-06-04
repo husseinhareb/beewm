@@ -146,6 +146,57 @@ impl Beewm {
         (class.is_modal || class.has_parent || class.known_dialog).then_some(root)
     }
 
+    /// Best-effort `app_id`/class for a window, used only for animation log
+    /// lines. Returns an empty string when none is available.
+    pub(crate) fn window_app_id(window: &Window) -> String {
+        window
+            .toplevel()
+            .and_then(|toplevel| {
+                smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|role| role.lock().unwrap().app_id.clone())
+                })
+            })
+            .or_else(|| window.x11_surface().map(|x11| x11.class()))
+            .unwrap_or_default()
+    }
+
+    /// The rectangle a window should currently be *rendered* into: the animated
+    /// visual rect while an animation is in flight, otherwise its real
+    /// `Space` geometry. Used by the renderer and the border generator so the
+    /// decorations track the animation. Input/focus never use this — they use
+    /// the real geometry from `space`.
+    pub(crate) fn visual_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        if let Some(root) = Self::window_root_surface(window) {
+            let now = std::time::Instant::now();
+            if let Some(visual) = self.animations.active_rect(&root, now) {
+                return Some(visual.rect);
+            }
+        }
+        self.space.element_geometry(window)
+    }
+
+    /// Advance all window animations by wall-clock time. Returns `true` while
+    /// any animation is still active, so the backend keeps scheduling frames at
+    /// the output refresh rate; once everything settles it returns `false` and
+    /// normal render throttling resumes. Cheap: a couple of `HashMap::retain`s.
+    pub fn tick_animations(&mut self, now: std::time::Instant) -> bool {
+        let was_active = self.animations.has_active();
+        let active = self.animations.tick(now);
+        // Repaint while active, and also on the active→idle edge so the final
+        // frame settles exactly on the real geometry (the last animated frame
+        // is at t<1 and would otherwise stay slightly sub-final on screen).
+        if active || was_active {
+            self.needs_render = true;
+            // Borders are keyed by reused IDs; bump the commit serial so the
+            // damage tracker repaints them as the animated rectangle moves.
+            self.border_commit_serial = self.border_commit_serial.wrapping_add(1);
+        }
+        active
+    }
+
     /// Emit the current bottom→top stacking order with each element's app_id
     /// and floating/tiled layer, gated on the `beewm::floating` debug target so
     /// it is free in normal runs.
@@ -245,6 +296,12 @@ impl Beewm {
 
         self.untrack_window_for_surface(&root);
         self.mapped_with_buffer.remove(&root);
+        // Drop any in-flight animation/target for this window. A true closing
+        // shrink animation is not implemented (see `compositor::animation`):
+        // it requires a GPU snapshot that outlives the destroyed client buffer.
+        // The surviving windows still animate into the freed space via the
+        // GeometryChange path triggered by the relayout below.
+        self.animations.forget(&root);
 
         // Clean up fullscreen state if this was the fullscreen window.
         let was_fullscreen = self
@@ -523,6 +580,7 @@ impl Beewm {
             return;
         };
 
+        self.animations.forget(&root);
         self.floating_windows.insert(root.clone(), floating);
         self.space.map_element(window.clone(), floating.position, true);
 
@@ -594,6 +652,7 @@ impl Beewm {
         } else {
             return;
         };
+        self.animations.forget(&root);
         self.floating_windows.insert(root, placeholder);
 
         if workspace_idx == self.active_workspace {
@@ -635,6 +694,7 @@ impl Beewm {
             toplevel.send_configure();
         }
         self.remove_tiled_window(self.active_workspace, &root);
+        self.animations.forget(&root);
         self.space.map_element(window.clone(), pos, true);
         self.floating_windows.insert(
             root,
@@ -688,6 +748,9 @@ impl Beewm {
             } else if let Some(x11_surface) = window.x11_surface() {
                 let _ = x11_surface.set_fullscreen(true);
                 let _ = x11_surface.configure(output_geo);
+            }
+            if let Some(root) = Self::window_root_surface(&window) {
+                self.animations.forget(&root);
             }
             self.space.map_element(window.clone(), output_geo.loc, true);
             self.fullscreen_window = Some(window);
@@ -764,10 +827,19 @@ impl Beewm {
             self.layout_manager
                 .geometries(self.active_workspace, &usable, &tiled_roots);
 
+        let now = std::time::Instant::now();
+        // Suppress animations entirely while a window owns the whole screen
+        // (fullscreen / fullscreen-sized X11 game). beewm has had game FPS and
+        // direct-scanout regressions before; animating tiled siblings behind a
+        // game is never worth risking that. We still keep targets in sync below
+        // so re-tiling later does not snap.
+        let suppress_anim =
+            self.animations.disable_for_fullscreen() && self.screen_owned_by_window();
         for window in &tiled_windows {
-            let geo =
-                Self::window_root_surface(window).and_then(|root| keyed_geos.get(&root).copied());
-            let Some(geo) = geo else {
+            let Some(root) = Self::window_root_surface(window) else {
+                continue;
+            };
+            let Some(geo) = keyed_geos.get(&root).copied() else {
                 continue;
             };
             let (gx, gy) = self.effective_inner_gap(geo.width, geo.height);
@@ -791,6 +863,18 @@ impl Beewm {
             // interactive tiled resizes, size-only changes otherwise lag a frame
             // behind and exposed regions can briefly show through.
             self.space.map_element(window.clone(), location, false);
+
+            // Visual animation: feed the *final* tile rectangle (location +
+            // configured size) to the animation layer. This never changes the
+            // logical layout above — it only decides how the window is drawn on
+            // the way to this exact rectangle.
+            let target = Rectangle::new(location, size);
+            if suppress_anim {
+                self.animations.track_target(&root, target);
+            } else {
+                let app_id = Self::window_app_id(window);
+                self.animations.reconcile(&root, target, now, &app_id);
+            }
         }
         self.needs_render = true;
         self.remap_floating_windows();

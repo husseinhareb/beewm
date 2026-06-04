@@ -78,6 +78,23 @@ pub struct Config {
     pub refresh_rate: Option<u32>,
     pub autostart_commands: Vec<String>,
     pub keybinds: Vec<Keybind>,
+
+    // Animation settings. See `compositor::animation`.
+    /// Master switch for all compositor-driven window animations.
+    pub enable_animations: bool,
+    /// Animate newly mapped tiled windows (expand from top-left).
+    pub window_open_animation: bool,
+    /// Reserved closing animation toggle (see animation module limitations).
+    pub window_close_animation: bool,
+    /// Animate tiled windows when the layout reassigns their geometry.
+    pub layout_animation: bool,
+    /// Skip animations while a window owns the whole screen (fullscreen games).
+    pub disable_animations_for_fullscreen: bool,
+    pub open_animation_duration_ms: u64,
+    pub close_animation_duration_ms: u64,
+    pub layout_animation_duration_ms: u64,
+    /// Easing curve name: linear | ease_in | ease_out | ease_in_out.
+    pub animation_easing: String,
 }
 
 impl Default for Config {
@@ -98,6 +115,15 @@ impl Default for Config {
             refresh_rate: None,
             autostart_commands: Vec::new(),
             keybinds: Self::default_keybinds_for(num_workspaces),
+            enable_animations: true,
+            window_open_animation: true,
+            window_close_animation: true,
+            layout_animation: true,
+            disable_animations_for_fullscreen: true,
+            open_animation_duration_ms: 180,
+            close_animation_duration_ms: 150,
+            layout_animation_duration_ms: 200,
+            animation_easing: "ease_out".to_string(),
         }
     }
 }
@@ -274,6 +300,36 @@ impl Config {
         text.push_str(&format!("natural_scroll {}\n", default.natural_scroll));
         text.push_str(&format!("keyboard_layout {}\n", default.keyboard_layout));
         text.push_str("# refresh_rate 165   # set display refresh rate in Hz (default: use monitor preferred)\n");
+        text.push('\n');
+        text.push_str("# Window animations (compositor-driven; layout stays exact).\n");
+        text.push_str(&format!("enable_animations {}\n", default.enable_animations));
+        text.push_str(&format!(
+            "window_open_animation {}\n",
+            default.window_open_animation
+        ));
+        text.push_str(&format!(
+            "window_close_animation {}\n",
+            default.window_close_animation
+        ));
+        text.push_str(&format!("layout_animation {}\n", default.layout_animation));
+        text.push_str(&format!(
+            "disable_animations_for_fullscreen {}\n",
+            default.disable_animations_for_fullscreen
+        ));
+        text.push_str(&format!(
+            "open_animation_duration_ms {}\n",
+            default.open_animation_duration_ms
+        ));
+        text.push_str(&format!(
+            "close_animation_duration_ms {}\n",
+            default.close_animation_duration_ms
+        ));
+        text.push_str(&format!(
+            "layout_animation_duration_ms {}\n",
+            default.layout_animation_duration_ms
+        ));
+        text.push_str("# animation_easing: linear | ease_in | ease_out | ease_in_out\n");
+        text.push_str(&format!("animation_easing {}\n\n", default.animation_easing));
         text.push_str("# Start commands once when beewm launches.\n");
         text.push_str("# exec waybar\n");
         text.push_str("# exec nm-applet\n\n");

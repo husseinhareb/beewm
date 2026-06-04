@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod backend;
 pub(crate) mod commands;
 pub(crate) mod config_watcher;
