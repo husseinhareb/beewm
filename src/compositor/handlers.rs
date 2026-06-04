@@ -37,7 +37,7 @@ use smithay::wayland::pointer_constraints::{
 };
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-    get_parent, send_surface_state, with_states,
+    send_surface_state, with_states,
 };
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
@@ -61,7 +61,7 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::dialog::XdgDialogHandler;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state};
 use smithay::backend::renderer::{BufferType, buffer_type};
 use super::diagnostics::BufferKind;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -281,6 +281,36 @@ impl CompositorHandler for Beewm {
         if let Some(window) = self.mapped_window_for_surface(surface) {
             window.on_commit();
 
+            // xdg-shell has no unmap event: a client unmaps a toplevel by
+            // committing a null buffer (and may keep the toplevel object alive
+            // — e.g. Firefox session restore tears down and rebuilds its
+            // window). Detect that here, on the toplevel's own root surface
+            // commit, and evict the window from the layout so no stale,
+            // invisible node keeps consuming tiling space. Subsurface commits
+            // and the no-buffer round-trip commits of the initial map handshake
+            // are excluded: we only act on the root surface, and only once the
+            // window has actually presented a buffer (`mapped_with_buffer`).
+            if let Some(toplevel) = window.toplevel() {
+                if toplevel.wl_surface() == surface {
+                    let root = root_surface(surface);
+                    let has_buffer =
+                        with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                            .unwrap_or(false);
+                    if has_buffer {
+                        self.mapped_with_buffer.insert(root);
+                    } else if self.mapped_with_buffer.contains(&root) {
+                        tracing::debug!(
+                            target = "beewm::lifecycle",
+                            id = root.id().protocol_id(),
+                            "toplevel unmapped (null buffer); evicting from layout",
+                        );
+                        self.handle_toplevel_unmap(surface);
+                        self.needs_render = true;
+                        return;
+                    }
+                }
+            }
+
             // If we previously sent a `size = None` configure to release this
             // window from its tiled dimensions, re-center it now that the client
             // has committed at its natural size.
@@ -494,8 +524,10 @@ impl XdgShellHandler for Beewm {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        // Remove windows that died before their first commit.
         let target_surface = surface.wl_surface();
+
+        // Remove windows that died before their first commit (still pending) or
+        // that were unmapped and re-queued as pending awaiting a remap.
         if let Some(pos) = self.pending_windows.iter().position(|w| {
             w.toplevel()
                 .map(|t| t.wl_surface() == target_surface)
@@ -503,85 +535,14 @@ impl XdgShellHandler for Beewm {
         }) {
             self.pending_windows.remove(pos);
             self.pending_should_float.remove(target_surface);
+            self.mapped_with_buffer.remove(&root_surface(target_surface));
             return;
         }
 
-        // Find which workspace owns this window and remove it
-        for ws_idx in 0..self.workspaces.len() {
-            if let Some(pos) = self.workspaces[ws_idx].windows.iter().position(|w| {
-                w.toplevel()
-                    .map(|t| t.wl_surface() == target_surface)
-                    .unwrap_or(false)
-            }) {
-                let window = self.workspaces[ws_idx].remove_window(pos).unwrap();
-                // Remember the dialog's parent so closing it returns focus to the
-                // window it belonged to, rather than whatever happens to be the
-                // workspace's last-focused tile.
-                let parent_surface = self.toplevel_parent_surface(&window);
-                let should_restore_focus = if ws_idx == self.active_workspace {
-                    match self
-                        .seat
-                        .get_keyboard()
-                        .and_then(|keyboard| keyboard.current_focus())
-                        .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
-                    {
-                        Some(current_focus) => {
-                            let mut root = current_focus;
-                            while let Some(parent) = get_parent(&root) {
-                                root = parent;
-                            }
-                            root == *target_surface
-                        }
-                        None => true,
-                    }
-                } else {
-                    false
-                };
-                self.untrack_window_for_surface(target_surface);
-                // Clean up fullscreen state if this was the fullscreen window.
-                let was_fullscreen = self
-                    .fullscreen_window
-                    .as_ref()
-                    .and_then(|w| w.toplevel())
-                    .map(|t| t.wl_surface() == target_surface)
-                    .unwrap_or(false);
-                if was_fullscreen {
-                    self.fullscreen_window = None;
-                    // Remap siblings that were unmapped while fullscreen was active.
-                    for sibling in &self.workspaces[ws_idx].windows {
-                        if self.space.element_geometry(sibling).is_none() {
-                            self.space.map_element(sibling.clone(), (0, 0), false);
-                        }
-                    }
-                }
-                // Clean up floating state if this was a floating window.
-                self.floating_windows.remove(target_surface);
-                self.remove_tiled_window(ws_idx, target_surface);
-                self.space.unmap_elem(&window);
-                self.publish_workspace_state();
-                if ws_idx == self.active_workspace {
-                    if should_restore_focus {
-                        // Prefer the closed dialog's parent if it is still mapped;
-                        // fall back to the workspace's last-focused window.
-                        let parent_focus = parent_surface
-                            .filter(|parent| self.mapped_window_for_surface(parent).is_some());
-                        let focus = parent_focus.or_else(|| {
-                            self.workspaces[self.active_workspace]
-                                .focused_idx
-                                .and_then(|focus_idx| {
-                                    self.workspaces[self.active_workspace].windows.get(focus_idx)
-                                })
-                                .and_then(|window| window.toplevel())
-                                .map(|toplevel| toplevel.wl_surface().clone())
-                        });
-                        self.set_keyboard_focus(focus);
-                    }
-                    self.relayout();
-                    self.needs_render = true;
-                }
-                break;
-            }
-        }
+        // A mapped (or previously-mapped) toplevel: tear it out of every layout
+        // structure and relayout. Shared with the unmap path so destroy and
+        // unmap can never diverge.
+        self.remove_mapped_toplevel(target_surface);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {

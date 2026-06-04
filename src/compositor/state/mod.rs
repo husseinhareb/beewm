@@ -174,6 +174,16 @@ pub struct Beewm {
     /// here so the first-commit path can honour the intent even if the static
     /// `should_map_toplevel_floating` heuristic doesn't match yet.
     pub(crate) pending_should_float: HashSet<WlSurface>,
+    /// Root WlSurfaces of mapped toplevels that have presented a buffer at
+    /// least once. xdg-shell has no dedicated unmap event: a client unmaps a
+    /// toplevel by committing a null buffer (and may keep the toplevel object
+    /// alive — e.g. Firefox session restore recreating its window). We treat a
+    /// null-buffer commit from a surface in this set as an unmap and evict the
+    /// window from the tiling layout so no stale node keeps consuming space.
+    /// Only roots that have actually shown a buffer are eligible, so the
+    /// no-buffer round-trip commits during the initial map handshake never
+    /// trip the unmap path.
+    pub(crate) mapped_with_buffer: HashSet<WlSurface>,
     /// Active pointer grab (move, resize, or tiled swap). Only one can be
     /// active at a time.
     pub active_grab: Option<ActiveGrab>,
@@ -324,6 +334,7 @@ impl Beewm {
             floating_windows: HashMap::new(),
             pending_float_centers: HashSet::new(),
             pending_should_float: HashSet::new(),
+            mapped_with_buffer: HashSet::new(),
             active_grab: None,
             tiled_swap_target: None,
             resolved_keybinds,

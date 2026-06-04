@@ -414,6 +414,58 @@ fn resizing_master_stack_tracks_master_and_stack_split_ratios() {
 }
 
 #[test]
+fn removing_an_unmapped_sibling_gives_the_survivor_the_full_area() {
+    // Regression guard for the Firefox "Restore Session" bug: while the old
+    // window was still tracked, two tiled nodes split the screen in half. The
+    // compositor must drop the unmapped node from the tiling tree; once it does
+    // so, the layout manager must collapse the lone survivor back to the full
+    // tiled area instead of leaving an invisible half-screen gap.
+    let mut manager = MasterStackManager::new(1, 0.5);
+    let screen = Geometry::new(0, 0, 1920, 1080);
+
+    // Both windows mapped: the screen is split between them.
+    manager.insert(0, None, 1u8);
+    manager.insert(0, None, 2u8);
+    let split = manager.geometries(0, &screen, &[1u8, 2u8]);
+    assert_ne!(split[&1], screen, "two mapped windows should not each fill the screen");
+
+    // The stale window (id 1) unmaps. The compositor removes it from the tree
+    // AND from the set of tiled ids it lays out.
+    manager.remove(0, &1u8);
+    let collapsed = manager.geometries(0, &screen, &[2u8]);
+
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(
+        collapsed[&2], screen,
+        "the only remaining tiled window must occupy the whole tiled area",
+    );
+    assert!(
+        !collapsed.contains_key(&1u8),
+        "the unmapped window must not retain a layout node",
+    );
+}
+
+#[test]
+fn unmapped_node_left_in_tree_still_drops_out_of_geometries() {
+    // Defence in depth: even if a stale id were momentarily still inside the
+    // tree, geometries() is driven by the caller's `tiled_ids` list. As long as
+    // the unmapped window is excluded from that list (which the unmap handler
+    // guarantees by removing it from the workspace), it consumes no space.
+    let mut manager = MasterStackManager::new(1, 0.5);
+    let screen = Geometry::new(0, 0, 1920, 1080);
+
+    manager.insert(0, None, 1u8);
+    manager.insert(0, None, 2u8);
+
+    // id 1 is unmapped but (hypothetically) not yet pruned from the tree;
+    // it is excluded from the mapped tiled-id list passed to geometries().
+    let geometries = manager.geometries(0, &screen, &[2u8]);
+
+    assert_eq!(geometries.get(&2u8), Some(&screen));
+    assert!(!geometries.contains_key(&1u8));
+}
+
+#[test]
 fn active_workspace_export_uses_one_based_numbers() {
     assert_eq!(active_workspace_state_contents(0), "1");
     assert_eq!(active_workspace_state_contents(4), "5");

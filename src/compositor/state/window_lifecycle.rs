@@ -1,5 +1,6 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
@@ -186,6 +187,142 @@ impl Beewm {
             ?order,
             "stacking order (bottom→top)",
         );
+    }
+
+    /// Remove a mapped toplevel (identified by its root wl_surface) from every
+    /// structure that tracks it: the owning workspace's window list, the tiling
+    /// tree, the floating map, fullscreen state, the surface→window lookup, the
+    /// mapped-buffer set, and the space's scene graph. Keyboard focus is moved
+    /// to a sensible neighbour and the active workspace is relaid out.
+    ///
+    /// Shared by the xdg `toplevel_destroyed` path (window gone for good) and
+    /// the xdg unmap path (null-buffer commit; the toplevel object may live on
+    /// and remap later). Keeping both on one code path guarantees the invariant
+    /// that the active tiling tree only ever holds mapped, alive windows.
+    ///
+    /// Returns the removed window when one was found.
+    pub(crate) fn remove_mapped_toplevel(&mut self, target_surface: &WlSurface) -> Option<Window> {
+        let root = root_surface(target_surface);
+
+        let Some(ws_idx) = self.workspaces.iter().position(|workspace| {
+            workspace
+                .windows
+                .iter()
+                .any(|w| Self::window_root_surface(w).as_ref() == Some(&root))
+        }) else {
+            // Not in any workspace list. Still scrub any residual bookkeeping so
+            // a half-tracked surface can't leave a ghost behind.
+            self.mapped_with_buffer.remove(&root);
+            self.floating_windows.remove(&root);
+            self.untrack_window_for_surface(&root);
+            return None;
+        };
+
+        let pos = self.workspaces[ws_idx]
+            .windows
+            .iter()
+            .position(|w| Self::window_root_surface(w).as_ref() == Some(&root))
+            .expect("window presence checked above");
+        let window = self.workspaces[ws_idx].remove_window(pos).unwrap();
+
+        // Remember the dialog's parent so closing/unmapping it returns focus to
+        // the window it belonged to, rather than whatever happens to be the
+        // workspace's last-focused tile.
+        let parent_surface = self.toplevel_parent_surface(&window);
+        let should_restore_focus = if ws_idx == self.active_workspace {
+            match self
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus())
+                .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
+            {
+                Some(current_focus) => root_surface(&current_focus) == root,
+                None => true,
+            }
+        } else {
+            false
+        };
+
+        self.untrack_window_for_surface(&root);
+        self.mapped_with_buffer.remove(&root);
+
+        // Clean up fullscreen state if this was the fullscreen window.
+        let was_fullscreen = self
+            .fullscreen_window
+            .as_ref()
+            .and_then(Self::window_root_surface)
+            .map(|fs_root| fs_root == root)
+            .unwrap_or(false);
+        if was_fullscreen {
+            self.fullscreen_window = None;
+            // Remap siblings that were unmapped while fullscreen was active.
+            for sibling in self.workspaces[ws_idx].windows.clone() {
+                if self.space.element_geometry(&sibling).is_none() {
+                    self.space.map_element(sibling, (0, 0), false);
+                }
+            }
+        }
+
+        // Clean up floating state and the tiling tree node.
+        self.floating_windows.remove(&root);
+        self.remove_tiled_window(ws_idx, &root);
+        self.space.unmap_elem(&window);
+        self.publish_workspace_state();
+
+        tracing::debug!(
+            target = "beewm::lifecycle",
+            id = root.id().protocol_id(),
+            ws_idx,
+            was_fullscreen,
+            remaining_windows = self.workspaces[ws_idx].windows.len(),
+            remaining_tiled = self.tiled_windows_in_workspace(ws_idx).len(),
+            "removed window from layout",
+        );
+
+        if ws_idx == self.active_workspace {
+            if should_restore_focus {
+                // Prefer the closed/unmapped dialog's parent if it is still
+                // mapped; fall back to the workspace's last-focused window.
+                let parent_focus = parent_surface
+                    .filter(|parent| self.mapped_window_for_surface(parent).is_some());
+                let focus = parent_focus.or_else(|| {
+                    self.workspaces[self.active_workspace]
+                        .focused_idx
+                        .and_then(|focus_idx| {
+                            self.workspaces[self.active_workspace].windows.get(focus_idx)
+                        })
+                        .and_then(Self::window_root_surface)
+                });
+                self.set_keyboard_focus(focus);
+            }
+            self.relayout();
+            self.needs_render = true;
+        }
+
+        Some(window)
+    }
+
+    /// Handle an xdg-shell toplevel unmap (the client committed a null buffer
+    /// to a previously-mapped toplevel without destroying it). The toplevel
+    /// object stays alive, so it leaves the active layout now but is re-queued
+    /// as a pending window: if the client remaps it (xdg-shell treats the next
+    /// map like an initial map — empty commit, configure, buffer) the normal
+    /// first-commit path rebuilds its layout entry from scratch. If the client
+    /// instead destroys it, `toplevel_destroyed` drops it from the pending list.
+    pub(crate) fn handle_toplevel_unmap(&mut self, target_surface: &WlSurface) {
+        let Some(window) = self.remove_mapped_toplevel(target_surface) else {
+            return;
+        };
+        // Only Wayland toplevels reach this path, but guard so a stray X11
+        // window (which has its own unmap handler) is never re-queued here.
+        if window.toplevel().is_some()
+            && !self
+                .pending_windows
+                .iter()
+                .any(|pending| pending == &window)
+        {
+            self.pending_windows.push(window);
+        }
     }
 
     fn workspace_idx_for_surface(&self, surface: &WlSurface) -> Option<usize> {
