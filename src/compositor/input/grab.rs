@@ -465,6 +465,16 @@ fn focus_and_raise_window(state: &mut Beewm, window: &Window) {
         state.set_keyboard_focus(Some(surface));
     }
     state.space.raise_element(window, true);
+    // If we just raised a tiled window, push the floating layer back on top so a
+    // transient/modal dialog is never occluded by the parent it belongs to. When
+    // the raised window is itself floating it must stay on top, so skip the
+    // re-raise in that case.
+    let raised_floating = Beewm::window_root_surface(window)
+        .map(|root| state.is_root_floating(&root))
+        .unwrap_or(false);
+    if !raised_floating {
+        state.raise_floating_windows();
+    }
     state.needs_render = true;
 }
 

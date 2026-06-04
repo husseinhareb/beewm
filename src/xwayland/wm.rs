@@ -82,11 +82,18 @@ impl Beewm {
                     .as_ref()
                     .map(|fs| fs != &window)
                     .unwrap_or(false);
+                // Keep focus on an existing modal/auth dialog when this tiled X11
+                // parent maps behind it (e.g. Spotify under XWayland appearing
+                // after the keyring prompt).
+                let keep_auth_dialog_focus =
+                    !should_float && self.focused_auth_dialog_root().is_some();
                 if !fullscreen_blocks_focus {
-                    if let Some(wl_surface) =
-                        window.wl_surface().map(|surface| surface.into_owned())
-                    {
-                        self.set_keyboard_focus(Some(wl_surface));
+                    if !keep_auth_dialog_focus {
+                        if let Some(wl_surface) =
+                            window.wl_surface().map(|surface| surface.into_owned())
+                        {
+                            self.set_keyboard_focus(Some(wl_surface));
+                        }
                     }
                     self.space.raise_element(&window, true);
                     // Sync X11 stacking with our scene-graph stacking so X
@@ -365,13 +372,13 @@ fn should_map_x11_floating(surface: &X11Surface) -> bool {
         .unwrap_or(false);
 
     // Bounded max_size *that is plausibly a real cap*, not a "no real max"
-    // sentinel. Threshold below typical screen-height (1024) is enough to
-    // catch gnome-keyring (~400x250), polkit prompts (~400x300), file pickers
+    // sentinel. Shares `is_dialog_size_cap` with the Wayland path: catches
+    // gnome-keyring (~400x250), polkit prompts (~400x300), file pickers
     // (~800x600) while excluding apps that publish display dimensions or
     // 32767 as their max.
     let has_dialog_size_cap = surface
         .max_size()
-        .map(|max| max.w > 0 && max.h > 0 && max.w <= 1280 && max.h <= 1024)
+        .map(crate::compositor::state::is_dialog_size_cap)
         .unwrap_or(false);
 
     by_type || by_relation || is_fixed || has_dialog_size_cap

@@ -1,13 +1,13 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Point, Rectangle, Size};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
-use smithay::wayland::shell::xdg::ToplevelSurface;
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData};
 
 use crate::model::window::Geometry;
 
-use super::popup::should_map_toplevel_floating;
+use super::popup::{centered_dialog_position, classify_toplevel_floating, should_map_toplevel_floating};
 use super::{Beewm, FloatingWindowData, root_surface};
 
 impl Beewm {
@@ -81,15 +81,111 @@ impl Beewm {
             win_h = win_h.max(min_size.h).min(usable_size.h.max(1));
         }
 
-        let pos = Point::from((
-            usable_origin.x + (usable_size.w - win_w) / 2,
-            usable_origin.y + (usable_size.h - win_h) / 2,
-        ));
+        // Prefer centring over the parent window (transient/modal dialogs sit on
+        // top of the window they belong to, like Hyprland/GNOME/KDE); fall back
+        // to the usable area when no parent geometry is available. Either way the
+        // result is clamped to stay fully on-screen.
+        let usable = Rectangle::new(usable_origin, usable_size);
+        let win_size = Size::from((win_w, win_h));
+        let parent_geo = self.parent_window_geometry(window);
+        let pos = centered_dialog_position(usable, parent_geo, win_size);
 
-        Some((
-            root,
-            FloatingWindowData::new(pos, Size::from((win_w, win_h))),
-        ))
+        tracing::debug!(
+            target = "beewm::floating",
+            ?usable,
+            ?parent_geo,
+            ?win_size,
+            ?pos,
+            centred_over_parent = parent_geo.is_some(),
+            "centered_floating_data placement",
+        );
+
+        Some((root, FloatingWindowData::new(pos, win_size)))
+    }
+
+    /// Geometry of the window this dialog is a child of, if the parent is
+    /// currently mapped. Used to centre transient/modal dialogs over their
+    /// parent. Only Wayland `xdg_toplevel.set_parent` relationships are resolved
+    /// here; cross-client prompters (keyring/polkit) have no parent and fall
+    /// back to output-centred placement.
+    fn parent_window_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        let parent = self.toplevel_parent_surface(window)?;
+        let parent_window = self.mapped_window_for_surface(&parent)?;
+        self.space.element_geometry(&parent_window)
+    }
+
+    /// The `xdg_toplevel.set_parent` parent surface of this window, if any.
+    pub(crate) fn toplevel_parent_surface(&self, window: &Window) -> Option<WlSurface> {
+        let toplevel = window.toplevel()?;
+        smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|role| role.lock().unwrap().parent.clone())
+        })
+    }
+
+    /// Root surface of the currently keyboard-focused window when it is a
+    /// floating authentication/modal/transient dialog whose focus a freshly
+    /// mapped *tiled* window must not steal.
+    ///
+    /// "auth dialog" = floating AND (modal | has a parent | known prompter
+    /// app_id). This is intentionally narrow: an ordinary floating utility
+    /// window does not pin focus forever, but a keyring/polkit/modal prompt
+    /// does keep focus when the parent app finishes mapping behind it.
+    pub(crate) fn focused_auth_dialog_root(&self) -> Option<WlSurface> {
+        let focus = self.seat.get_keyboard()?.current_focus()?;
+        let surface = focus.wl_surface()?.into_owned();
+        let root = root_surface(&surface);
+        if !self.is_root_floating(&root) {
+            return None;
+        }
+        let window = self.mapped_window_for_surface(&root)?;
+        let class = classify_toplevel_floating(&window);
+        (class.is_modal || class.has_parent || class.known_dialog).then_some(root)
+    }
+
+    /// Emit the current bottom→top stacking order with each element's app_id
+    /// and floating/tiled layer, gated on the `beewm::floating` debug target so
+    /// it is free in normal runs.
+    pub(crate) fn log_stacking_order(&self, context: &'static str) {
+        if !tracing::enabled!(target: "beewm::floating", tracing::Level::DEBUG) {
+            return;
+        }
+        let order: Vec<String> = self
+            .space
+            .elements()
+            .map(|window| {
+                let layer = Self::window_root_surface(window)
+                    .map(|root| {
+                        if self.is_root_floating(&root) {
+                            "float"
+                        } else {
+                            "tiled"
+                        }
+                    })
+                    .unwrap_or("?");
+                let app_id = window
+                    .toplevel()
+                    .and_then(|toplevel| {
+                        smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                            states
+                                .data_map
+                                .get::<XdgToplevelSurfaceData>()
+                                .and_then(|role| role.lock().unwrap().app_id.clone())
+                        })
+                    })
+                    .or_else(|| window.x11_surface().map(|x11| x11.class()))
+                    .unwrap_or_default();
+                format!("{app_id}[{layer}]")
+            })
+            .collect();
+        tracing::debug!(
+            target = "beewm::floating",
+            context,
+            ?order,
+            "stacking order (bottom→top)",
+        );
     }
 
     fn workspace_idx_for_surface(&self, surface: &WlSurface) -> Option<usize> {

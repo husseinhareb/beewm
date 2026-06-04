@@ -224,6 +224,15 @@ impl Beewm {
         }
 
         self.space.raise_element(&window, true);
+        // Keep floating dialogs above their parent: raising a tiled window with
+        // directional focus must not occlude a transient/modal dialog. Skip when
+        // the focused window is itself floating so it stays on top.
+        let raised_floating = Self::window_root_surface(&window)
+            .map(|root| self.is_root_floating(&root))
+            .unwrap_or(false);
+        if !raised_floating {
+            self.raise_floating_windows();
+        }
         // Sync the X11 z-order. Without this, XWayland still thinks the
         // previously-focused X11 window is on top and routes pointer events
         // accordingly — observable as "Steam has the focus border but clicks

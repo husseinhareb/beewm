@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use beewm::compositor::{
     FloatToggleTransition, ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge,
-    active_workspace_state_contents, constrain_popup_geometry, expand_by_border,
-    float_toggle_transition, is_fixed_size, layers_hit_tested_after_windows,
+    active_workspace_state_contents, centered_dialog_position, constrain_popup_geometry,
+    expand_by_border, float_toggle_transition, is_dialog_size_cap, is_fixed_size,
+    layers_hit_tested_after_windows,
     layers_hit_tested_before_windows, layers_rendered_above_windows, layers_rendered_below_windows,
     popup_constraint_target, resize_edges_for_pointer, resized_window_geometry_from_start,
     root_is_swap_highlighted, visible_border_rectangles, window_border_overlaps_layer,
@@ -78,6 +79,90 @@ fn zero_size_is_not_treated_as_fixed() {
 #[test]
 fn non_zero_size_can_be_treated_as_fixed() {
     assert!(is_fixed_size(Size::<i32, Logical>::from((640, 480))));
+}
+
+#[test]
+fn small_max_size_is_a_dialog_cap() {
+    // gnome-keyring (~400x250), polkit (~400x300), file pickers (~800x600).
+    assert!(is_dialog_size_cap(Size::<i32, Logical>::from((400, 250))));
+    assert!(is_dialog_size_cap(Size::<i32, Logical>::from((800, 600))));
+    assert!(is_dialog_size_cap(Size::<i32, Logical>::from((1280, 1024))));
+}
+
+#[test]
+fn large_or_sentinel_max_size_is_not_a_dialog_cap() {
+    // A parent app advertising display dimensions or a "no real max" sentinel
+    // must NOT be classified as a dialog — otherwise Zed/Spotify/Claude float.
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((1920, 1080))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((3840, 2160))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((32767, 32767))));
+}
+
+#[test]
+fn one_axis_or_zero_max_size_is_not_a_dialog_cap() {
+    // The old rule floated on `max > 0` on a single axis; both axes must be
+    // bounded now so a window capped on only one axis stays tiled.
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((0, 0))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((800, 0))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((0, 600))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((400, 2000))));
+}
+
+#[test]
+fn dialog_without_parent_is_centered_in_usable_area() {
+    let usable = rect(0, 0, 1920, 1080);
+    let win = Size::<i32, Logical>::from((400, 300));
+    // (1920 - 400) / 2 = 760, (1080 - 300) / 2 = 390
+    assert_eq!(
+        centered_dialog_position(usable, None, win),
+        Point::<i32, Logical>::from((760, 390)),
+    );
+}
+
+#[test]
+fn dialog_with_parent_is_centered_over_the_parent() {
+    let usable = rect(0, 0, 1920, 1080);
+    let parent = rect(1000, 600, 600, 400);
+    let win = Size::<i32, Logical>::from((400, 300));
+    // parent center (1000 + 600/2, 600 + 400/2) = (1300, 800)
+    // top-left = (1300 - 200, 800 - 150) = (1100, 650)
+    assert_eq!(
+        centered_dialog_position(usable, Some(parent), win),
+        Point::<i32, Logical>::from((1100, 650)),
+    );
+}
+
+#[test]
+fn dialog_over_parent_is_clamped_into_the_usable_area() {
+    let usable = rect(0, 0, 1920, 1080);
+    // Parent hugging the bottom-right corner would push a centered dialog
+    // partly off-screen; the result must stay fully visible.
+    let parent = rect(1800, 1000, 120, 80);
+    let win = Size::<i32, Logical>::from((400, 300));
+    let pos = centered_dialog_position(usable, Some(parent), win);
+    assert_eq!(pos, Point::<i32, Logical>::from((1920 - 400, 1080 - 300)));
+}
+
+#[test]
+fn dialog_placement_respects_a_non_zero_usable_origin() {
+    // A reserved top bar shifts the usable origin down; the dialog must center
+    // within (and clamp to) that shifted area, never the raw output origin.
+    let usable = rect(0, 40, 1920, 1040);
+    let win = Size::<i32, Logical>::from((400, 300));
+    assert_eq!(
+        centered_dialog_position(usable, None, win),
+        Point::<i32, Logical>::from((760, 40 + (1040 - 300) / 2)),
+    );
+}
+
+#[test]
+fn oversized_dialog_pins_to_the_usable_origin() {
+    let usable = rect(10, 20, 300, 200);
+    let win = Size::<i32, Logical>::from((800, 600));
+    assert_eq!(
+        centered_dialog_position(usable, None, win),
+        Point::<i32, Logical>::from((10, 20)),
+    );
 }
 
 #[test]

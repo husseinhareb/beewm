@@ -17,6 +17,60 @@ pub fn is_fixed_size(size: Size<i32, smithay::utils::Logical>) -> bool {
     size.w > 0 && size.h > 0
 }
 
+/// True when a toplevel's declared `max_size` is a *plausible dialog cap* —
+/// both axes bounded and small enough to be a dialog, rather than a "no real
+/// max" sentinel (display dimensions, 32767) that ordinary resizable app
+/// windows routinely publish.
+///
+/// The earlier rule ("any `max > 0` on either axis is a dialog") floated normal
+/// parent app windows that merely advertise a large cap; that is the root cause
+/// of the keyring prompt's parent appearing floating *and* being stacked above
+/// the prompt (`raise_floating_windows` raises the most-recently-inserted
+/// floating window — the parent — on top). Keeping the parent tiled fixes both.
+pub fn is_dialog_size_cap(max_size: Size<i32, Logical>) -> bool {
+    max_size.w > 0 && max_size.h > 0 && max_size.w <= 1280 && max_size.h <= 1024
+}
+
+/// Choose the top-left placement for a floating dialog of `win_size`.
+///
+/// When `parent` is given the dialog is centred over the parent rectangle
+/// (matching how stacking WMs place transient/modal dialogs over the window
+/// they belong to); otherwise it is centred within `usable`. The result is
+/// always clamped so the dialog stays fully inside `usable` whenever it fits,
+/// and pinned to the usable origin when the dialog is larger than the screen.
+pub fn centered_dialog_position(
+    usable: Rectangle<i32, Logical>,
+    parent: Option<Rectangle<i32, Logical>>,
+    win_size: Size<i32, Logical>,
+) -> Point<i32, Logical> {
+    let anchor = parent.unwrap_or(usable);
+    let x = anchor.loc.x + (anchor.size.w - win_size.w) / 2;
+    let y = anchor.loc.y + (anchor.size.h - win_size.h) / 2;
+    let max_x = usable.loc.x + (usable.size.w - win_size.w).max(0);
+    let max_y = usable.loc.y + (usable.size.h - win_size.h).max(0);
+    Point::from((x.clamp(usable.loc.x, max_x), y.clamp(usable.loc.y, max_y)))
+}
+
+/// Last-resort allowlist for authentication/keyring prompters that float as
+/// dialogs but may not carry a parent, modal flag, or size cap on the wire
+/// (e.g. GNOME Keyring's `gcr-prompter` and polkit agents run as their own
+/// D-Bus-activated clients, so cross-client `set_parent` is impossible).
+///
+/// This is intentionally narrow: protocol metadata (parent/modal/size hints)
+/// is the primary signal — this only catches prompters when that metadata is
+/// absent, and never overrides a window that announces itself as normal.
+pub(crate) fn is_known_dialog_app_id(app_id: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "gcr-prompter",
+        "org.gnome.keyring.Prompter",
+        "gnome-keyring-prompter",
+        "polkit-gnome-authentication-agent-1",
+        "org.freedesktop.PolicyKit1.Authority",
+        "polkit-kde-authentication-agent-1",
+    ];
+    KNOWN.iter().any(|known| app_id.eq_ignore_ascii_case(known))
+}
+
 pub fn popup_constraint_target(
     parent_geometry: Rectangle<i32, Logical>,
     output_geometry: Rectangle<i32, Logical>,
@@ -35,9 +89,35 @@ pub fn constrain_popup_geometry(
     positioner.get_unconstrained_geometry(popup_constraint_target(parent_geometry, output_geometry))
 }
 
-pub(crate) fn should_map_toplevel_floating(window: &Window) -> bool {
+/// Per-window floating classification for an xdg toplevel.
+///
+/// Classification is **per window**: a window floats because of its *own*
+/// properties (parent set on itself, its own modal flag, its own size hints).
+/// It is never derived from a child or parent — a normal app that merely *has*
+/// a dialog child stays tiled.
+#[derive(Debug, Clone)]
+pub(crate) struct ToplevelFloatClass {
+    pub should_float: bool,
+    /// Stable, human-readable reason for the decision (for diagnostics).
+    pub reason: &'static str,
+    pub has_parent: bool,
+    pub is_modal: bool,
+    pub known_dialog: bool,
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+}
+
+pub(crate) fn classify_toplevel_floating(window: &Window) -> ToplevelFloatClass {
     let Some(toplevel) = window.toplevel() else {
-        return false;
+        return ToplevelFloatClass {
+            should_float: false,
+            reason: "not-a-toplevel",
+            has_parent: false,
+            is_modal: false,
+            known_dialog: false,
+            app_id: None,
+            title: None,
+        };
     };
 
     smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
@@ -58,17 +138,36 @@ pub(crate) fn should_map_toplevel_floating(window: &Window) -> bool {
             .cached_state
             .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
         let current = *cached.current();
-        // A client that announces *any* maximum-size cap is telling us it has a
-        // preferred bounded size — dialog-like behaviour. We treat this as a
-        // floating hint even when min_size != max_size (many GTK dialogs only
-        // set max_size, or set min_size to a much smaller floor than max_size).
-        let has_size_cap = current.max_size.w > 0 || current.max_size.h > 0;
         // Strictly fixed-size (min == max, both positive) is the textbook
-        // non-resizable-dialog signal. Keep it for the case where max_size is
-        // not set independently of min_size.
-        let is_fixed =
-            is_fixed_size(current.min_size) && current.min_size == current.max_size;
-        let should_float = has_parent || is_modal || has_size_cap || is_fixed;
+        // non-resizable-dialog signal.
+        let is_fixed = is_fixed_size(current.min_size) && current.min_size == current.max_size;
+        // A *plausible* dialog cap (see `is_dialog_size_cap`): both axes bounded
+        // and within dialog-plausible bounds, so a parent app that merely
+        // advertises a large/sentinel max_size stays tiled.
+        let has_size_cap = is_dialog_size_cap(current.max_size);
+        // Protocol metadata is the primary signal; the app_id allowlist is only
+        // consulted as a fallback for prompters that carry none of it.
+        let known_dialog = app_id
+            .as_deref()
+            .map(is_known_dialog_app_id)
+            .unwrap_or(false);
+
+        // Order matters only for the diagnostic reason string; the OR below is
+        // what actually decides. Strongest/most-specific signals first.
+        let (should_float, reason) = if has_parent {
+            (true, "has-parent")
+        } else if is_modal {
+            (true, "modal")
+        } else if known_dialog {
+            (true, "known-dialog-app-id")
+        } else if is_fixed {
+            (true, "fixed-size")
+        } else if has_size_cap {
+            (true, "bounded-size-cap")
+        } else {
+            (false, "normal")
+        };
+
         tracing::debug!(
             target = "beewm::floating",
             ?title,
@@ -79,11 +178,26 @@ pub(crate) fn should_map_toplevel_floating(window: &Window) -> bool {
             max_size = ?current.max_size,
             has_size_cap,
             is_fixed,
+            known_dialog,
             should_float,
-            "should_map_toplevel_floating decision",
+            reason,
+            "classify_toplevel_floating decision",
         );
-        should_float
+
+        ToplevelFloatClass {
+            should_float,
+            reason,
+            has_parent,
+            is_modal,
+            known_dialog,
+            app_id,
+            title,
+        }
     })
+}
+
+pub(crate) fn should_map_toplevel_floating(window: &Window) -> bool {
+    classify_toplevel_floating(window).should_float
 }
 
 impl Beewm {

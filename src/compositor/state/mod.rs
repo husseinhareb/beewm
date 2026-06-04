@@ -67,7 +67,10 @@ pub use self::decorations::{
     expand_by_border, root_is_swap_highlighted, visible_border_rectangles,
     window_border_overlaps_layer,
 };
-pub use self::popup::{constrain_popup_geometry, is_fixed_size, popup_constraint_target};
+pub use self::popup::{
+    centered_dialog_position, constrain_popup_geometry, is_dialog_size_cap, is_fixed_size,
+    popup_constraint_target,
+};
 pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
 
 const ACTIVE_WORKSPACE_STATE_PATH: &str = "/tmp/beewm_workspace";

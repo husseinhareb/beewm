@@ -30,7 +30,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Point, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::pointer_constraints::{
     PointerConstraint, PointerConstraintsHandler, with_pointer_constraint,
@@ -67,7 +67,7 @@ use super::diagnostics::BufferKind;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::state::{Beewm, lookup_client_compositor_state, root_surface};
-use super::state::popup::should_map_toplevel_floating;
+use super::state::popup::classify_toplevel_floating;
 
 /// Classify the buffer a surface just committed (for the `beewm::dmabuf` /
 /// `beewm::commit` traces). Reads `current()` because beewm's `commit()` runs
@@ -185,8 +185,31 @@ impl CompositorHandler for Beewm {
                 .wl_surface()
                 .map(|s| root_surface(&s.into_owned()))
                 .unwrap_or_else(|| root_surface(surface));
+
+            // Classify *this* window on its own merits. A normal app that merely
+            // has a dialog child is never floated here — only the child window's
+            // own parent/modal/size signals (or a recorded floating intent from
+            // a parent_changed/modal_changed that arrived while pending) float it.
+            let class = classify_toplevel_floating(&window);
             let intent_recorded = self.pending_should_float.remove(&window_root);
-            let should_float = should_map_toplevel_floating(&window) || intent_recorded;
+            let should_float = class.should_float || intent_recorded;
+            let reason = if class.should_float {
+                class.reason
+            } else if intent_recorded {
+                "deferred-parent/modal-intent"
+            } else {
+                "normal"
+            };
+
+            // Capture an authentication/modal dialog that currently holds focus
+            // *before* we map this window, so a tiled parent mapping behind it
+            // does not steal its keyboard focus.
+            let auth_dialog_root = self.focused_auth_dialog_root();
+
+            let parent_root = self
+                .toplevel_parent_surface(&window)
+                .map(|parent| parent.id().protocol_id());
+
             if should_float {
                 self.map_as_floating_centered(&window);
                 self.relayout();
@@ -204,8 +227,16 @@ impl CompositorHandler for Beewm {
                 .as_ref()
                 .map(|fs| fs != &window)
                 .unwrap_or(false);
+            // Keep keyboard focus on an existing modal/auth dialog when the
+            // window we just mapped is a tiled parent appearing behind it.
+            let keep_auth_dialog_focus = !should_float && auth_dialog_root.is_some();
+            let mut focus_target = window_root.id().protocol_id();
             if !fullscreen_blocks_focus {
-                if let Some(toplevel) = window.toplevel() {
+                if keep_auth_dialog_focus {
+                    if let Some(root) = auth_dialog_root.clone() {
+                        focus_target = root.id().protocol_id();
+                    }
+                } else if let Some(toplevel) = window.toplevel() {
                     let wl_surface = toplevel.wl_surface().clone();
                     self.set_keyboard_focus(Some(wl_surface));
                 }
@@ -215,6 +246,32 @@ impl CompositorHandler for Beewm {
                 // opens on top of them.
                 self.raise_floating_windows();
             }
+
+            let placement = if should_float {
+                self.floating_windows
+                    .get(&window_root)
+                    .map(|floating| Rectangle::new(floating.position, floating.size))
+            } else {
+                self.space.element_geometry(&window)
+            };
+            tracing::info!(
+                target = "beewm::floating",
+                id = window_root.id().protocol_id(),
+                app_id = ?class.app_id,
+                title = ?class.title,
+                has_parent = class.has_parent,
+                ?parent_root,
+                is_modal = class.is_modal,
+                known_dialog = class.known_dialog,
+                layer = if should_float { "floating" } else { "tiled" },
+                reason,
+                ?placement,
+                kept_auth_dialog_focus = keep_auth_dialog_focus,
+                focus_target,
+                "mapped new toplevel",
+            );
+            self.log_stacking_order("after toplevel map");
+
             self.needs_render = true;
             return;
         }
@@ -457,6 +514,10 @@ impl XdgShellHandler for Beewm {
                     .unwrap_or(false)
             }) {
                 let window = self.workspaces[ws_idx].remove_window(pos).unwrap();
+                // Remember the dialog's parent so closing it returns focus to the
+                // window it belonged to, rather than whatever happens to be the
+                // workspace's last-focused tile.
+                let parent_surface = self.toplevel_parent_surface(&window);
                 let should_restore_focus = if ws_idx == self.active_workspace {
                     match self
                         .seat
@@ -500,15 +561,19 @@ impl XdgShellHandler for Beewm {
                 self.publish_workspace_state();
                 if ws_idx == self.active_workspace {
                     if should_restore_focus {
-                        let focus = self.workspaces[self.active_workspace]
-                            .focused_idx
-                            .and_then(|focus_idx| {
-                                self.workspaces[self.active_workspace]
-                                    .windows
-                                    .get(focus_idx)
-                            })
-                            .and_then(|window| window.toplevel())
-                            .map(|toplevel| toplevel.wl_surface().clone());
+                        // Prefer the closed dialog's parent if it is still mapped;
+                        // fall back to the workspace's last-focused window.
+                        let parent_focus = parent_surface
+                            .filter(|parent| self.mapped_window_for_surface(parent).is_some());
+                        let focus = parent_focus.or_else(|| {
+                            self.workspaces[self.active_workspace]
+                                .focused_idx
+                                .and_then(|focus_idx| {
+                                    self.workspaces[self.active_workspace].windows.get(focus_idx)
+                                })
+                                .and_then(|window| window.toplevel())
+                                .map(|toplevel| toplevel.wl_surface().clone())
+                        });
                         self.set_keyboard_focus(focus);
                     }
                     self.relayout();
