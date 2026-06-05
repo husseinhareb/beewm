@@ -100,8 +100,7 @@ impl Beewm {
             .space
             .elements()
             .filter(|w| {
-                self.fullscreen_window
-                    .as_ref()
+                self.active_fullscreen()
                     .map(|fs| fs != *w)
                     .unwrap_or(true)
             })
@@ -165,8 +164,7 @@ impl Beewm {
             .space
             .elements()
             .filter(|w| {
-                self.fullscreen_window
-                    .as_ref()
+                self.active_fullscreen()
                     .map(|fs| fs != *w)
                     .unwrap_or(true)
             })

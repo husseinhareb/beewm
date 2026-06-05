@@ -72,6 +72,45 @@ impl Beewm {
         self.focus_active_workspace_window(idx);
     }
 
+    /// Move keyboard focus to the next/previous tiled window in *on-screen
+    /// layout order* (the order `LayoutManager::geometries` produces), wrapping
+    /// around. This is what `FocusNext`/`FocusPrev` bind to.
+    ///
+    /// Cycling over the layout order — rather than the workspace's
+    /// window-insertion order — means `mod+Tab` walks neighbours as they appear
+    /// on screen instead of jumping around by creation time. When the active
+    /// workspace has no tiled windows (everything is floating), fall back to the
+    /// insertion-order cycle so floating-only workspaces still cycle.
+    pub fn focus_in_cycle(&mut self, forward: bool) {
+        let ws_idx = self.active_workspace;
+        let ordered = self.layout_manager.ordered_roots(ws_idx);
+        if ordered.is_empty() {
+            let workspace = &mut self.workspaces[ws_idx];
+            if forward {
+                workspace.focus_next();
+            } else {
+                workspace.focus_prev();
+            }
+            self.focus_current_window();
+            return;
+        }
+
+        let current_pos = self
+            .focused_tiled_window_root(ws_idx)
+            .and_then(|root| ordered.iter().position(|candidate| *candidate == root));
+
+        let next_pos = match current_pos {
+            Some(pos) if forward => (pos + 1) % ordered.len(),
+            Some(pos) => (pos + ordered.len() - 1) % ordered.len(),
+            None => 0,
+        };
+
+        let target_root = ordered[next_pos].clone();
+        if let Some(idx) = self.window_index_for_surface(ws_idx, &target_root) {
+            self.focus_active_workspace_window(idx);
+        }
+    }
+
     pub fn focus_window_in_direction(&mut self, direction: FocusDirection) {
         let Some(current_idx) = self.active_workspace_focused_index() else {
             return;
@@ -110,6 +149,13 @@ impl Beewm {
         }
     }
 
+    /// The single authoritative writer of `Workspace::focused_idx`. The seat's
+    /// keyboard focus is the source of truth for "which window is focused";
+    /// `focused_idx` is only a cache of that (and the value restored when a
+    /// workspace is re-entered). Smithay calls this from `focus_changed` after
+    /// it has already updated the seat focus, so `active_workspace_focused_index`
+    /// — which reads the seat — agrees with what we cache here. No other code
+    /// path should assign `focused_idx` directly.
     pub fn note_keyboard_focus_change(&mut self, focused: Option<&WlSurface>) {
         let new_idx = focused
             .and_then(|s| self.window_index_for_surface(self.active_workspace, s));
@@ -147,6 +193,14 @@ impl Beewm {
 
         if let Some(idx) = new_idx {
             self.workspaces[self.active_workspace].focused_idx = Some(idx);
+            // The cache must agree with the seat keyboard focus we just synced
+            // from. `active_workspace_focused_index` prefers the seat, so this
+            // catches any drift between the two representations of focus.
+            debug_assert_eq!(
+                self.active_workspace_focused_index(),
+                Some(idx),
+                "focused_idx cache diverged from the seat keyboard focus",
+            );
         }
 
         self.invalidate_borders();
@@ -182,7 +236,9 @@ impl Beewm {
         // = false and skips the intermediate keyboard.set_focus(root) call, which
         // would otherwise emit a spurious focus_changed event before we set the
         // real focus below.
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
         if keyboard.is_grabbed() {
             keyboard.unset_grab(self);
         }
@@ -194,7 +250,9 @@ impl Beewm {
         }
 
         let is_none = focused.is_none();
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
         keyboard.set_focus(self, focused, serial);
 
         // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.
@@ -217,8 +275,9 @@ impl Beewm {
             return;
         };
 
-        self.workspaces[self.active_workspace].focused_idx = Some(idx);
-
+        // Don't set `focused_idx` here: the seat's keyboard focus is the single
+        // source of truth. Setting the focus below routes through
+        // `note_keyboard_focus_change`, which updates the `focused_idx` cache.
         if let Some(target) = KeyboardFocusTarget::from_window(&window) {
             self.set_keyboard_focus_target(Some(target));
         }

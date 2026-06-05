@@ -1,6 +1,28 @@
 use beewm::model::workspace::Workspace;
 
 #[test]
+fn fullscreen_slot_is_per_workspace_and_independent() {
+    // Each workspace owns its own fullscreen slot, so a window fullscreened on
+    // one workspace must not leak into another and survives switching away and
+    // back (the compositor re-presents it from this slot on re-entry).
+    let mut workspaces: Vec<Workspace<u32>> =
+        std::iter::repeat_with(Workspace::new).take(3).collect();
+
+    assert!(workspaces.iter().all(|ws| ws.fullscreen.is_none()));
+
+    workspaces[1].fullscreen = Some(42);
+
+    assert_eq!(workspaces[0].fullscreen, None);
+    assert_eq!(workspaces[1].fullscreen, Some(42));
+    assert_eq!(workspaces[2].fullscreen, None);
+
+    // Mutating windows/focus on the workspace leaves the fullscreen slot intact.
+    workspaces[1].add_window(7);
+    workspaces[1].focus_next();
+    assert_eq!(workspaces[1].fullscreen, Some(42));
+}
+
+#[test]
 fn add_window_focuses_the_newest_window() {
     let mut workspace = Workspace::default();
 

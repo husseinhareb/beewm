@@ -129,8 +129,7 @@ fn compute_compositor_cursor(state: &Beewm) -> Option<CursorIcon> {
     for window in state.space.elements() {
         // Fullscreen windows have no compositor-drawn borders.
         if state
-            .fullscreen_window
-            .as_ref()
+            .active_fullscreen()
             .map(|fs| fs == window)
             .unwrap_or(false)
         {

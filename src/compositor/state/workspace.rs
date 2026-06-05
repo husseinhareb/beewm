@@ -36,10 +36,8 @@ impl Beewm {
             idx + 1
         );
 
-        // If a window is fullscreened, restore it before leaving the workspace.
-        self.restore_fullscreen();
-
-        // Unmap all windows from the current workspace
+        // Leave the current workspace's fullscreen state intact — it is
+        // re-presented when we return. Just unmap everything currently shown.
         for window in &self.workspaces[self.active_workspace].windows {
             self.space.unmap_elem(window);
         }
@@ -50,13 +48,26 @@ impl Beewm {
         self.needs_render = true;
         self.relayout();
 
-        // Focus the active window on the new workspace
+        // If the workspace we entered had a fullscreen window, re-present it
+        // over the freshly relaid-out tiles.
+        if let Some(window) = self.workspaces[self.active_workspace].fullscreen.clone() {
+            self.show_fullscreen_window(&window);
+        }
+
+        // Focus the workspace's fullscreen window if it has one, otherwise its
+        // last-focused tiled window.
         let focus = self.workspaces[self.active_workspace]
-            .focused_idx
-            .and_then(|focus_idx| {
+            .fullscreen
+            .clone()
+            .or_else(|| {
                 self.workspaces[self.active_workspace]
-                    .windows
-                    .get(focus_idx)
+                    .focused_idx
+                    .and_then(|focus_idx| {
+                        self.workspaces[self.active_workspace]
+                            .windows
+                            .get(focus_idx)
+                            .cloned()
+                    })
             })
             .and_then(|window| window.wl_surface().map(|surface| surface.into_owned()));
         if let Some(focus) = focus {
@@ -72,9 +83,11 @@ impl Beewm {
             return;
         }
 
-        // Restore fullscreen before moving, mirroring switch_workspace. Without
-        // this, fullscreen_window keeps pointing at the moved window, leaving
-        // layer suppression active on the source workspace and siblings unmapped.
+        // Exit fullscreen before moving the focused window. The focused window
+        // is the active workspace's fullscreen window when one is set, so moving
+        // it must clear that slot first — otherwise the source workspace keeps a
+        // fullscreen entry pointing at a window that no longer lives there,
+        // leaving layer suppression active and siblings unmapped.
         self.restore_fullscreen();
 
         let focus_idx = match self.active_workspace_focused_index() {

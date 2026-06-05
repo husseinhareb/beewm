@@ -13,6 +13,41 @@ use crate::compositor::types::{
 use super::MIN_FLOATING_WINDOW_SIZE;
 use super::pointer::surface_under;
 
+/// Minimum number of pixels of a floating window that must stay within the
+/// usable area on each axis while moving, so it can always be grabbed again.
+const ONSCREEN_MARGIN: i32 = 48;
+
+/// Clamp a window's top-left position so at least `margin` px of it (per axis)
+/// stays inside `usable`. Only the position is adjusted — the size is left
+/// exactly as the caller computed it.
+fn clamp_window_onscreen(
+    pos: Point<i32, Logical>,
+    size: Size<i32, Logical>,
+    usable: Rectangle<i32, Logical>,
+    margin: i32,
+) -> Point<i32, Logical> {
+    let clamp_axis = |value: i32, lo: i32, hi: i32| -> i32 {
+        // A usable area narrower than the visible margin would invert the
+        // bounds; pin to the far edge rather than panicking in `clamp`.
+        if lo > hi { hi } else { value.clamp(lo, hi) }
+    };
+
+    let mx = margin.min(size.w.max(1));
+    let my = margin.min(size.h.max(1));
+
+    // Left edge may range from "right edge just `mx` past the usable left" to
+    // "left edge `mx` short of the usable right"; likewise vertically.
+    let min_x = usable.loc.x + mx - size.w;
+    let max_x = usable.loc.x + usable.size.w - mx;
+    let min_y = usable.loc.y + my - size.h;
+    let max_y = usable.loc.y + usable.size.h - my;
+
+    Point::from((
+        clamp_axis(pos.x, min_x, max_x),
+        clamp_axis(pos.y, min_y, max_y),
+    ))
+}
+
 pub(super) fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>) -> bool {
     match state.active_grab.clone() {
         Some(ActiveGrab::Move(grab)) => {
@@ -63,26 +98,33 @@ fn apply_window_move_from_start(
     start_window_pos: Point<i32, Logical>,
     pointer: Point<f64, Logical>,
 ) {
-    let new_window_pos = dragged_window_location(start_window_pos, start_pointer, pointer);
+    let mut new_window_pos = dragged_window_location(start_window_pos, start_pointer, pointer);
+
+    let root = Beewm::window_root_surface(window);
+    let size = state
+        .space
+        .element_geometry(window)
+        .map(|geo| geo.size)
+        .or_else(|| {
+            root.as_ref()
+                .and_then(|root| state.floating_windows.get(root))
+                .map(|floating| floating.size)
+        });
+
+    // Keep at least a grabbable strip of the window on-screen so it can never
+    // be dragged entirely past the edges (no client-side titlebars exist).
+    if let (Some(size), Some(usable)) = (size, state.floating_usable_rect()) {
+        new_window_pos = clamp_window_onscreen(new_window_pos, size, usable, ONSCREEN_MARGIN);
+    }
+
     state
         .space
         .map_element(window.clone(), new_window_pos, true);
-    if let Some(root) = Beewm::window_root_surface(window) {
-        let size = state
-            .space
-            .element_geometry(window)
-            .map(|geo| geo.size)
-            .or_else(|| {
-                state
-                    .floating_windows
-                    .get(&root)
-                    .map(|floating| floating.size)
-            });
-        if let Some(size) = size {
-            state
-                .floating_windows
-                .insert(root, FloatingWindowData::new(new_window_pos, size));
-        }
+
+    if let (Some(root), Some(size)) = (root, size) {
+        state
+            .floating_windows
+            .insert(root, FloatingWindowData::new(new_window_pos, size));
     }
 }
 
@@ -435,7 +477,9 @@ fn tiled_window_target_size(
 }
 
 fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return None;
+    };
     let modifiers = keyboard.modifier_state();
     if !modifiers.logo {
         return None;
@@ -448,7 +492,9 @@ fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> 
 }
 
 fn tiled_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return None;
+    };
     let modifiers = keyboard.modifier_state();
     if !modifiers.logo {
         return None;
@@ -606,9 +652,38 @@ mod tests {
     use smithay::utils::{Logical, Point, Rectangle, Size};
 
     use super::{
-        dragged_window_location, original_tiled_slot_contains_pointer,
+        clamp_window_onscreen, dragged_window_location, original_tiled_slot_contains_pointer,
         tiled_swap_target_from_geometries,
     };
+
+    fn usable() -> Rectangle<i32, Logical> {
+        Rectangle::new((0, 0).into(), Size::<i32, Logical>::from((1920, 1080)))
+    }
+
+    #[test]
+    fn clamp_keeps_a_margin_visible_when_dragged_off_the_right_and_bottom() {
+        let size = Size::<i32, Logical>::from((400, 300));
+        let clamped = clamp_window_onscreen(Point::from((5000, 5000)), size, usable(), 48);
+        // Left edge pinned so 48px of the window stays inside the right edge.
+        assert_eq!(clamped.x, 1920 - 48);
+        assert_eq!(clamped.y, 1080 - 48);
+    }
+
+    #[test]
+    fn clamp_keeps_a_margin_visible_when_dragged_off_the_top_and_left() {
+        let size = Size::<i32, Logical>::from((400, 300));
+        let clamped = clamp_window_onscreen(Point::from((-5000, -5000)), size, usable(), 48);
+        // Right edge must remain at least 48px past the usable left edge.
+        assert_eq!(clamped.x + size.w, 48);
+        assert_eq!(clamped.y + size.h, 48);
+    }
+
+    #[test]
+    fn clamp_leaves_an_on_screen_window_untouched() {
+        let size = Size::<i32, Logical>::from((400, 300));
+        let pos = Point::from((200, 150));
+        assert_eq!(clamp_window_onscreen(pos, size, usable(), 48), pos);
+    }
 
     #[test]
     fn dragged_window_location_preserves_the_initial_pointer_offset() {

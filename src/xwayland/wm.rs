@@ -78,8 +78,7 @@ impl Beewm {
                 // its keyboard. The new window is still inserted into the
                 // workspace so it appears once fullscreen exits.
                 let fullscreen_blocks_focus = self
-                    .fullscreen_window
-                    .as_ref()
+                    .active_fullscreen()
                     .map(|fs| fs != &window)
                     .unwrap_or(false);
                 // Keep focus on an existing modal/auth dialog when this tiled X11
@@ -178,16 +177,22 @@ impl Beewm {
             return false;
         };
 
-        let already_fullscreen = self
-            .fullscreen_window
+        let already_fullscreen = self.workspaces[ws_idx]
+            .fullscreen
             .as_ref()
             .map(|fullscreen| fullscreen == &window_obj)
             .unwrap_or(false);
         if already_fullscreen {
             return true;
         }
-        if self.fullscreen_window.is_some() {
-            self.restore_fullscreen();
+        // Replace any existing fullscreen on the target workspace (see the
+        // xdg-shell fullscreen_request handler for the active-vs-hidden split).
+        if self.workspaces[ws_idx].fullscreen.is_some() {
+            if ws_idx == self.active_workspace {
+                self.restore_fullscreen();
+            } else {
+                self.workspaces[ws_idx].fullscreen = None;
+            }
         }
 
         let _ = window.set_fullscreen(true);
@@ -207,7 +212,7 @@ impl Beewm {
         let _ = window.configure(output_geo);
         self.space
             .map_element(window_obj.clone(), output_geo.loc, true);
-        self.fullscreen_window = Some(window_obj.clone());
+        self.workspaces[ws_idx].fullscreen = Some(window_obj.clone());
 
         if let Some(wl_surface) = window_obj.wl_surface().map(|s| s.into_owned()) {
             self.set_keyboard_focus(Some(wl_surface));
@@ -295,14 +300,14 @@ impl Beewm {
             self.remove_tiled_window(workspace_idx, surface);
         }
 
-        let was_fullscreen = self
-            .fullscreen_window
+        let was_fullscreen = self.workspaces[workspace_idx]
+            .fullscreen
             .as_ref()
             .and_then(|window| window.x11_surface())
             .map(|candidate| candidate == surface)
             .unwrap_or(false);
         if was_fullscreen {
-            self.fullscreen_window = None;
+            self.workspaces[workspace_idx].fullscreen = None;
             for sibling in &self.workspaces[workspace_idx].windows {
                 if self.space.element_geometry(sibling).is_none() {
                     self.space.map_element(sibling.clone(), (0, 0), false);
@@ -483,6 +488,7 @@ impl XwmHandler for Beewm {
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        let _guard = crate::compositor::state::DispatchCallbackGuard::enter();
         if matches!(property, WmWindowProperty::Title) {
             let is_focused = self
                 .active_workspace_focused_window()
@@ -660,8 +666,7 @@ impl XwmHandler for Beewm {
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let is_our_fullscreen = self
-            .fullscreen_window
-            .as_ref()
+            .active_fullscreen()
             .and_then(|w| w.x11_surface())
             .map(|s| s == &window)
             .unwrap_or(false);

@@ -303,15 +303,15 @@ impl Beewm {
         // GeometryChange path triggered by the relayout below.
         self.animations.forget(&root);
 
-        // Clean up fullscreen state if this was the fullscreen window.
-        let was_fullscreen = self
-            .fullscreen_window
+        // Clean up fullscreen state if this was the workspace's fullscreen window.
+        let was_fullscreen = self.workspaces[ws_idx]
+            .fullscreen
             .as_ref()
             .and_then(Self::window_root_surface)
             .map(|fs_root| fs_root == root)
             .unwrap_or(false);
         if was_fullscreen {
-            self.fullscreen_window = None;
+            self.workspaces[ws_idx].fullscreen = None;
             // Remap siblings that were unmapped while fullscreen was active.
             for sibling in self.workspaces[ws_idx].windows.clone() {
                 if self.space.element_geometry(&sibling).is_none() {
@@ -390,6 +390,24 @@ impl Beewm {
                 self.window_index_for_surface(workspace_idx, surface)
                     .map(|_| workspace_idx)
             })
+    }
+
+    /// The rectangle floating windows are kept reachable within: the output
+    /// minus layer-shell exclusive zones (so a float can't hide under the bar),
+    /// *without* the tiling gap. Used to clamp interactive moves/resizes so a
+    /// floating window can never be dragged entirely off-screen — there are no
+    /// client-side titlebars to grab it back with.
+    pub(crate) fn floating_usable_rect(&self) -> Option<Rectangle<i32, Logical>> {
+        let output = self.space.outputs().next()?.clone();
+        let output_geo = self.space.output_geometry(&output)?;
+        let non_exclusive = {
+            let lm = smithay::desktop::layer_map_for_output(&output);
+            lm.non_exclusive_zone()
+        };
+        Some(Rectangle::new(
+            output_geo.loc + non_exclusive.loc,
+            non_exclusive.size,
+        ))
     }
 
     pub(crate) fn tiling_usable_geometry(&self) -> Option<Geometry> {
@@ -721,41 +739,51 @@ impl Beewm {
 
     /// Toggle fullscreen for the currently focused window.
     pub fn toggle_fullscreen(&mut self) {
-        if self.fullscreen_window.is_some() {
+        if self.active_fullscreen().is_some() {
             self.exit_fullscreen_internal(true);
         } else {
             let window = match self.active_workspace_focused_window().cloned() {
                 Some(w) => w,
                 None => return,
             };
-            let output = match self.space.outputs().next().cloned() {
-                Some(o) => o,
-                None => return,
-            };
-            let output_geo = self.space.output_geometry(&output).unwrap();
-            let ws_idx = self.active_workspace;
-            for sibling in &self.workspaces[ws_idx].windows {
-                if *sibling != window {
-                    self.space.unmap_elem(sibling);
-                }
-            }
-            if let Some(toplevel) = window.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    state.states.set(xdg_toplevel::State::Fullscreen);
-                    state.size = Some(output_geo.size);
-                });
-                toplevel.send_configure();
-            } else if let Some(x11_surface) = window.x11_surface() {
-                let _ = x11_surface.set_fullscreen(true);
-                let _ = x11_surface.configure(output_geo);
-            }
-            if let Some(root) = Self::window_root_surface(&window) {
-                self.animations.forget(&root);
-            }
-            self.space.map_element(window.clone(), output_geo.loc, true);
-            self.fullscreen_window = Some(window);
-            self.needs_render = true;
+            self.workspaces[self.active_workspace].fullscreen = Some(window.clone());
+            self.show_fullscreen_window(&window);
         }
+    }
+
+    /// Present `window` fullscreen on the active workspace: unmap its siblings,
+    /// configure it to the output size, and map it over the output. The active
+    /// workspace's `fullscreen` slot must already point at `window` — this only
+    /// applies the on-screen presentation. Shared by `toggle_fullscreen` and the
+    /// workspace-switch re-apply path so the two can never drift.
+    pub(crate) fn show_fullscreen_window(&mut self, window: &Window) {
+        let Some(output) = self.space.outputs().next().cloned() else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            return;
+        };
+        let ws_idx = self.active_workspace;
+        for sibling in self.workspaces[ws_idx].windows.clone() {
+            if &sibling != window {
+                self.space.unmap_elem(&sibling);
+            }
+        }
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.size = Some(output_geo.size);
+            });
+            toplevel.send_configure();
+        } else if let Some(x11_surface) = window.x11_surface() {
+            let _ = x11_surface.set_fullscreen(true);
+            let _ = x11_surface.configure(output_geo);
+        }
+        if let Some(root) = Self::window_root_surface(window) {
+            self.animations.forget(&root);
+        }
+        self.space.map_element(window.clone(), output_geo.loc, true);
+        self.needs_render = true;
     }
 
     /// Exit fullscreen (if any) and restore the tiled layout.
@@ -764,7 +792,7 @@ impl Beewm {
     }
 
     fn exit_fullscreen_internal(&mut self, relayout: bool) -> Option<Window> {
-        let fs_window = self.fullscreen_window.take()?;
+        let fs_window = self.workspaces[self.active_workspace].fullscreen.take()?;
         let restore_floating = Self::window_root_surface(&fs_window)
             .and_then(|root| self.floating_windows.get(&root).copied());
 

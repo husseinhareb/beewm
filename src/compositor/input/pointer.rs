@@ -168,7 +168,9 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
 
     // If the surface currently under the cursor has an active pointer lock, keep the
     // cursor fixed and only deliver relative motion to the game.
-    let pointer = state.seat.get_pointer().unwrap();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
     let under_cursor = surface_under(state, state.pointer_location);
     let is_locked = under_cursor
         .as_ref()
@@ -183,7 +185,9 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
 
     if is_locked {
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = state.seat.get_pointer().unwrap();
+        let Some(pointer) = state.seat.get_pointer() else {
+            return;
+        };
         // Smithay's PointerInternal::relative_motion ignores the focus parameter
         // and delivers only to its internal self.focus, which is only set by
         // pointer.motion() calls. Call motion() first at the current (fixed) cursor
@@ -228,7 +232,9 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     }
 
     let serial = SERIAL_COUNTER.next_serial();
-    let pointer = state.seat.get_pointer().unwrap();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
     let pointer_is_grabbed = pointer.is_grabbed();
 
     let under = surface_under(state, new_pos);
@@ -263,7 +269,9 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
                 state.refresh_compositor_cursor();
                 return;
             };
-            let keyboard = state.seat.get_keyboard().unwrap();
+            let Some(keyboard) = state.seat.get_keyboard() else {
+                return;
+            };
             let already_focused = keyboard
                 .current_focus()
                 .as_ref()
@@ -302,7 +310,9 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
     }
 
     let serial = SERIAL_COUNTER.next_serial();
-    let pointer = state.seat.get_pointer().unwrap();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
     let pointer_is_grabbed = pointer.is_grabbed();
 
     let under = surface_under(state, pos);
@@ -327,7 +337,9 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
                 state.refresh_compositor_cursor();
                 return;
             };
-            let keyboard = state.seat.get_keyboard().unwrap();
+            let Some(keyboard) = state.seat.get_keyboard() else {
+                return;
+            };
             let already_focused = keyboard
                 .current_focus()
                 .as_ref()
@@ -430,7 +442,9 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
         }
     }
 
-    let pointer = state.seat.get_pointer().unwrap();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
     pointer.button(
         state,
         &ButtonEvent {
@@ -473,7 +487,9 @@ mod tests {
 }
 
 pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {
-    let pointer = state.seat.get_pointer().unwrap();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
 
     let source = event.source();
     let horizontal_amount = event.amount(Axis::Horizontal);

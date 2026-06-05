@@ -13,7 +13,9 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
     let keycode = event.key_code();
     let key_state = event.state();
 
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
 
     keyboard.input::<(), _>(
         state,
@@ -97,14 +99,10 @@ fn execute_action(state: &mut Beewm, action: Action) {
             }
         }
         Action::FocusNext => {
-            let ws = &mut state.workspaces[state.active_workspace];
-            ws.focus_next();
-            state.focus_current_window();
+            state.focus_in_cycle(true);
         }
         Action::FocusPrev => {
-            let ws = &mut state.workspaces[state.active_workspace];
-            ws.focus_prev();
-            state.focus_current_window();
+            state.focus_in_cycle(false);
         }
         Action::FocusDirection(direction) => {
             state.focus_window_in_direction(direction);

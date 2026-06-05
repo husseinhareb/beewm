@@ -13,7 +13,7 @@ use beewm::compositor::{
     workspace_state_contents, write_state_file_atomically,
 };
 use beewm::layout::dwindle_tree::{DwindleTree, ResizeEdge};
-use beewm::layout::manager::{LayoutManager, MasterStackManager};
+use beewm::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use beewm::model::window::Geometry;
 use beewm::model::workspace::Workspace;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner;
@@ -382,6 +382,73 @@ fn resizing_a_dwindle_leaf_updates_the_nearest_matching_split() {
     assert_eq!(geometries[&1], Geometry::new(0, 0, 50, 100));
     assert_eq!(geometries[&2], Geometry::new(50, 0, 50, 40));
     assert_eq!(geometries[&3], Geometry::new(50, 40, 50, 60));
+}
+
+#[test]
+fn dwindle_ordered_roots_follow_layout_order_not_insertion() {
+    // FocusNext/Prev cycle through `ordered_roots`, which must match the
+    // on-screen (geometry) traversal order rather than window-insertion order.
+    let mut manager = DwindleManager::new(1, 0.5);
+    manager.insert(0, None, 1u8);
+    manager.insert(0, Some(&1u8), 2u8);
+    manager.insert(0, Some(&2u8), 3u8);
+
+    let screen = Geometry::new(0, 0, 100, 100);
+    let geometries = manager.geometries(0, &screen, &[1u8, 2u8, 3u8]);
+    let ordered = manager.ordered_roots(0);
+
+    // Every tiled id appears exactly once.
+    assert_eq!(ordered.len(), 3);
+    for id in [1u8, 2u8, 3u8] {
+        assert!(ordered.contains(&id));
+    }
+
+    // The order is the left/top → right/bottom geometry order: each successive
+    // root sits at an origin that is not before the previous one.
+    let origins: Vec<_> = ordered.iter().map(|id| geometries[id].x).collect();
+    let mut sorted = origins.clone();
+    sorted.sort();
+    // For this dwindle shape the master (id 1) is leftmost; the stack splits to
+    // its right, so ordered_roots starts at the leftmost column.
+    assert_eq!(ordered.first(), Some(&1u8));
+    assert_eq!(geometries[&ordered[0]].x, *sorted.first().unwrap());
+}
+
+#[test]
+fn master_stack_ordered_roots_match_stack_order() {
+    let mut manager = MasterStackManager::new(1, 0.5);
+    manager.insert(0, None, 10u8);
+    manager.insert(0, None, 20u8);
+    manager.insert(0, None, 30u8);
+
+    assert_eq!(manager.ordered_roots(0), vec![10u8, 20u8, 30u8]);
+}
+
+#[test]
+fn layout_manager_out_of_range_workspace_is_noop() {
+    // Defensive bounds checks: operating on a workspace index past the end must
+    // never panic (panic = "abort" would take down the whole session).
+    let mut dwindle = DwindleManager::<u8>::new(2, 0.5);
+    dwindle.insert(99, None, 1u8); // out of range — must not panic
+    dwindle.remove(99, &1u8);
+    assert!(!dwindle.swap(99, &1u8, &2u8));
+    assert!(dwindle.ordered_roots(99).is_empty());
+    assert!(
+        dwindle
+            .geometries(99, &Geometry::new(0, 0, 100, 100), &[])
+            .is_empty()
+    );
+
+    let mut master = MasterStackManager::<u8>::new(2, 0.5);
+    master.insert(99, None, 1u8);
+    master.remove(99, &1u8);
+    assert!(!master.swap(99, &1u8, &2u8));
+    assert!(master.ordered_roots(99).is_empty());
+    assert!(
+        master
+            .geometries(99, &Geometry::new(0, 0, 100, 100), &[])
+            .is_empty()
+    );
 }
 
 #[test]

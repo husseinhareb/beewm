@@ -16,12 +16,23 @@ impl Beewm {
         self.floating_windows.contains_key(root)
     }
 
+    /// The window fullscreened on the *active* workspace, if any.
+    pub(crate) fn active_fullscreen(&self) -> Option<&Window> {
+        self.workspaces[self.active_workspace].fullscreen.as_ref()
+    }
+
     pub(crate) fn is_root_fullscreen(&self, root: &WlSurface) -> bool {
-        self.fullscreen_window
-            .as_ref()
-            .and_then(Self::window_root_surface)
-            .map(|fullscreen_root| fullscreen_root == *root)
-            .unwrap_or(false)
+        // Check every workspace, not just the active one: a window can be the
+        // fullscreen of a hidden workspace and must still be treated as
+        // fullscreen (e.g. when relaying out or reclassifying that workspace).
+        self.workspaces.iter().any(|workspace| {
+            workspace
+                .fullscreen
+                .as_ref()
+                .and_then(Self::window_root_surface)
+                .map(|fullscreen_root| fullscreen_root == *root)
+                .unwrap_or(false)
+        })
     }
 
     pub(crate) fn focused_tiled_window_root(&self, workspace_idx: usize) -> Option<WlSurface> {
@@ -125,8 +136,7 @@ impl Beewm {
     }
 
     pub fn screen_owned_by_x11_window(&self) -> bool {
-        self.fullscreen_window
-            .as_ref()
+        self.active_fullscreen()
             .and_then(|window| window.x11_surface())
             .is_some()
             || self
@@ -145,7 +155,7 @@ impl Beewm {
     ///    only `fullscreen_window` lets borders/layers reappear and prevents
     ///    direct scanout.
     pub fn screen_owned_by_window(&self) -> bool {
-        if self.fullscreen_window.is_some() {
+        if self.active_fullscreen().is_some() {
             return true;
         }
 

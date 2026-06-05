@@ -598,8 +598,7 @@ fn render_frame(data: &mut UdevData) {
     // shows which path is being exercised.
     let fullscreen_is_x11 = data
         .state
-        .fullscreen_window
-        .as_ref()
+        .active_fullscreen()
         .and_then(|w| w.x11_surface())
         .is_some()
         || data.state.screen_owned_by_x11_window();

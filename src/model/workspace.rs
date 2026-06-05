@@ -3,6 +3,10 @@
 pub struct Workspace<W = ()> {
     pub windows: Vec<W>,
     pub focused_idx: Option<usize>,
+    /// The window currently fullscreened on *this* workspace, if any. Tracked
+    /// per workspace (not globally) so switching away from and back to a
+    /// workspace preserves its fullscreen state.
+    pub fullscreen: Option<W>,
 }
 
 impl<W> Workspace<W> {
@@ -10,6 +14,7 @@ impl<W> Workspace<W> {
         Workspace {
             windows: Vec::new(),
             focused_idx: None,
+            fullscreen: None,
         }
     }
 
