@@ -149,6 +149,13 @@ impl Beewm {
         }
     }
 
+    /// The single authoritative writer of `Workspace::focused_idx`. The seat's
+    /// keyboard focus is the source of truth for "which window is focused";
+    /// `focused_idx` is only a cache of that (and the value restored when a
+    /// workspace is re-entered). Smithay calls this from `focus_changed` after
+    /// it has already updated the seat focus, so `active_workspace_focused_index`
+    /// — which reads the seat — agrees with what we cache here. No other code
+    /// path should assign `focused_idx` directly.
     pub fn note_keyboard_focus_change(&mut self, focused: Option<&WlSurface>) {
         let new_idx = focused
             .and_then(|s| self.window_index_for_surface(self.active_workspace, s));
@@ -186,6 +193,14 @@ impl Beewm {
 
         if let Some(idx) = new_idx {
             self.workspaces[self.active_workspace].focused_idx = Some(idx);
+            // The cache must agree with the seat keyboard focus we just synced
+            // from. `active_workspace_focused_index` prefers the seat, so this
+            // catches any drift between the two representations of focus.
+            debug_assert_eq!(
+                self.active_workspace_focused_index(),
+                Some(idx),
+                "focused_idx cache diverged from the seat keyboard focus",
+            );
         }
 
         self.invalidate_borders();
@@ -260,8 +275,9 @@ impl Beewm {
             return;
         };
 
-        self.workspaces[self.active_workspace].focused_idx = Some(idx);
-
+        // Don't set `focused_idx` here: the seat's keyboard focus is the single
+        // source of truth. Setting the focus below routes through
+        // `note_keyboard_focus_change`, which updates the `focused_idx` cache.
         if let Some(target) = KeyboardFocusTarget::from_window(&window) {
             self.set_keyboard_focus_target(Some(target));
         }
