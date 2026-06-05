@@ -186,8 +186,6 @@ pub struct Beewm {
     pub xwm: Option<X11Wm>,
     /// DISPLAY number exported to spawned child processes once XWayland is ready.
     pub xdisplay: Option<u32>,
-    /// The window currently occupying the full screen, if any.
-    pub fullscreen_window: Option<Window>,
     /// Tracks popup surfaces and provides grab support.
     pub popup_manager: PopupManager,
     /// Floating windows (not subject to tiling) mapped to their last geometry.
@@ -370,7 +368,6 @@ impl Beewm {
             animations,
             xwm: None,
             xdisplay: None,
-            fullscreen_window: None,
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
             pending_float_centers: HashSet::new(),

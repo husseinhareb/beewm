@@ -280,8 +280,7 @@ impl CompositorHandler for Beewm {
             // not steal its focus, otherwise the user is left typing into an
             // invisible window underneath and directional focus gets stuck.
             let fullscreen_blocks_focus = self
-                .fullscreen_window
-                .as_ref()
+                .active_fullscreen()
                 .map(|fs| fs != &window)
                 .unwrap_or(false);
             // Keep keyboard focus on an existing modal/auth dialog when the
@@ -512,16 +511,36 @@ impl XdgShellHandler for Beewm {
             return;
         };
 
-        let already_fullscreen = self
-            .fullscreen_window
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace
+                    .windows
+                    .iter()
+                    .any(|candidate| *candidate == window)
+                    .then_some(ws_idx)
+            })
+            .unwrap_or(self.active_workspace);
+
+        let already_fullscreen = self.workspaces[ws_idx]
+            .fullscreen
             .as_ref()
             .map(|fullscreen| fullscreen == &window)
             .unwrap_or(false);
         if already_fullscreen {
             return;
         }
-        if self.fullscreen_window.is_some() {
-            self.restore_fullscreen();
+        // Replace any existing fullscreen on the target workspace. When it is the
+        // active workspace we restore it properly (remap siblings); for a hidden
+        // workspace nothing is on-screen, so just clear the slot.
+        if self.workspaces[ws_idx].fullscreen.is_some() {
+            if ws_idx == self.active_workspace {
+                self.restore_fullscreen();
+            } else {
+                self.workspaces[ws_idx].fullscreen = None;
+            }
         }
 
         let Some(output) = output
@@ -537,19 +556,6 @@ impl XdgShellHandler for Beewm {
             return;
         };
 
-        let ws_idx = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .find_map(|(ws_idx, workspace)| {
-                workspace
-                    .windows
-                    .iter()
-                    .any(|candidate| *candidate == window)
-                    .then_some(ws_idx)
-            })
-            .unwrap_or(self.active_workspace);
-
         for sibling in &self.workspaces[ws_idx].windows {
             if *sibling != window {
                 self.space.unmap_elem(sibling);
@@ -562,15 +568,14 @@ impl XdgShellHandler for Beewm {
         });
         surface.send_configure();
         self.space.map_element(window.clone(), output_geo.loc, true);
-        self.fullscreen_window = Some(window.clone());
+        self.workspaces[ws_idx].fullscreen = Some(window.clone());
         self.set_keyboard_focus(Some(surface.wl_surface().clone()));
         self.needs_render = true;
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
         let is_current_fullscreen = self
-            .fullscreen_window
-            .as_ref()
+            .active_fullscreen()
             .and_then(|window| window.toplevel())
             .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
             .unwrap_or(false);
