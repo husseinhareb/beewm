@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use smithay::backend::renderer::ImportAll;
@@ -6,7 +7,9 @@ use smithay::backend::renderer::Texture;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::{
+    render_elements_from_surface_tree, WaylandSurfaceRenderElement,
+};
 use smithay::backend::renderer::element::utils::{
     ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, RelocateRenderElement,
     RescaleRenderElement,
@@ -18,6 +21,7 @@ use smithay::desktop::space::{ConstrainBehavior, ConstrainReference, constrain_s
 use smithay::desktop::{Space, Window, layer_map_for_output};
 use smithay::output::Output;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
+use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::compositor::animation::AnimationManager;
@@ -297,6 +301,37 @@ where
     }
 
     render_elements
+}
+
+/// Build the render elements for the session-lock surface covering `output`,
+/// if any. Returns an empty vec when the output has no lock surface or the lock
+/// client has died — in both cases the caller renders solid black underneath,
+/// so the session is never exposed.
+// `Output` has interior mutability (Arc<Mutex<…>>) but its Hash/Eq use stable
+// identity, so it is a sound HashMap key — the standard smithay pattern.
+#[allow(clippy::mutable_key_type)]
+pub(crate) fn lock_render_elements<R>(
+    renderer: &mut R,
+    output: &Output,
+    lock_surfaces: &HashMap<Output, LockSurface>,
+    alpha: f32,
+) -> Vec<WaylandSurfaceRenderElement<R>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Texture + Clone + 'static,
+{
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    match lock_surfaces.get(output) {
+        Some(lock) if lock.alive() => render_elements_from_surface_tree(
+            renderer,
+            lock.wl_surface(),
+            (0, 0),
+            scale,
+            alpha,
+            Kind::Unspecified,
+        ),
+        _ => Vec::new(),
+    }
 }
 
 /// Combined render element for the DRM compositor.

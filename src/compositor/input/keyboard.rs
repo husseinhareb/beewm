@@ -36,9 +36,16 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
                     return FilterResult::Intercept(());
                 }
 
-                if let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle) {
-                    execute_action(state, action);
-                    return FilterResult::Intercept(());
+                // While the session is locked, the compositor must act on NO
+                // keybinding — every key is forwarded only to the focused lock
+                // surface. This is what stops `mod+enter` (or any bind) from
+                // opening a terminal behind the lock. VT switching above is
+                // intentionally still allowed; the lock persists across VTs.
+                if !state.locked {
+                    if let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle) {
+                        execute_action(state, action);
+                        return FilterResult::Intercept(());
+                    }
                 }
             }
             FilterResult::Forward

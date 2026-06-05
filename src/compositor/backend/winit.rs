@@ -29,7 +29,9 @@ use crate::compositor::feedback::{
 };
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
-use crate::compositor::render::{WindowElement, layer_render_elements, window_render_elements};
+use crate::compositor::render::{
+    WindowElement, layer_render_elements, lock_render_elements, window_render_elements,
+};
 use crate::compositor::screencopy::process_pending_screencopies;
 use crate::compositor::state::{Beewm, ClientState};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
@@ -430,20 +432,36 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             1.0,
                         );
 
+                        // While locked, render only the lock surface (over a
+                        // solid-black clear); never the windows/layers/borders
+                        // underneath. See the udev backend for the rationale.
+                        let locked = data.state.locked;
                         let mut elements: Vec<WinitRenderElement> = Vec::new();
-                        elements.extend(layers_above.into_iter().map(WinitRenderElement::from));
-                        elements.extend(border_elements.into_iter().map(WinitRenderElement::from));
-                        elements.extend(window_elements.into_iter().map(WinitRenderElement::from));
-                        elements.extend(layers_below.into_iter().map(WinitRenderElement::from));
+                        if locked {
+                            let lock_elements = lock_render_elements(
+                                renderer,
+                                output,
+                                &data.state.lock_surfaces,
+                                1.0,
+                            );
+                            elements.extend(lock_elements.into_iter().map(WinitRenderElement::from));
+                        } else {
+                            elements.extend(layers_above.into_iter().map(WinitRenderElement::from));
+                            elements.extend(border_elements.into_iter().map(WinitRenderElement::from));
+                            elements.extend(window_elements.into_iter().map(WinitRenderElement::from));
+                            elements.extend(layers_below.into_iter().map(WinitRenderElement::from));
+                        }
 
                         process_pending_screencopies(&mut data.state, renderer, output);
 
+                        let clear_color =
+                            if locked { [0.0, 0.0, 0.0, 1.0] } else { [0.1, 0.1, 0.1, 1.0] };
                         Some(damage_tracker.render_output(
                             renderer,
                             &mut framebuffer,
                             0,
                             &elements,
-                            [0.1, 0.1, 0.1, 1.0],
+                            clear_color,
                         ))
                     }
                     Err(err) => {

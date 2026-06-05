@@ -21,6 +21,7 @@ use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::{XkbConfig, xkb};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
+use smithay::output::Output;
 use smithay::reexports::wayland_server::backend::{ClientData, GlobalId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
@@ -41,6 +42,7 @@ use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState};
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
@@ -96,6 +98,10 @@ pub struct Beewm {
     pub _xdg_dialog_state: XdgDialogState,
     pub _xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
+    /// ext-session-lock-v1: lets a locker (beelock) take a real,
+    /// compositor-enforced lock. This is the *only* secure lock path — see
+    /// the `locked` field below.
+    pub session_lock_manager_state: SessionLockManagerState,
     pub xwayland_shell_state: XWaylandShellState,
     pub shm_state: ShmState,
     pub _output_manager_state: OutputManagerState,
@@ -133,6 +139,21 @@ pub struct Beewm {
 
     // Session (for VT switching in TTY mode)
     pub session: Option<LibSeatSession>,
+
+    // ── Session lock (ext-session-lock-v1) ──────────────────────────────────
+    /// True while the session is locked by an ext-session-lock client.
+    ///
+    /// This is the load-bearing security flag: when set, the compositor renders
+    /// only lock surfaces (or solid black for any output without one), routes
+    /// all keyboard/pointer input exclusively to the lock surface, and ignores
+    /// every compositor keybinding. Crucially it lives entirely in compositor
+    /// state, so if the lock client dies the session STAYS locked (black screen,
+    /// input still trapped) until a new locker authenticates — a killed process
+    /// can never expose the session.
+    pub locked: bool,
+    /// Per-output lock surfaces supplied by the lock client. Absence of a
+    /// surface for a locked output means that output renders solid black.
+    pub lock_surfaces: HashMap<Output, LockSurface>,
 
     // Desktop management
     pub space: Space<Window>,
@@ -260,6 +281,10 @@ impl Beewm {
         let fractional_scale_manager_state =
             FractionalScaleManagerState::new::<Self>(&display_handle);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
+        // Allow any client to bind the session-lock manager. Only one lock can
+        // be held at a time; the protocol arbitrates that for us.
+        let session_lock_manager_state =
+            SessionLockManagerState::new::<Self, _>(&display_handle, |_| true);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
         let screencopy_global = create_screencopy_global::<Self>(&display_handle);
@@ -302,6 +327,7 @@ impl Beewm {
             _xdg_dialog_state: xdg_dialog_state,
             _xdg_decoration_state: xdg_decoration_state,
             layer_shell_state,
+            session_lock_manager_state,
             xwayland_shell_state,
             shm_state,
             _output_manager_state: output_manager_state,
@@ -328,6 +354,8 @@ impl Beewm {
             _pointer_constraints_state: pointer_constraints_state,
             prev_keyboard_focus: None,
             session: None,
+            locked: false,
+            lock_surfaces: HashMap::new(),
             space: Space::default(),
             layout_manager,
             tiled_swap_layout_snapshot: None,

@@ -42,7 +42,7 @@ use crate::compositor::feedback::{
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
 use crate::compositor::render::{
-    OutputRenderElement, layer_render_elements, window_render_elements,
+    OutputRenderElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
 use crate::compositor::screencopy::process_pending_screencopies;
 use crate::compositor::state::{Beewm, ClientState, lookup_client_compositor_state};
@@ -636,6 +636,18 @@ fn render_frame(data: &mut UdevData) {
 
     process_pending_screencopies(&mut data.state, &mut gpu.renderer, &output);
 
+    // When the session is locked, the only thing on screen is the lock surface
+    // (plus the cursor). Everything else — windows, layer-shell surfaces,
+    // borders — is omitted, and outputs without a live lock surface fall back to
+    // the solid-black clear color. This is what guarantees a locked session
+    // never leaks content, even if the lock client has died.
+    let locked = data.state.locked;
+    let lock_elements = if locked {
+        lock_render_elements(&mut gpu.renderer, &output, &data.state.lock_surfaces, 1.0)
+    } else {
+        Vec::new()
+    };
+
     let count_windows = window_elements.len();
     let count_borders = border_elements.len();
     let count_cursor = cursor_elements.len();
@@ -645,17 +657,27 @@ fn render_frame(data: &mut UdevData) {
     // Build final element list front-to-back (first = topmost).
     let mut elements: Vec<OutputRenderElement> = Vec::new();
     elements.extend(cursor_elements.into_iter().map(OutputRenderElement::from));
-    elements.extend(layers_above.into_iter().map(OutputRenderElement::from));
-    elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
-    elements.extend(window_elements.into_iter().map(OutputRenderElement::from));
-    elements.extend(layers_below.into_iter().map(OutputRenderElement::from));
+    if locked {
+        elements.extend(lock_elements.into_iter().map(OutputRenderElement::from));
+    } else {
+        elements.extend(layers_above.into_iter().map(OutputRenderElement::from));
+        elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
+        elements.extend(window_elements.into_iter().map(OutputRenderElement::from));
+        elements.extend(layers_below.into_iter().map(OutputRenderElement::from));
+    }
+
+    let clear_color = if locked {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        [0.1, 0.1, 0.1, 1.0]
+    };
 
     let gpu = data.gpu.as_mut().unwrap();
 
     let result = gpu.compositor.render_frame::<_, OutputRenderElement>(
         &mut gpu.renderer,
         &elements,
-        [0.1, 0.1, 0.1, 1.0],
+        clear_color,
         FrameFlags::DEFAULT,
     );
 

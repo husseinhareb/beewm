@@ -56,6 +56,19 @@ pub(in crate::compositor) fn surface_under(
         .next()
         .cloned()
         .or_else(|| state.space.outputs().next().cloned())?;
+
+    // While locked, the pointer may only ever reach the lock surface — never a
+    // window or layer-shell surface underneath. The lock surface is anchored at
+    // the output origin and covers it fully.
+    if state.locked {
+        let lock = state.lock_surfaces.get(&output)?;
+        if !lock.alive() {
+            return None;
+        }
+        let output_loc = state.space.output_geometry(&output)?.loc.to_f64();
+        return Some((lock.wl_surface().clone(), output_loc));
+    }
+
     let fullscreen_active = state.screen_owned_by_window();
 
     let layer_hit = |layer: WlrLayer| -> Option<(WlSurface, Point<f64, Logical>)> {

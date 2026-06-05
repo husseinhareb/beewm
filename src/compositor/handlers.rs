@@ -12,6 +12,7 @@ use smithay::delegate_output;
 use smithay::delegate_presentation;
 use smithay::delegate_primary_selection;
 use smithay::delegate_seat;
+use smithay::delegate_session_lock;
 use smithay::delegate_shm;
 use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
@@ -59,6 +60,9 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::session_lock::{
+    LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
+};
 use smithay::wayland::shell::xdg::dialog::XdgDialogHandler;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -200,6 +204,21 @@ impl CompositorHandler for Beewm {
         // Process buffer attachment for the surface tree — required for
         // the renderer to see committed wl_buffer contents.
         on_commit_buffer_handler::<Self>(surface);
+
+        // Session-lock surfaces aren't windows or layer surfaces; a commit just
+        // means the lock UI has new content to present. Schedule a render and
+        // stop — none of the window/layer routing below applies to them.
+        if self.locked {
+            let root = root_surface(surface);
+            if self
+                .lock_surfaces
+                .values()
+                .any(|ls| *ls.wl_surface() == root)
+            {
+                self.needs_render = true;
+                return;
+            }
+        }
 
         // If this is the initial commit of a pending window, map it now.
         if let Some(pos) = self.pending_windows.iter().position(|w| {
@@ -797,6 +816,68 @@ impl WlrLayerShellHandler for Beewm {
     }
 }
 
+impl SessionLockHandler for Beewm {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_manager_state
+    }
+
+    fn lock(&mut self, confirmation: SessionLocker) {
+        tracing::info!(target: "beewm::lock", "Session lock requested; locking session");
+        // Drop normal keyboard focus right away — nothing behind the lock may
+        // keep input. Per-output lock surfaces (and their focus) arrive via
+        // `new_surface`.
+        self.set_keyboard_focus_target(None);
+        self.locked = true;
+        // Confirm to the client that the session is locked. After this the
+        // protocol guarantees the session stays locked for this lock's lifetime;
+        // we uphold that even across a client crash because `locked` is our own
+        // state (see `unlock` / `lock_surface_destroyed`).
+        confirmation.lock();
+        self.needs_render = true;
+    }
+
+    fn unlock(&mut self) {
+        tracing::info!(target: "beewm::lock", "Session unlock requested by lock client");
+        self.locked = false;
+        self.lock_surfaces.clear();
+        // Hand keyboard focus back to the active window.
+        self.focus_current_window();
+        self.needs_render = true;
+    }
+
+    fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
+        let Some(output) = Output::from_resource(&output) else {
+            tracing::warn!(target: "beewm::lock", "Lock surface for an unknown output; ignoring");
+            return;
+        };
+
+        // Size the lock surface to the full output and send the initial
+        // configure so the client can draw. current_mode is in physical pixels;
+        // lock surfaces are configured in logical pixels.
+        let physical = output.current_mode().map(|m| m.size).unwrap_or_default();
+        let logical = physical.to_logical(output.current_scale().integer_scale());
+        surface.with_pending_state(|state| {
+            state.size = Some((logical.w.max(0) as u32, logical.h.max(0) as u32).into());
+        });
+        surface.send_configure();
+
+        // Route keyboard focus to the lock surface so the user can type their
+        // password. While `locked`, `handle_key` ignores every keybinding, so
+        // these keys reach only the lock client.
+        let wl_surface = surface.wl_surface().clone();
+        self.lock_surfaces.insert(output, surface);
+
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let keyboard = self.seat.get_keyboard().unwrap();
+        keyboard.set_focus(
+            self,
+            Some(super::focus_target::KeyboardFocusTarget::Wayland(wl_surface)),
+            serial,
+        );
+        self.needs_render = true;
+    }
+}
+
 impl SelectionHandler for Beewm {
     type SelectionUserData = ();
 }
@@ -896,6 +977,7 @@ delegate_xdg_shell!(Beewm);
 delegate_xdg_dialog!(Beewm);
 delegate_xdg_decoration!(Beewm);
 delegate_layer_shell!(Beewm);
+delegate_session_lock!(Beewm);
 delegate_data_device!(Beewm);
 delegate_primary_selection!(Beewm);
 delegate_seat!(Beewm);
