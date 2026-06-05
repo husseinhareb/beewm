@@ -631,6 +631,20 @@ impl Beewm {
     /// cached_state lock, so re-entering it deadlocks the main loop. Use
     /// `request_focus_publish` from those paths instead.
     pub(crate) fn publish_focused_window_state(&self) {
+        // Tripwire for the deadlock documented above: this must never run while
+        // a dispatch callback holds a surface's cached_state lock, because
+        // `focused_window_title` re-enters `with_states`. Debug-only; compiled
+        // out of release.
+        #[cfg(debug_assertions)]
+        DISPATCH_CALLBACK_DEPTH.with(|depth| {
+            debug_assert_eq!(
+                depth.get(),
+                0,
+                "publish_focused_window_state() called from inside a dispatch callback; \
+                 use request_focus_publish() instead — re-entering with_states deadlocks the loop",
+            );
+        });
+
         if super::runtime_flags::flags().focus_ipc_disabled {
             return;
         }
@@ -730,6 +744,57 @@ pub(crate) fn root_surface(surface: &WlSurface) -> WlSurface {
         root = parent;
     }
     root
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Nesting depth of in-progress Wayland/X11 dispatch callbacks that hold a
+    /// surface's `cached_state` lock. Used only to back `DispatchCallbackGuard`.
+    static DISPATCH_CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII marker placed at the top of dispatch callbacks (focus_changed,
+/// title_changed, X11 property_notify) that run while smithay holds a surface's
+/// `cached_state` lock. While one is alive, `publish_focused_window_state`
+/// would deadlock by re-entering `with_states`; it carries a `debug_assert!`
+/// that fires if that ever happens, so the safe `request_focus_publish` path is
+/// enforced in debug builds and tests. A no-op zero-sized type in release.
+pub(crate) struct DispatchCallbackGuard;
+
+impl DispatchCallbackGuard {
+    #[must_use]
+    pub(crate) fn enter() -> Self {
+        #[cfg(debug_assertions)]
+        DISPATCH_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for DispatchCallbackGuard {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        DISPATCH_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod dispatch_guard_tests {
+    use super::{DISPATCH_CALLBACK_DEPTH, DispatchCallbackGuard};
+
+    #[test]
+    fn guard_tracks_nesting_depth_and_resets_on_drop() {
+        DISPATCH_CALLBACK_DEPTH.with(|depth| assert_eq!(depth.get(), 0));
+        {
+            let _outer = DispatchCallbackGuard::enter();
+            DISPATCH_CALLBACK_DEPTH.with(|depth| assert_eq!(depth.get(), 1));
+            {
+                let _inner = DispatchCallbackGuard::enter();
+                DISPATCH_CALLBACK_DEPTH.with(|depth| assert_eq!(depth.get(), 2));
+            }
+            DISPATCH_CALLBACK_DEPTH.with(|depth| assert_eq!(depth.get(), 1));
+        }
+        DISPATCH_CALLBACK_DEPTH.with(|depth| assert_eq!(depth.get(), 0));
+    }
 }
 
 /// Pre-resolve keybinds so the hot-path is a simple integer comparison.

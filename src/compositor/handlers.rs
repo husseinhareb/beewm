@@ -493,6 +493,7 @@ impl XdgShellHandler for Beewm {
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
+        let _guard = super::state::DispatchCallbackGuard::enter();
         // Republish only when the title-changed surface is the focused one —
         // background tabs/clients renaming themselves shouldn't cause the
         // status bar to flicker through unrelated titles.
@@ -691,6 +692,7 @@ impl SeatHandler for Beewm {
         seat: &Seat<Self>,
         focused: Option<&super::focus_target::KeyboardFocusTarget>,
     ) {
+        let _guard = super::state::DispatchCallbackGuard::enter();
         // Smithay hands us the focus target it just routed enter/leave to.
         // Pull the underlying wl_surface for pointer-constraint + selection
         // bookkeeping, which is still wl_surface-keyed.

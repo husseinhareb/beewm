@@ -488,6 +488,7 @@ impl XwmHandler for Beewm {
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        let _guard = crate::compositor::state::DispatchCallbackGuard::enter();
         if matches!(property, WmWindowProperty::Title) {
             let is_focused = self
                 .active_workspace_focused_window()
