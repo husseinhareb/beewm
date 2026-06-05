@@ -22,6 +22,7 @@ use smithay::desktop::{
     find_popup_root_surface, layer_map_for_output, LayerSurface as DesktopLayerSurface,
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, Window, WindowSurfaceType,
 };
+use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::input::pointer::{CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
@@ -93,6 +94,41 @@ fn committed_buffer_kind(surface: &WlSurface) -> BufferKind {
 }
 
 impl Beewm {
+    /// Build the per-commit identity/path tags for the `beewm::commit`
+    /// diagnostic: which app the surface belongs to, whether it is XWayland,
+    /// and — decisively — whether it is the output's primary scan-out surface
+    /// (and therefore receives *unthrottled* frame callbacks). See
+    /// [`super::diagnostics::SurfaceLabel`].
+    fn surface_commit_label(&self, surface: &WlSurface) -> super::diagnostics::SurfaceLabel {
+        let window = self.mapped_window_for_surface(surface);
+        let (app, is_x11) = match &window {
+            Some(w) => (
+                super::state::focused_window_title(w),
+                w.x11_surface().is_some(),
+            ),
+            None => (String::new(), false),
+        };
+
+        // A surface is on the scan-out path when its recorded primary
+        // scan-out output (set during rendering) matches our output.
+        let on_scanout_output = self
+            .space
+            .outputs()
+            .next()
+            .map(|output| {
+                with_states(surface, |states| {
+                    surface_primary_scanout_output(surface, states).as_ref() == Some(output)
+                })
+            })
+            .unwrap_or(false);
+
+        super::diagnostics::SurfaceLabel {
+            app,
+            is_x11,
+            on_scanout_output,
+        }
+    }
+
     fn prime_surface_scale_state(&self, surface: &WlSurface) {
         let Some(output) = self.space.outputs().next().cloned() else {
             return;
@@ -154,7 +190,9 @@ impl CompositorHandler for Beewm {
             let key = root_surface(surface).id().protocol_id();
             let cb_latency = self.last_frame_callbacks_sent_at.map(|t| t.elapsed());
             let buffer = committed_buffer_kind(surface);
-            self.commit_tracker.record(key, cb_latency, buffer);
+            // Compute identity/path tags before the &mut borrow of the tracker.
+            let label = self.surface_commit_label(surface);
+            self.commit_tracker.record(key, cb_latency, buffer, label);
         }
 
         self.popup_manager.commit(surface);
@@ -683,7 +721,18 @@ impl WlrLayerShellHandler for Beewm {
             None => return,
         };
 
-        let desktop_layer = DesktopLayerSurface::new(surface, namespace);
+        // Read the client's requested size/anchor before mapping so we can log
+        // whether the compositor honors it (a tray menu popup must keep its own
+        // content size and never be expanded to the full output).
+        let requested = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+            let mut cached = states
+                .cached_state
+                .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceCachedState>();
+            let cur = cached.current();
+            (cur.size, cur.anchor, cur.exclusive_zone)
+        });
+
+        let desktop_layer = DesktopLayerSurface::new(surface, namespace.clone());
         let mut layer_map = layer_map_for_output(&output);
         if let Err(e) = layer_map.map_layer(&desktop_layer) {
             tracing::error!("Failed to map layer surface: {}", e);
@@ -694,6 +743,25 @@ impl WlrLayerShellHandler for Beewm {
         // We must call send_pending_configure() explicitly to send the initial configure;
         // without this the bar client waits forever and never draws.
         layer_map.arrange();
+
+        // Diagnostics: prove tray-menu popups keep their requested content size
+        // and are not forced to output-sized geometry by the compositor.
+        let assigned = layer_map.layer_geometry(&desktop_layer);
+        let output_size = output
+            .current_mode()
+            .map(|m| m.size)
+            .unwrap_or_default();
+        tracing::info!(
+            "layer surface mapped: namespace={:?} layer={:?} requested_size={:?} \
+             anchor={:?} exclusive_zone={:?} assigned_geometry={:?} output_size={:?}",
+            namespace,
+            _layer,
+            requested.0,
+            requested.1,
+            requested.2,
+            assigned,
+            output_size,
+        );
         if desktop_layer
             .layer_surface()
             .send_pending_configure()
