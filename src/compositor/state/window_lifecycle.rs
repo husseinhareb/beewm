@@ -392,6 +392,24 @@ impl Beewm {
             })
     }
 
+    /// The rectangle floating windows are kept reachable within: the output
+    /// minus layer-shell exclusive zones (so a float can't hide under the bar),
+    /// *without* the tiling gap. Used to clamp interactive moves/resizes so a
+    /// floating window can never be dragged entirely off-screen — there are no
+    /// client-side titlebars to grab it back with.
+    pub(crate) fn floating_usable_rect(&self) -> Option<Rectangle<i32, Logical>> {
+        let output = self.space.outputs().next()?.clone();
+        let output_geo = self.space.output_geometry(&output)?;
+        let non_exclusive = {
+            let lm = smithay::desktop::layer_map_for_output(&output);
+            lm.non_exclusive_zone()
+        };
+        Some(Rectangle::new(
+            output_geo.loc + non_exclusive.loc,
+            non_exclusive.size,
+        ))
+    }
+
     pub(crate) fn tiling_usable_geometry(&self) -> Option<Geometry> {
         let output = self.space.outputs().next()?.clone();
         let output_geo = self.space.output_geometry(&output)?;
