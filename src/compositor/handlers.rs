@@ -429,8 +429,9 @@ impl CompositorHandler for Beewm {
             };
 
             if is_layer {
-                if let Some(wl_surface) = focus_wl_surface {
-                    let keyboard = self.seat.get_keyboard().unwrap();
+                if let (Some(wl_surface), Some(keyboard)) =
+                    (focus_wl_surface, self.seat.get_keyboard())
+                {
                     let already_focused = keyboard
                         .current_focus()
                         .and_then(|target| target.wl_surface().map(|s| s.into_owned()))
@@ -873,12 +874,13 @@ impl SessionLockHandler for Beewm {
         self.lock_surfaces.insert(output, surface);
 
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        let keyboard = self.seat.get_keyboard().unwrap();
-        keyboard.set_focus(
-            self,
-            Some(super::focus_target::KeyboardFocusTarget::Wayland(wl_surface)),
-            serial,
-        );
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                Some(super::focus_target::KeyboardFocusTarget::Wayland(wl_surface)),
+                serial,
+            );
+        }
         self.needs_render = true;
     }
 }

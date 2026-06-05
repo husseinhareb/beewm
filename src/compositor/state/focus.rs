@@ -221,7 +221,9 @@ impl Beewm {
         // = false and skips the intermediate keyboard.set_focus(root) call, which
         // would otherwise emit a spurious focus_changed event before we set the
         // real focus below.
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
         if keyboard.is_grabbed() {
             keyboard.unset_grab(self);
         }
@@ -233,7 +235,9 @@ impl Beewm {
         }
 
         let is_none = focused.is_none();
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
         keyboard.set_focus(self, focused, serial);
 
         // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.

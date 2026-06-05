@@ -13,7 +13,9 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
     let keycode = event.key_code();
     let key_state = event.state();
 
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
 
     keyboard.input::<(), _>(
         state,

@@ -477,7 +477,9 @@ fn tiled_window_target_size(
 }
 
 fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return None;
+    };
     let modifiers = keyboard.modifier_state();
     if !modifiers.logo {
         return None;
@@ -490,7 +492,9 @@ fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> 
 }
 
 fn tiled_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return None;
+    };
     let modifiers = keyboard.modifier_state();
     if !modifiers.logo {
         return None;
