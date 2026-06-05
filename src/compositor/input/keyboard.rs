@@ -97,14 +97,10 @@ fn execute_action(state: &mut Beewm, action: Action) {
             }
         }
         Action::FocusNext => {
-            let ws = &mut state.workspaces[state.active_workspace];
-            ws.focus_next();
-            state.focus_current_window();
+            state.focus_in_cycle(true);
         }
         Action::FocusPrev => {
-            let ws = &mut state.workspaces[state.active_workspace];
-            ws.focus_prev();
-            state.focus_current_window();
+            state.focus_in_cycle(false);
         }
         Action::FocusDirection(direction) => {
             state.focus_window_in_direction(direction);

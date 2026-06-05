@@ -72,6 +72,45 @@ impl Beewm {
         self.focus_active_workspace_window(idx);
     }
 
+    /// Move keyboard focus to the next/previous tiled window in *on-screen
+    /// layout order* (the order `LayoutManager::geometries` produces), wrapping
+    /// around. This is what `FocusNext`/`FocusPrev` bind to.
+    ///
+    /// Cycling over the layout order — rather than the workspace's
+    /// window-insertion order — means `mod+Tab` walks neighbours as they appear
+    /// on screen instead of jumping around by creation time. When the active
+    /// workspace has no tiled windows (everything is floating), fall back to the
+    /// insertion-order cycle so floating-only workspaces still cycle.
+    pub fn focus_in_cycle(&mut self, forward: bool) {
+        let ws_idx = self.active_workspace;
+        let ordered = self.layout_manager.ordered_roots(ws_idx);
+        if ordered.is_empty() {
+            let workspace = &mut self.workspaces[ws_idx];
+            if forward {
+                workspace.focus_next();
+            } else {
+                workspace.focus_prev();
+            }
+            self.focus_current_window();
+            return;
+        }
+
+        let current_pos = self
+            .focused_tiled_window_root(ws_idx)
+            .and_then(|root| ordered.iter().position(|candidate| *candidate == root));
+
+        let next_pos = match current_pos {
+            Some(pos) if forward => (pos + 1) % ordered.len(),
+            Some(pos) => (pos + ordered.len() - 1) % ordered.len(),
+            None => 0,
+        };
+
+        let target_root = ordered[next_pos].clone();
+        if let Some(idx) = self.window_index_for_surface(ws_idx, &target_root) {
+            self.focus_active_workspace_window(idx);
+        }
+    }
+
     pub fn focus_window_in_direction(&mut self, direction: FocusDirection) {
         let Some(current_idx) = self.active_workspace_focused_index() else {
             return;

@@ -65,6 +65,12 @@ pub trait LayoutManager<Id: Clone + Eq + Hash + 'static>: Debug {
     /// also affects the current rendered layout immediately.
     fn set_default_split_ratio(&mut self, ratio: f64);
 
+    /// Window ids in on-screen layout order (left/top → right/bottom),
+    /// consistent with the order `geometries` produces. Used for next/prev
+    /// focus cycling so it follows the visible layout instead of the
+    /// workspace's window-insertion order.
+    fn ordered_roots(&self, workspace: usize) -> Vec<Id>;
+
     /// Access the positional layout (for index-based fallback in relayout).
     /// Returns `None` for tree-based layouts that produce keyed geometries.
     fn positional_layout(&self) -> Option<&dyn Layout> {
@@ -101,15 +107,24 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
     }
 
     fn insert(&mut self, workspace: usize, split_target: Option<&Id>, id: Id) {
-        self.trees[workspace].insert(split_target, id);
+        let Some(tree) = self.trees.get_mut(workspace) else {
+            return;
+        };
+        tree.insert(split_target, id);
     }
 
     fn remove(&mut self, workspace: usize, id: &Id) {
-        self.trees[workspace].remove(id);
+        let Some(tree) = self.trees.get_mut(workspace) else {
+            return;
+        };
+        tree.remove(id);
     }
 
     fn swap(&mut self, workspace: usize, first: &Id, second: &Id) -> bool {
-        self.trees[workspace].swap(first, second)
+        let Some(tree) = self.trees.get_mut(workspace) else {
+            return false;
+        };
+        tree.swap(first, second)
     }
 
     fn geometries(
@@ -118,10 +133,10 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         screen: &Geometry,
         _tiled_ids: &[Id],
     ) -> HashMap<Id, Geometry> {
-        self.trees[workspace]
-            .geometries(screen)
-            .into_iter()
-            .collect()
+        let Some(tree) = self.trees.get(workspace) else {
+            return HashMap::new();
+        };
+        tree.geometries(screen).into_iter().collect()
     }
 
     fn preview_insert(
@@ -131,7 +146,7 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         id: Id,
         screen: &Geometry,
     ) -> Option<Geometry> {
-        let mut tree = self.trees[workspace].clone();
+        let mut tree = self.trees.get(workspace)?.clone();
         tree.insert(split_target, id.clone());
         tree.geometries(screen)
             .into_iter()
@@ -142,6 +157,13 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         for tree in &mut self.trees {
             tree.set_default_split_ratio(ratio);
         }
+    }
+
+    fn ordered_roots(&self, workspace: usize) -> Vec<Id> {
+        self.trees
+            .get(workspace)
+            .map(|tree| tree.leaves())
+            .unwrap_or_default()
     }
 
     fn resize(
@@ -219,13 +241,17 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
     }
 
     fn insert(&mut self, workspace: usize, _split_target: Option<&Id>, id: Id) {
-        let state = &mut self.workspaces[workspace];
+        let Some(state) = self.workspaces.get_mut(workspace) else {
+            return;
+        };
         state.order.push(id);
         ensure_stack_weights_len(state);
     }
 
     fn remove(&mut self, workspace: usize, id: &Id) {
-        let state = &mut self.workspaces[workspace];
+        let Some(state) = self.workspaces.get_mut(workspace) else {
+            return;
+        };
         let Some(idx) = state.order.iter().position(|candidate| candidate == id) else {
             return;
         };
@@ -240,7 +266,9 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
     }
 
     fn swap(&mut self, workspace: usize, first: &Id, second: &Id) -> bool {
-        let state = &mut self.workspaces[workspace];
+        let Some(state) = self.workspaces.get_mut(workspace) else {
+            return false;
+        };
         let Some(first_idx) = state.order.iter().position(|candidate| candidate == first) else {
             return false;
         };
@@ -257,7 +285,9 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
         screen: &Geometry,
         tiled_ids: &[Id],
     ) -> HashMap<Id, Geometry> {
-        let state = &self.workspaces[workspace];
+        let Some(state) = self.workspaces.get(workspace) else {
+            return HashMap::new();
+        };
         master_stack_geometry_map(screen, tiled_ids, state.master_ratio, &state.stack_weights)
     }
 
@@ -268,7 +298,7 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
         _id: Id,
         screen: &Geometry,
     ) -> Option<Geometry> {
-        let state = &self.workspaces[workspace];
+        let state = self.workspaces.get(workspace)?;
         let mut order = state.order.clone();
         order.push(_id);
         master_stack_ordered_geometries(screen, &order, state.master_ratio, &state.stack_weights)
@@ -283,6 +313,13 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
         }
     }
 
+    fn ordered_roots(&self, workspace: usize) -> Vec<Id> {
+        self.workspaces
+            .get(workspace)
+            .map(|state| state.order.clone())
+            .unwrap_or_default()
+    }
+
     fn resize(
         &mut self,
         workspace: usize,
@@ -292,7 +329,9 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
         edges: ResizeEdges,
         delta: (i32, i32),
     ) -> bool {
-        let state = &mut self.workspaces[workspace];
+        let Some(state) = self.workspaces.get_mut(workspace) else {
+            return false;
+        };
         let Some(target_idx) = tiled_ids.iter().position(|candidate| candidate == target) else {
             return false;
         };

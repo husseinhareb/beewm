@@ -97,6 +97,18 @@ impl<T: Clone + Eq> DwindleTree<T> {
         geometries
     }
 
+    /// Leaves in on-screen traversal order (first child before second at every
+    /// split), i.e. the same order `geometries` emits them. Used for next/prev
+    /// focus cycling so it follows the visible layout rather than insertion
+    /// order.
+    pub fn leaves(&self) -> Vec<T> {
+        let mut leaves = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            root.collect_leaves(&mut leaves);
+        }
+        leaves
+    }
+
     pub fn resize(
         &mut self,
         target: &T,
@@ -202,6 +214,16 @@ impl<T: Clone + Eq> DwindleNode<T> {
             } => {
                 a.swap(first, second);
                 b.swap(first, second);
+            }
+        }
+    }
+
+    fn collect_leaves(&self, leaves: &mut Vec<T>) {
+        match self {
+            Self::Leaf(window) => leaves.push(window.clone()),
+            Self::Split { first, second, .. } => {
+                first.collect_leaves(leaves);
+                second.collect_leaves(leaves);
             }
         }
     }
