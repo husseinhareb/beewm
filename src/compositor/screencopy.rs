@@ -5,16 +5,15 @@ use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportAll, ImportMem, Offscreen, Renderer, Texture,
 };
-use smithay::backend::renderer::gles::GlesTexture;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
-    zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
-    zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
-    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+    zwlr_screencopy_frame_v1, zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+    zwlr_screencopy_manager_v1, zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_output::WlOutput, wl_shm};
 use smithay::reexports::wayland_server::{
@@ -194,13 +193,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, (), Beewm> for Beewm {
                 overlay_cursor,
                 output,
             } => {
-                state.create_screencopy_frame(
-                    frame,
-                    output,
-                    overlay_cursor != 0,
-                    None,
-                    data_init,
-                );
+                state.create_screencopy_frame(frame, output, overlay_cursor != 0, None, data_init);
             }
             zwlr_screencopy_manager_v1::Request::CaptureOutputRegion {
                 frame,
@@ -255,11 +248,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, (), Beewm> for Beewm {
     }
 }
 
-pub(crate) fn process_pending_screencopies<R>(
-    state: &mut Beewm,
-    renderer: &mut R,
-    output: &Output,
-) where
+pub(crate) fn process_pending_screencopies<R>(state: &mut Beewm, renderer: &mut R, output: &Output)
+where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
     R::TextureId: Texture + Clone + Send + 'static,
     R::Error: std::fmt::Debug,
@@ -298,11 +288,8 @@ pub(crate) fn process_pending_screencopies<R>(
     }
 }
 
-fn process_screencopy_frame<R>(
-    state: &mut Beewm,
-    renderer: &mut R,
-    pending: PendingScreencopyFrame,
-) where
+fn process_screencopy_frame<R>(state: &mut Beewm, renderer: &mut R, pending: PendingScreencopyFrame)
+where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
     R::TextureId: Texture + Clone + Send + 'static,
     R::Error: std::fmt::Debug,
@@ -416,10 +403,22 @@ where
     );
 
     let mut elements = Vec::new();
-    elements.extend(cursor_elements.into_iter().map(ScreencopyRenderElement::from));
+    elements.extend(
+        cursor_elements
+            .into_iter()
+            .map(ScreencopyRenderElement::from),
+    );
     elements.extend(layers_above.into_iter().map(ScreencopyRenderElement::from));
-    elements.extend(border_elements.into_iter().map(ScreencopyRenderElement::from));
-    elements.extend(window_elements.into_iter().map(ScreencopyRenderElement::from));
+    elements.extend(
+        border_elements
+            .into_iter()
+            .map(ScreencopyRenderElement::from),
+    );
+    elements.extend(
+        window_elements
+            .into_iter()
+            .map(ScreencopyRenderElement::from),
+    );
     elements.extend(layers_below.into_iter().map(ScreencopyRenderElement::from));
     elements
 }
@@ -429,12 +428,12 @@ fn geometry_for_output(
     requested_region: Option<Rectangle<i32, Logical>>,
 ) -> Option<ScreencopyGeometry> {
     let mode = output.current_mode()?;
-    Some(capture_geometry(
+    capture_geometry(
         mode.size,
         output.current_scale().fractional_scale(),
         output.current_transform(),
         requested_region,
-    )?)
+    )
 }
 
 fn capture_geometry(
@@ -465,16 +464,8 @@ fn capture_geometry(
         .to_physical(output_scale)
         .to_i32_round();
     let buffer_region = Rectangle::new(
-        (
-            buffer_region_physical.loc.x,
-            buffer_region_physical.loc.y,
-        )
-            .into(),
-        (
-            buffer_region_physical.size.w,
-            buffer_region_physical.size.h,
-        )
-            .into(),
+        (buffer_region_physical.loc.x, buffer_region_physical.loc.y).into(),
+        (buffer_region_physical.size.w, buffer_region_physical.size.h).into(),
     );
     if buffer_region.size.w <= 0 || buffer_region.size.h <= 0 {
         return None;
@@ -566,7 +557,10 @@ mod tests {
             Size::<i32, Physical>::from((1920, 1080)),
             1.0,
             Transform::Normal,
-            Some(Rectangle::<i32, Logical>::new((-10, -20).into(), (100, 100).into())),
+            Some(Rectangle::<i32, Logical>::new(
+                (-10, -20).into(),
+                (100, 100).into(),
+            )),
         )
         .expect("geometry should be valid");
 
@@ -584,7 +578,10 @@ mod tests {
             Size::<i32, Physical>::from((100, 80)),
             1.0,
             Transform::Normal,
-            Some(Rectangle::<i32, Logical>::new((10, 20).into(), (30, 40).into())),
+            Some(Rectangle::<i32, Logical>::new(
+                (10, 20).into(),
+                (30, 40).into(),
+            )),
         )
         .expect("geometry should be valid");
 
@@ -603,7 +600,10 @@ mod tests {
             Size::<i32, Physical>::from((1920, 1080)),
             1.0,
             Transform::_90,
-            Some(Rectangle::<i32, Logical>::new((0, 0).into(), (200, 100).into())),
+            Some(Rectangle::<i32, Logical>::new(
+                (0, 0).into(),
+                (200, 100).into(),
+            )),
         )
         .expect("geometry should be valid");
 

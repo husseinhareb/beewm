@@ -28,6 +28,10 @@ pub enum Action {
     FocusNext,
     FocusPrev,
     FocusDirection(FocusDirection),
+    /// Move keyboard focus to the nearest output in a direction.
+    FocusOutput(FocusDirection),
+    /// Move the focused window to the nearest output in a direction.
+    MoveWindowToOutput(FocusDirection),
     CloseWindow,
     ToggleFullscreen,
     ToggleFloat,
@@ -35,6 +39,28 @@ pub enum Action {
     MoveToWorkspace(usize),
     Spawn(String),
     Quit,
+}
+
+/// A `WxH` or `WxH@Hz` mode spec parsed from an `output` directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputModeSpec {
+    pub width: i32,
+    pub height: i32,
+    pub refresh: Option<u32>,
+}
+
+/// Per-connector configuration from `output <name> …` directives, matched
+/// against the human-readable connector name (e.g. `DP-3`, `eDP-1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputConfig {
+    pub name: String,
+    /// `output <name> disable` turns the display off (no surface is created).
+    pub enabled: bool,
+    /// Explicit top-left in the global layout; otherwise outputs auto-pack
+    /// left-to-right.
+    pub position: Option<(i32, i32)>,
+    /// Force a specific mode; otherwise the connector's preferred mode is used.
+    pub mode: Option<OutputModeSpec>,
 }
 
 /// The active tiling layout.
@@ -76,6 +102,15 @@ pub struct Config {
     pub natural_scroll: bool,
     pub keyboard_layout: String,
     pub refresh_rate: Option<u32>,
+    /// Publish the settings tray icon as a StatusNotifierItem on the session bus.
+    /// On by default; disable with
+    /// `tray disable` in the config. (`BEEWM_TRAY=1` can also force it on.)
+    pub tray_enabled: bool,
+    /// Seconds of inactivity before the screen blanks (DPMS off). `0` disables
+    /// blanking entirely. Also settable live from the tray's Screen-timeout menu.
+    pub screen_timeout: u32,
+    /// Per-output configuration from `output <name> …` directives.
+    pub outputs: Vec<OutputConfig>,
     pub autostart_commands: Vec<String>,
     pub keybinds: Vec<Keybind>,
 
@@ -113,6 +148,9 @@ impl Default for Config {
             natural_scroll: false,
             keyboard_layout: DEFAULT_KEYBOARD_LAYOUT.to_string(),
             refresh_rate: None,
+            tray_enabled: true,
+            screen_timeout: 600,
+            outputs: Vec::new(),
             autostart_commands: Vec::new(),
             keybinds: Self::default_keybinds_for(num_workspaces),
             enable_animations: true,
@@ -245,10 +283,92 @@ impl Config {
     }
 
     /// Load config from the default path (`~/.config/beewm/config`).
-    /// If it does not exist, write a starter config first.
+    /// If it does not exist, write a starter config first. Runtime settings
+    /// changed from the tray (`state.conf`) are layered on top.
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path();
-        Self::load_from_path(&path)
+        let mut config = Self::load_from_path(&path)?;
+        config.apply_state_overrides();
+        Ok(config)
+    }
+
+    /// Path of the machine-managed runtime-settings overlay written by the tray.
+    /// Kept separate from the hand-edited config so menu changes never clobber
+    /// the user's comments/variables; it is parsed *after* the main config and
+    /// overrides the matching keys.
+    pub fn state_path() -> PathBuf {
+        let mut path = dirs_or_default();
+        path.push("beewm");
+        path.push("state.conf");
+        path
+    }
+
+    /// Overlay the small set of tray-settable keys from `state.conf`, if present.
+    fn apply_state_overrides(&mut self) {
+        let Ok(contents) = std::fs::read_to_string(Self::state_path()) else {
+            return;
+        };
+        let overrides = parse_state_overrides(&contents);
+        if let Some(gap) = overrides.gap {
+            self.gap = gap;
+        }
+        if let Some(secs) = overrides.screen_timeout {
+            self.screen_timeout = secs;
+        }
+        for (name, mode) in overrides.output_modes {
+            self.set_output_mode_override(name, mode);
+        }
+    }
+
+    pub fn runtime_output_modes() -> Vec<(String, OutputModeSpec)> {
+        let Ok(contents) = std::fs::read_to_string(Self::state_path()) else {
+            return Vec::new();
+        };
+        parse_state_overrides(&contents).output_modes
+    }
+
+    pub fn set_output_mode_override(&mut self, name: String, mode: OutputModeSpec) {
+        if let Some(output) = self.outputs.iter_mut().find(|output| output.name == name) {
+            output.mode = Some(mode);
+            return;
+        }
+        self.outputs.push(OutputConfig {
+            name,
+            enabled: true,
+            position: None,
+            mode: Some(mode),
+        });
+    }
+
+    /// Persist the tray-settable runtime values to `state.conf` (best-effort).
+    /// Called when the tray changes a setting so it survives a restart.
+    pub fn write_state_overrides(
+        gap: u32,
+        screen_timeout: u32,
+        output_modes: &[(String, OutputModeSpec)],
+    ) {
+        let path = Self::state_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut contents = format!(
+            "# beewm runtime settings — written by the settings tray.\n\
+             # Overrides the matching keys in your main config; delete to revert.\n\
+             gap {gap}\n\
+             screen_timeout {screen_timeout}\n",
+        );
+        let mut output_modes = output_modes.to_vec();
+        output_modes.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        for (name, mode) in output_modes {
+            let refresh = mode.refresh.map(|hz| format!("@{hz}")).unwrap_or_default();
+            contents.push_str(&format!(
+                "output {name} mode {}x{}{refresh}\n",
+                mode.width, mode.height
+            ));
+        }
+        if let Err(error) = std::fs::write(&path, contents) {
+            tracing::warn!("Failed to write {}: {}", path.display(), error);
+        }
     }
 
     /// Load config from an explicit path.
@@ -301,8 +421,25 @@ impl Config {
         text.push_str(&format!("keyboard_layout {}\n", default.keyboard_layout));
         text.push_str("# refresh_rate 165   # set display refresh rate in Hz (default: use monitor preferred)\n");
         text.push('\n');
+        text.push_str("# Settings tray: publishes a StatusNotifierItem for your tray host.\n");
+        text.push_str("# Shown by default; uncomment to hide it.\n");
+        text.push_str("# tray_enabled false\n");
+        text.push_str("# Seconds of inactivity before the screen blanks (DPMS off); 0 = never.\n");
+        text.push_str(&format!("screen_timeout {}\n", default.screen_timeout));
+        text.push('\n');
+        text.push_str(
+            "# Multi-monitor: arrange outputs by connector name (DP-3, eDP-1, HDMI-A-1).\n",
+        );
+        text.push_str("# Requires BEEWM_MULTI_OUTPUT=1 while multi-head is experimental.\n");
+        text.push_str("# output eDP-1 position 0 0\n");
+        text.push_str("# output DP-3 position 2560 0 mode 2560x1440@165\n");
+        text.push_str("# output HDMI-A-1 disable\n");
+        text.push('\n');
         text.push_str("# Window animations (compositor-driven; layout stays exact).\n");
-        text.push_str(&format!("enable_animations {}\n", default.enable_animations));
+        text.push_str(&format!(
+            "enable_animations {}\n",
+            default.enable_animations
+        ));
         text.push_str(&format!(
             "window_open_animation {}\n",
             default.window_open_animation
@@ -329,7 +466,10 @@ impl Config {
             default.layout_animation_duration_ms
         ));
         text.push_str("# animation_easing: linear | ease_in | ease_out | ease_in_out\n");
-        text.push_str(&format!("animation_easing {}\n\n", default.animation_easing));
+        text.push_str(&format!(
+            "animation_easing {}\n\n",
+            default.animation_easing
+        ));
         text.push_str("# Start commands once when beewm launches.\n");
         text.push_str("# exec waybar\n");
         text.push_str("# exec nm-applet\n\n");
@@ -390,17 +530,17 @@ impl Config {
 
         for bind in &self.keybinds {
             match bind.action {
-                Action::SwitchWorkspace(index) | Action::MoveToWorkspace(index) => {
-                    if index >= self.num_workspaces {
-                        return Err(ConfigError::Parse {
-                            line: 0,
-                            message: format!(
-                                "workspace binding points at workspace {} but only {} workspaces exist",
-                                index + 1,
-                                self.num_workspaces
-                            ),
-                        });
-                    }
+                Action::SwitchWorkspace(index) | Action::MoveToWorkspace(index)
+                    if index >= self.num_workspaces =>
+                {
+                    return Err(ConfigError::Parse {
+                        line: 0,
+                        message: format!(
+                            "workspace binding points at workspace {} but only {} workspaces exist",
+                            index + 1,
+                            self.num_workspaces
+                        ),
+                    });
                 }
                 _ => {}
             }
@@ -408,6 +548,56 @@ impl Config {
 
         Ok(self)
     }
+}
+
+/// The subset of settings the tray can persist to `state.conf`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StateOverrides {
+    gap: Option<u32>,
+    screen_timeout: Option<u32>,
+    output_modes: Vec<(String, OutputModeSpec)>,
+}
+
+/// Parse the tiny `state.conf` overlay (a few `key value` lines). Unknown keys
+/// and malformed values are ignored so a stale overlay never breaks startup.
+fn parse_state_overrides(contents: &str) -> StateOverrides {
+    let mut overrides = StateOverrides::default();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("gap"), Some(value)) => overrides.gap = value.parse().ok(),
+            (Some("screen_timeout"), Some(value)) => overrides.screen_timeout = value.parse().ok(),
+            (Some("output"), Some(name)) => {
+                while let Some(key) = parts.next() {
+                    if matches!(key, "mode" | "resolution") {
+                        if let Some(mode) = parts.next().and_then(parse_state_mode_spec) {
+                            overrides.output_modes.push((name.to_string(), mode));
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    overrides
+}
+
+fn parse_state_mode_spec(value: &str) -> Option<OutputModeSpec> {
+    let (dims, refresh) = match value.split_once('@') {
+        Some((dims, hz)) => (dims, Some(hz.parse().ok()?)),
+        None => (value, None),
+    };
+    let (width, height) = dims.split_once(['x', 'X'])?;
+    Some(OutputModeSpec {
+        width: width.parse().ok()?,
+        height: height.parse().ok()?,
+        refresh,
+    })
 }
 
 fn dirs_or_default() -> PathBuf {
@@ -418,4 +608,41 @@ fn dirs_or_default() -> PathBuf {
             home.push(".config");
             home
         })
+}
+
+#[cfg(test)]
+mod state_override_tests {
+    use super::parse_state_overrides;
+
+    #[test]
+    fn parses_known_keys_and_ignores_the_rest() {
+        let overrides = parse_state_overrides(
+            "# tray-written\n\
+             gap 12\n\
+             screen_timeout 300\n\
+             output DP-1 mode 2560x1440@165\n\
+             bogus 5\n",
+        );
+        assert_eq!(overrides.gap, Some(12));
+        assert_eq!(overrides.screen_timeout, Some(300));
+        assert_eq!(overrides.output_modes.len(), 1);
+        assert_eq!(overrides.output_modes[0].0, "DP-1");
+        assert_eq!(
+            overrides.output_modes[0].1,
+            super::OutputModeSpec {
+                width: 2560,
+                height: 1440,
+                refresh: Some(165)
+            }
+        );
+    }
+
+    #[test]
+    fn empty_or_malformed_yields_no_overrides() {
+        let overrides =
+            parse_state_overrides("\n# only comments\ngap notanumber\noutput DP-1 mode nope\n");
+        assert_eq!(overrides.gap, None);
+        assert_eq!(overrides.screen_timeout, None);
+        assert!(overrides.output_modes.is_empty());
+    }
 }

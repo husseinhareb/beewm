@@ -42,7 +42,13 @@ pub fn start() -> io::Result<(IpcServer, Channel<Command>)> {
         .name("beewm-ipc".into())
         .spawn(move || accept_control_loop(listener, sender, thread_path))?;
 
-    Ok((IpcServer { path, _thread: thread }, channel))
+    Ok((
+        IpcServer {
+            path,
+            _thread: thread,
+        },
+        channel,
+    ))
 }
 
 /// Bind the event socket and start accepting subscriber connections.
@@ -63,7 +69,13 @@ pub fn start_event_listener() -> io::Result<(IpcServer, Channel<UnixStream>)> {
         .name("beewm-events-accept".into())
         .spawn(move || accept_event_loop(listener, sender, thread_path))?;
 
-    Ok((IpcServer { path, _thread: thread }, channel))
+    Ok((
+        IpcServer {
+            path,
+            _thread: thread,
+        },
+        channel,
+    ))
 }
 
 pub fn apply_command(state: &mut Beewm, command: Command) {
@@ -96,10 +108,10 @@ fn accept_control_loop(listener: UnixListener, sender: Sender<Command>, path: Pa
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Some(command) = read_command(stream) {
-                    if sender.send(command).is_err() {
-                        break;
-                    }
+                if let Some(command) = read_command(stream)
+                    && sender.send(command).is_err()
+                {
+                    break;
                 }
             }
             Err(error) => {
