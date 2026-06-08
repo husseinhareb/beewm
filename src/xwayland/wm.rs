@@ -28,11 +28,12 @@ impl Beewm {
                 // Use activate=false: override-redirect windows are menus/tooltips
                 // that should not "activate" and deactivate all other windows in the
                 // space (which would strip _NET_WM_STATE_FOCUSED from the parent app).
-                self.space.map_element(window, surface.geometry().loc, false);
+                self.space
+                    .map_element(window, surface.geometry().loc, false);
                 self.needs_render = true;
             }
             PendingX11Kind::Managed => {
-                let workspace_idx = self.active_workspace;
+                let workspace_idx = self.active_workspace();
                 let should_float = should_map_x11_floating(&surface);
                 let split_target = self.focused_tiled_window_root(workspace_idx);
 
@@ -87,12 +88,11 @@ impl Beewm {
                 let keep_auth_dialog_focus =
                     !should_float && self.focused_auth_dialog_root().is_some();
                 if !fullscreen_blocks_focus {
-                    if !keep_auth_dialog_focus {
-                        if let Some(wl_surface) =
+                    if !keep_auth_dialog_focus
+                        && let Some(wl_surface) =
                             window.wl_surface().map(|surface| surface.into_owned())
-                        {
-                            self.set_keyboard_focus(Some(wl_surface));
-                        }
+                    {
+                        self.set_keyboard_focus(Some(wl_surface));
                     }
                     self.space.raise_element(&window, true);
                     // Sync X11 stacking with our scene-graph stacking so X
@@ -156,23 +156,23 @@ impl Beewm {
     /// Promote a managed X11 window to fullscreen. Returns false when the
     /// window isn't tracked in any workspace yet (caller should defer).
     fn apply_x11_fullscreen(&mut self, window: &X11Surface) -> bool {
-        let Some((ws_idx, window_obj)) = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .find_map(|(ws_idx, workspace)| {
-                workspace
-                    .windows
-                    .iter()
-                    .find(|candidate| {
-                        candidate
-                            .x11_surface()
-                            .map(|surface| surface == window)
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .map(|window_obj| (ws_idx, window_obj))
-            })
+        let Some((ws_idx, window_obj)) =
+            self.workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace
+                        .windows
+                        .iter()
+                        .find(|candidate| {
+                            candidate
+                                .x11_surface()
+                                .map(|surface| surface == window)
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .map(|window_obj| (ws_idx, window_obj))
+                })
         else {
             return false;
         };
@@ -188,7 +188,7 @@ impl Beewm {
         // Replace any existing fullscreen on the target workspace (see the
         // xdg-shell fullscreen_request handler for the active-vs-hidden split).
         if self.workspaces[ws_idx].fullscreen.is_some() {
-            if ws_idx == self.active_workspace {
+            if ws_idx == self.active_workspace() {
                 self.restore_fullscreen();
             } else {
                 self.workspaces[ws_idx].fullscreen = None;
@@ -197,7 +197,7 @@ impl Beewm {
 
         let _ = window.set_fullscreen(true);
 
-        let output = match self.space.outputs().next().cloned() {
+        let output = match self.output_for_window(&window_obj) {
             Some(o) => o,
             None => return true,
         };
@@ -277,7 +277,7 @@ impl Beewm {
             .remove_window(window_idx)
             .expect("x11 window index should be valid");
         let tracked_surface = window.wl_surface().map(|surface| surface.into_owned());
-        let should_restore_focus = if workspace_idx == self.active_workspace {
+        let should_restore_focus = if workspace_idx == self.active_workspace() {
             match self
                 .seat
                 .get_keyboard()
@@ -318,12 +318,12 @@ impl Beewm {
         self.space.unmap_elem(&window);
         self.publish_workspace_state();
 
-        if workspace_idx == self.active_workspace {
+        if workspace_idx == self.active_workspace() {
             if should_restore_focus {
-                let focus = self.workspaces[self.active_workspace]
+                let focus = self.workspaces[self.active_workspace()]
                     .focused_idx
                     .and_then(|focus_idx| {
-                        self.workspaces[self.active_workspace]
+                        self.workspaces[self.active_workspace()]
                             .windows
                             .get(focus_idx)
                     })
@@ -586,12 +586,10 @@ impl XwmHandler for Beewm {
             return;
         };
 
-        let is_workspace_window = self.workspaces.iter().any(|workspace| {
-            workspace
-                .windows
-                .iter()
-                .any(|candidate| *candidate == mapped)
-        });
+        let is_workspace_window = self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.windows.contains(&mapped));
 
         if !is_workspace_window {
             self.space.map_element(mapped.clone(), geometry.loc, false);
@@ -599,28 +597,28 @@ impl XwmHandler for Beewm {
             return;
         }
 
-        if let Some(root) = Self::window_root_surface(&mapped) {
-            if self.is_root_floating(&root) {
-                // Preserve the compositor-chosen position; only adopt the size
-                // the client just configured itself with. configure_notify is
-                // driven by the X11 server's view of the window's geometry
-                // (which may include a client-side request we already rejected
-                // in configure_request) — re-anchoring here would let the
-                // dialog snap back to its preferred origin.
-                let stored_pos = self
-                    .floating_windows
-                    .get(&root)
-                    .copied()
-                    .map(|data| data.position)
-                    .unwrap_or(geometry.loc);
-                self.floating_windows.insert(
-                    root,
-                    crate::compositor::types::FloatingWindowData::new(stored_pos, geometry.size),
-                );
-                self.space.map_element(mapped, stored_pos, false);
-                self.raise_floating_windows();
-                self.needs_render = true;
-            }
+        if let Some(root) = Self::window_root_surface(&mapped)
+            && self.is_root_floating(&root)
+        {
+            // Preserve the compositor-chosen position; only adopt the size
+            // the client just configured itself with. configure_notify is
+            // driven by the X11 server's view of the window's geometry
+            // (which may include a client-side request we already rejected
+            // in configure_request) — re-anchoring here would let the
+            // dialog snap back to its preferred origin.
+            let stored_pos = self
+                .floating_windows
+                .get(&root)
+                .copied()
+                .map(|data| data.position)
+                .unwrap_or(geometry.loc);
+            self.floating_windows.insert(
+                root,
+                crate::compositor::types::FloatingWindowData::new(stored_pos, geometry.size),
+            );
+            self.space.map_element(mapped, stored_pos, false);
+            self.raise_floating_windows();
+            self.needs_render = true;
         }
     }
 
