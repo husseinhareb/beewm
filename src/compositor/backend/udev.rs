@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::config::{Config, OutputConfig, OutputModeSpec};
 
 use smithay::backend::allocator::Format;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
@@ -21,11 +22,13 @@ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
-use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{
+    Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, connector, crtc,
+};
 use smithay::reexports::input::{Libinput, ScrollMethod};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{DeviceFd, Logical, Point, Transform};
 use smithay::utils::{Monotonic, Time};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder};
 use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
@@ -45,7 +48,9 @@ use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
 use crate::compositor::screencopy::process_pending_screencopies;
-use crate::compositor::state::{Beewm, ClientState, lookup_client_compositor_state};
+use crate::compositor::state::{
+    BackendRequest, Beewm, ClientState, OutputModes, lookup_client_compositor_state,
+};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
 
 /// How the `wp_linux_dmabuf` global should be advertised.
@@ -65,20 +70,24 @@ enum DmabufSetup {
     Legacy(Vec<Format>),
 }
 
-/// Per-GPU state for the DRM backend.
-struct GpuData {
-    _drm_device: DrmDevice,
-    _drm_notifier_token: RegistrationToken,
-    _gbm_device: GbmDevice<DrmDeviceFd>,
-    renderer: GlesRenderer,
-    compositor: DrmCompositor<
-        GbmAllocator<DrmDeviceFd>,
-        GbmFramebufferExporter<DrmDeviceFd>,
-        (),
-        DrmDeviceFd,
-    >,
+type DrmCompositorImpl =
+    DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+
+/// One rendered output: a single CRTC's `DrmCompositor` plus its `Output` and
+/// per-output pacing/feedback bookkeeping. Every surface on a device shares that
+/// device's single `GlesRenderer` (see [`GpuData::renderer`]).
+struct SurfaceData {
+    /// The connector (physical display) this surface drives — used to diff
+    /// against the live connector set on hotplug.
+    connector: connector::Handle,
+    /// The CRTC this surface scans out on — used to route vblank events.
+    crtc: crtc::Handle,
     output: Output,
-    /// True when a vblank has fired and we may render the next frame.
+    /// Top-left of this output in the global Space coordinate space; mirrored
+    /// into the compositor's `OutputCtx` via `Beewm::add_output`.
+    position: Point<i32, Logical>,
+    compositor: DrmCompositorImpl,
+    /// True when this surface's vblank has fired and it may render again.
     can_render: bool,
     pending_presentation_feedback: Option<smithay::desktop::utils::OutputPresentationFeedback>,
     /// Rolling counters for the `beewm::frame` instrumentation. Reset whenever
@@ -88,6 +97,25 @@ struct GpuData {
     /// Vblank-cadence counters for the `beewm::presentation` instrumentation —
     /// proves whether the compositor presents at the real refresh rate.
     present_stats: PresentStats,
+}
+
+/// Per-GPU state for the DRM backend. One renderer drives every connected
+/// connector's [`SurfaceData`]. Multi-head (more than one surface) is gated on
+/// `BEEWM_MULTI_OUTPUT`; by default exactly one surface is created.
+struct GpuData {
+    drm_device: DrmDevice,
+    /// Cloned control fd for connector/encoder queries (DrmDevice itself doesn't
+    /// expose the `ControlDevice` surface we need for hotplug rescans).
+    drm_fd: DrmDeviceFd,
+    _drm_notifier_token: RegistrationToken,
+    gbm_device: GbmDevice<DrmDeviceFd>,
+    renderer: GlesRenderer,
+    surfaces: Vec<SurfaceData>,
+    // Device-level resources retained so surfaces can be created at runtime when
+    // a display is hot-plugged (see `rescan_connectors`).
+    renderer_formats: Vec<Format>,
+    color_formats: [smithay::backend::allocator::Fourcc; 2],
+    cursor_size: smithay::utils::Size<u32, smithay::utils::Buffer>,
 }
 
 #[derive(Debug)]
@@ -251,26 +279,32 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             SessionEvent::PauseSession => {
                 tracing::info!("Session paused");
                 if let Some(gpu) = data.gpu.as_mut() {
-                    gpu._drm_device.pause();
-                    gpu.can_render = false;
+                    gpu.drm_device.pause();
+                    for surface in &mut gpu.surfaces {
+                        surface.can_render = false;
+                    }
                 }
                 data.state.needs_render = false;
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("Session activated");
                 if let Some(gpu) = data.gpu.as_mut() {
-                    if let Err(err) = gpu._drm_device.activate(true) {
+                    if let Err(err) = gpu.drm_device.activate(true) {
                         tracing::error!("Failed to reactivate DRM device: {}", err);
-                        gpu.can_render = false;
+                        for surface in &mut gpu.surfaces {
+                            surface.can_render = false;
+                        }
                         return;
                     }
-                    if let Err(err) = gpu.compositor.reset_state() {
-                        tracing::error!(
-                            "Failed to reset compositor state after reactivation: {}",
-                            err
-                        );
+                    for surface in &mut gpu.surfaces {
+                        if let Err(err) = surface.compositor.reset_state() {
+                            tracing::error!(
+                                "Failed to reset compositor state after reactivation: {}",
+                                err
+                            );
+                        }
+                        surface.can_render = true;
                     }
-                    gpu.can_render = true;
                 }
                 data.state.needs_render = true;
             }
@@ -351,7 +385,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     .active_workspace_focused_window()
                     .map(crate::compositor::state::focused_window_title)
                     .unwrap_or_default();
-                let workspace_num = data.state.active_workspace + 1;
+                let workspace_num = data.state.active_workspace() + 1;
                 let initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
                 data.state.event_broadcaster.add_subscriber(stream, initial);
             }
@@ -359,6 +393,20 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("Event socket channel closed");
             }
         })?;
+
+    // Settings tray: a StatusNotifierItem D-Bus thread sends chosen menu actions
+    // back here over a channel; config reload can start/stop the tray thread.
+    let (tray_tx, tray_rx) =
+        smithay::reexports::calloop::channel::channel::<crate::compositor::tray::MenuAction>();
+    event_loop
+        .handle()
+        .insert_source(tray_rx, |event, _, data: &mut UdevData| {
+            if let ChannelEvent::Msg(action) = event {
+                data.state.apply_menu_action(action);
+                data.state.needs_render = true;
+            }
+        })?;
+    data.state.install_tray_action_sender(tray_tx);
 
     // Watch the config file for changes and reload automatically on save.
     match config_watcher::make_config_watch_fd(&Config::config_path()) {
@@ -447,9 +495,23 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     for (device_id, path) in udev.device_list() {
         tracing::info!("Found DRM device: {} at {}", device_id, path.display());
         if data.gpu.is_none() {
-            match init_gpu(&mut session, &event_loop, &display_handle, path, data.state.config.refresh_rate) {
+            match init_gpu(
+                &mut session,
+                &event_loop,
+                &display_handle,
+                path,
+                data.state.config.refresh_rate,
+                &data.state.config.outputs,
+            ) {
                 Ok((gd, dmabuf_setup, syncobj_state)) => {
-                    data.state.space.map_output(&gd.output, (0, 0));
+                    for surface in &gd.surfaces {
+                        data.state
+                            .add_output(surface.output.clone(), surface.position);
+                        if let Ok(conn_info) = gd.drm_fd.get_connector(surface.connector, false) {
+                            let modes = output_modes_for(&conn_info, &surface.output);
+                            data.state.set_output_modes(surface.output.clone(), modes);
+                        }
+                    }
                     data.gpu = Some(gd);
                     data.state.drm_syncobj_state = syncobj_state;
                     let display_handle = data.state.display_handle.clone();
@@ -482,12 +544,20 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Insert udev for hotplug (we don't handle hotplug in detail yet)
     event_loop
         .handle()
-        .insert_source(udev, |event, _, _data| match event {
+        .insert_source(udev, |event, _, data| match event {
             UdevEvent::Added { device_id, path } => {
                 tracing::info!("DRM device added: {} at {}", device_id, path.display());
+                // Multi-GPU hot-add is not handled yet (Phase 3 covers connectors
+                // on the already-initialized device, not adding a second GPU).
             }
             UdevEvent::Changed { device_id } => {
                 tracing::info!("DRM device changed: {}", device_id);
+                // A connector (monitor) was plugged or unplugged. Reconcile the
+                // surface set on the active device. Gated so the default
+                // single-output path keeps the legacy log-only behavior.
+                if crate::compositor::runtime_flags::flags().multi_output_enabled {
+                    rescan_connectors(data);
+                }
             }
             UdevEvent::Removed { device_id } => {
                 tracing::info!("DRM device removed: {}", device_id);
@@ -533,8 +603,13 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_millis(100)
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
+        // Evaluate the screen-timeout deadline and apply any queued backend work
+        // (DPMS blank/wake) before rendering this iteration.
+        data.state.update_idle(Instant::now());
+        process_backend_requests(&mut data);
         // Run deferred work that was queued from inside dispatch callbacks
         // and that cannot safely run there (would deadlock cached_state).
+        data.state.apply_pending_map_focus();
         data.state.flush_pending_focus_publish();
         // Process pending surface state (sends wl_surface.enter/leave)
         // BEFORE flushing so clients receive enter events in the same
@@ -546,10 +621,12 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = data.display.flush_clients() {
             tracing::warn!("Failed to flush Wayland clients: {}", err);
         }
-        // Only render when the previous frame has been presented (VBlank fired)
-        // AND something visual has actually changed. Rendering after dispatch
-        // keeps live resizes closer to the latest pointer and commit state.
-        if data.gpu.as_ref().is_some_and(|g| g.can_render) && data.state.needs_render {
+        // Only render when something visual has actually changed. Each surface
+        // renders only if its own vblank has fired (`can_render`); a surface
+        // still waiting re-arms `needs_render` from inside `render_frame` so it
+        // is retried next iteration. Rendering after dispatch keeps live resizes
+        // close to the latest pointer/commit state.
+        if data.gpu.is_some() && data.state.needs_render && !data.state.blanked {
             // Clear the flag *before* rendering so subsequent damage that
             // arrives while we wait for VBlank re-arms the next frame.
             // Without this, every successful queue caused a redundant empty
@@ -570,40 +647,263 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Render the current state into the DRM framebuffer and queue it.
-fn render_frame(data: &mut UdevData) {
-    let gpu = match data.gpu.as_mut() {
-        Some(g) => g,
-        None => return,
+/// Apply queued backend work that needs DRM access (currently DPMS for the
+/// screen-timeout blank). Drained once per loop iteration.
+fn process_backend_requests(data: &mut UdevData) {
+    while let Some(request) = data.state.backend_requests.pop_front() {
+        match request {
+            BackendRequest::SetDpms { on } => {
+                let Some(gpu) = data.gpu.as_mut() else {
+                    continue;
+                };
+                for surface in gpu.surfaces.iter_mut() {
+                    if on {
+                        // Re-arm so the next render re-enables the CRTC (queueing
+                        // a frame brings DPMS back on per DrmCompositor::clear).
+                        surface.can_render = true;
+                    } else if let Err(err) = surface.compositor.clear() {
+                        tracing::warn!(
+                            target: "beewm::idle",
+                            "DPMS off (clear) failed: {:?}", err
+                        );
+                    }
+                }
+                if on {
+                    data.state.needs_render = true;
+                }
+            }
+            BackendRequest::SetOutputMode { output, mode } => {
+                apply_output_mode(data, &output, mode);
+            }
+        }
+    }
+}
+
+/// Build the [`OutputModes`] list the tray's Resolution/Refresh menu reads, from
+/// a connector's advertised modes plus the output's current mode.
+fn output_modes_for(conn_info: &connector::Info, output: &Output) -> OutputModes {
+    let mut available: Vec<OutputModeSpec> = conn_info
+        .modes()
+        .iter()
+        .map(|m| {
+            let (w, h) = m.size();
+            OutputModeSpec {
+                width: w as i32,
+                height: h as i32,
+                refresh: Some(m.vrefresh()),
+            }
+        })
+        .collect();
+    available.sort_unstable_by(|a, b| {
+        (b.width, b.height, b.refresh).cmp(&(a.width, a.height, a.refresh))
+    });
+    available.dedup();
+    let current = output.current_mode().map(|m| OutputModeSpec {
+        width: m.size.w,
+        height: m.size.h,
+        refresh: Some((m.refresh / 1000) as u32),
+    });
+    OutputModes { available, current }
+}
+
+/// Apply a live resolution/refresh change to `output` by rebuilding its DRM
+/// surface with the requested mode (reusing the existing `Output` so workspaces
+/// and position are preserved). Gated on `BEEWM_LIVE_MODESET`; the runtime
+/// modeset path is not yet hardware-validated.
+fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec) {
+    if !crate::compositor::runtime_flags::flags().live_modeset_enabled {
+        tracing::warn!(
+            target: "beewm::tray",
+            "live modeset is gated off; set BEEWM_LIVE_MODESET=1 to change resolution/refresh \
+             from the tray (the runtime modeset path is not yet hardware-validated)",
+        );
+        return;
+    }
+
+    // All DRM work happens here; we return the data the compositor side needs.
+    let rebuilt = {
+        let Some(gpu) = data.gpu.as_mut() else {
+            return;
+        };
+        let Some(idx) = gpu.surfaces.iter().position(|s| &s.output == output) else {
+            tracing::warn!(target: "beewm::tray", "modeset: no surface for the focused output");
+            return;
+        };
+        let connector = gpu.surfaces[idx].connector;
+        let crtc = gpu.surfaces[idx].crtc;
+        let position = gpu.surfaces[idx].position;
+
+        let conn_info = match gpu.drm_fd.get_connector(connector, false) {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(target: "beewm::tray", "modeset: get_connector failed: {}", error);
+                return;
+            }
+        };
+        let Some(drm_mode) = find_mode_for_spec(&conn_info, spec) else {
+            tracing::warn!(
+                target: "beewm::tray",
+                "modeset: {}x{}{} not available on this output",
+                spec.width,
+                spec.height,
+                spec.refresh.map(|hz| format!("@{hz}")).unwrap_or_default(),
+            );
+            return;
+        };
+
+        // Drop the old surface first so its CRTC is free before we re-create.
+        let reused_output = gpu.surfaces[idx].output.clone();
+        gpu.surfaces.remove(idx);
+
+        let drm_surface = match gpu.drm_device.create_surface(crtc, drm_mode, &[connector]) {
+            Ok(surface) => surface,
+            Err(error) => {
+                tracing::error!(target: "beewm::tray", "modeset: create_surface failed: {}", error);
+                return;
+            }
+        };
+        let gbm_allocator = GbmAllocator::new(
+            gpu.gbm_device.clone(),
+            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+        );
+        let gbm_exporter = GbmFramebufferExporter::new(gpu.gbm_device.clone(), None);
+
+        let output_mode = OutputMode {
+            size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
+            refresh: (drm_mode.vrefresh() * 1000) as i32,
+        };
+        reused_output.change_current_state(
+            Some(output_mode),
+            Some(Transform::Normal),
+            None,
+            Some(position),
+        );
+        reused_output.set_preferred(output_mode);
+
+        let compositor = match DrmCompositor::new(
+            &reused_output,
+            drm_surface,
+            None,
+            gbm_allocator,
+            gbm_exporter,
+            gpu.color_formats,
+            gpu.renderer_formats.to_vec(),
+            gpu.cursor_size,
+            Some(gpu.gbm_device.clone()),
+        ) {
+            Ok(compositor) => compositor,
+            Err(error) => {
+                tracing::error!(target: "beewm::tray", "modeset: DrmCompositor::new failed: {}", error);
+                return;
+            }
+        };
+
+        gpu.surfaces.push(SurfaceData {
+            connector,
+            crtc,
+            output: reused_output.clone(),
+            position,
+            compositor,
+            can_render: true,
+            pending_presentation_feedback: None,
+            frame_stats: FrameStats::new(),
+            present_stats: PresentStats::new(),
+        });
+        tracing::info!(
+            target: "beewm::tray",
+            width = output_mode.size.w,
+            height = output_mode.size.h,
+            refresh_hz = output_mode.refresh as f64 / 1000.0,
+            "applied live output mode",
+        );
+        (reused_output, conn_info)
     };
-    gpu.can_render = false;
+
+    let (output, conn_info) = rebuilt;
+    let modes = output_modes_for(&conn_info, &output);
+    let applied_mode = modes.current;
+    let output_name = output.name().to_string();
+    data.state.set_output_modes(output, modes);
+    if let Some(mode) = applied_mode {
+        data.state.record_runtime_output_mode(output_name, mode);
+    }
+    data.state.needs_render = true;
+    // Reflow tiling/floats against the output's new size.
+    data.state.handle_output_geometry_changed();
+}
+
+/// Render every renderable surface (each connected output) and queue its frame.
+/// A surface still waiting on its vblank is skipped and `needs_render` is
+/// re-armed so it is retried on the next loop iteration.
+fn render_frame(data: &mut UdevData) {
+    let UdevData { state, gpu, .. } = data;
+    let Some(gpu) = gpu.as_mut() else {
+        return;
+    };
+    // Split-borrow: the device's single renderer is shared by every surface.
+    let GpuData {
+        renderer, surfaces, ..
+    } = gpu;
+    let mut any_skipped = false;
+    for surface in surfaces.iter_mut() {
+        if surface.can_render {
+            render_one_surface(state, renderer, surface);
+        } else {
+            any_skipped = true;
+        }
+    }
+    if any_skipped {
+        // At least one surface is still waiting on its page-flip; keep the dirty
+        // flag set so it renders once its vblank fires.
+        state.needs_render = true;
+    }
+}
+
+/// Render the current state into one output's DRM framebuffer and queue it.
+fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &mut SurfaceData) {
+    surface.can_render = false;
 
     let frame_start = Instant::now();
 
+    let wedge_trace = crate::compositor::runtime_flags::flags().wedge_trace;
+    if wedge_trace {
+        tracing::warn!(
+            target: "beewm::wedge",
+            animating = state.animations.has_active(),
+            scale = surface.output.current_scale().fractional_scale(),
+            "render_one_surface: begin (building window elements)",
+        );
+    }
     let window_elements = window_render_elements(
-        &mut gpu.renderer,
-        &data.state.space,
-        &gpu.output,
+        renderer,
+        &state.space,
+        &surface.output,
         1.0,
-        &data.state.animations,
+        &state.animations,
         Instant::now(),
     );
+    if wedge_trace {
+        tracing::warn!(
+            target: "beewm::wedge",
+            count = window_elements.len(),
+            "window_render_elements: done",
+        );
+    }
 
     // True when an xdg-shell fullscreen or a fullscreen-sized X11 game covers
     // the output. Both should suppress top-layers so the game can be promoted
     // onto the primary plane by smithay's DrmCompositor.
-    let fullscreen_active = data.state.screen_owned_by_window();
+    let fullscreen_active = state.screen_owned_by_window();
     // Whether the screen-owning window is an XWayland (X11) surface — many
     // games run through XWayland, and `beewm::frame` surfaces this so the log
     // shows which path is being exercised.
-    let fullscreen_is_x11 = data
-        .state
+    let fullscreen_is_x11 = state
         .active_fullscreen()
         .and_then(|w| w.x11_surface())
         .is_some()
-        || data.state.screen_owned_by_x11_window();
+        || state.screen_owned_by_x11_window();
 
-    let border_elements = data.state.border_elements();
+    let border_elements = state.border_elements();
     // Cursor visibility is driven entirely by Wayland client/pointer state, not
     // by fullscreen presentation. `effective_cursor_icon()` returns `None` (so
     // `cursor_elements` is empty) exactly when the focused client hid the cursor
@@ -614,35 +914,36 @@ fn render_frame(data: &mut UdevData) {
     // promotes it onto the hardware cursor plane; a fullscreen game can still be
     // direct-scanned-out onto the primary plane with the cursor on its own
     // plane, so keeping the element does not block direct scanout.
-    let cursor_elements = data.state.cursor_elements(&mut gpu.renderer);
+    let cursor_elements = state.cursor_elements(renderer);
 
     // Render layer-shell surfaces (waybar, beebar, etc.) at the correct Z-order.
-    // Clone output so we can borrow it for layer_map while also using gpu.renderer.
-    let output = gpu.output.clone();
+    // Clone output so we can borrow it for layer_map while also using the renderer.
+    let output = surface.output.clone();
 
     let layers_below = layer_render_elements(
-        &mut gpu.renderer,
+        renderer,
         &output,
         layers_rendered_below_windows(fullscreen_active),
         1.0,
     );
     let layers_above = layer_render_elements(
-        &mut gpu.renderer,
+        renderer,
         &output,
         layers_rendered_above_windows(fullscreen_active),
         1.0,
     );
 
-    process_pending_screencopies(&mut data.state, &mut gpu.renderer, &output);
+    process_pending_screencopies(state, renderer, &output);
 
     // When the session is locked, the only thing on screen is the lock surface
     // (plus the cursor). Everything else — windows, layer-shell surfaces,
     // borders — is omitted, and outputs without a live lock surface fall back to
     // the solid-black clear color. This is what guarantees a locked session
     // never leaks content, even if the lock client has died.
-    let locked = data.state.locked;
+    let locked = state.locked;
     let lock_elements = if locked {
-        lock_render_elements(&mut gpu.renderer, &output, &data.state.lock_surfaces, 1.0)
+        let lock_surface = state.lock_surfaces.get(&output);
+        lock_render_elements(renderer, &output, lock_surface, 1.0)
     } else {
         Vec::new()
     };
@@ -671,14 +972,23 @@ fn render_frame(data: &mut UdevData) {
         [0.1, 0.1, 0.1, 1.0]
     };
 
-    let gpu = data.gpu.as_mut().unwrap();
-
-    let result = gpu.compositor.render_frame::<_, OutputRenderElement>(
-        &mut gpu.renderer,
+    if wedge_trace {
+        tracing::warn!(
+            target: "beewm::wedge",
+            crtc = ?surface.crtc,
+            elements = elements.len(),
+            "render_frame: begin",
+        );
+    }
+    let result = surface.compositor.render_frame::<_, OutputRenderElement>(
+        renderer,
         &elements,
         clear_color,
         FrameFlags::DEFAULT,
     );
+    if wedge_trace {
+        tracing::warn!(target: "beewm::wedge", ok = result.is_ok(), "render_frame: returned");
+    }
 
     match result {
         Ok(result) => {
@@ -687,35 +997,44 @@ fn render_frame(data: &mut UdevData) {
             let overlay_count = result.overlay_elements.len();
             let cursor_plane_used = result.cursor_element.is_some();
             let is_empty = result.is_empty;
-            update_primary_scanout_output(&data.state, &output, &render_states);
+            update_primary_scanout_output(state, &output, &render_states);
 
             if is_empty {
                 // No damage — nothing to scan out. The caller already
                 // cleared `needs_render`; re-allow the next render and send
                 // frame callbacks now since no VBlank will fire to do it.
-                gpu.can_render = true;
-                gpu.pending_presentation_feedback = None;
-                let elapsed = data.state.start_time.elapsed();
+                surface.can_render = true;
+                surface.pending_presentation_feedback = None;
+                let elapsed = state.start_time.elapsed();
                 send_frame_callbacks(
-                    &data.state,
+                    state,
                     &output,
                     elapsed,
                     Some(output_frame_interval(&output)),
                 );
-                data.state.last_frame_callbacks_sent_at = Some(Instant::now());
-            } else if let Err(e) = gpu.compositor.queue_frame(()) {
+                state.last_frame_callbacks_sent_at = Some(Instant::now());
+            } else if let Err(e) = {
+                if wedge_trace {
+                    tracing::warn!(target: "beewm::wedge", "queue_frame: begin (atomic commit)");
+                }
+                let r = surface.compositor.queue_frame(());
+                if wedge_trace {
+                    tracing::warn!(target: "beewm::wedge", ok = r.is_ok(), "queue_frame: returned");
+                }
+                r
+            } {
                 tracing::error!("Failed to queue frame: {:?}", e);
-                gpu.can_render = true;
-                gpu.pending_presentation_feedback = None;
+                surface.can_render = true;
+                surface.pending_presentation_feedback = None;
                 // Frame was never queued — no VBlank coming; unblock clients
                 // and re-arm the render so the next dispatch retries.
-                data.state.needs_render = true;
-                let elapsed = data.state.start_time.elapsed();
-                send_frame_callbacks(&data.state, &output, elapsed, None);
-                data.state.last_frame_callbacks_sent_at = Some(Instant::now());
+                state.needs_render = true;
+                let elapsed = state.start_time.elapsed();
+                send_frame_callbacks(state, &output, elapsed, None);
+                state.last_frame_callbacks_sent_at = Some(Instant::now());
             } else {
-                gpu.pending_presentation_feedback = Some(collect_presentation_feedback(
-                    &data.state,
+                surface.pending_presentation_feedback = Some(collect_presentation_feedback(
+                    state,
                     &output,
                     &render_states,
                 ));
@@ -730,44 +1049,46 @@ fn render_frame(data: &mut UdevData) {
                 // accurate. Set BEEWM_FRAME_CALLBACK_AT_VBLANK to restore the
                 // legacy at-vblank behaviour for comparison.
                 if !crate::compositor::runtime_flags::flags().frame_callback_at_vblank {
-                    let elapsed = data.state.start_time.elapsed();
+                    let elapsed = state.start_time.elapsed();
                     send_frame_callbacks(
-                        &data.state,
+                        state,
                         &output,
                         elapsed,
                         Some(output_frame_interval(&output)),
                     );
-                    data.state.last_frame_callbacks_sent_at = Some(Instant::now());
+                    state.last_frame_callbacks_sent_at = Some(Instant::now());
                 }
             }
 
             record_frame_stats(
-                &mut gpu.frame_stats,
-                frame_start.elapsed(),
-                is_scanout,
-                is_empty,
-                overlay_count,
-                cursor_plane_used,
-                fullscreen_active,
-                fullscreen_is_x11,
-                count_windows,
-                count_borders,
-                count_cursor,
-                count_layers_above,
-                count_layers_below,
+                &mut surface.frame_stats,
+                FrameStatsSample {
+                    render_time: frame_start.elapsed(),
+                    is_scanout,
+                    is_empty,
+                    overlay_count,
+                    cursor_plane_used,
+                    fullscreen_active,
+                    fullscreen_is_x11,
+                    count_windows,
+                    count_borders,
+                    count_cursor,
+                    count_layers_above,
+                    count_layers_below,
+                },
             );
             // For the normal non-empty case, frame callbacks are sent from the
             // VBlank handler once the hardware confirms the frame is on screen.
         }
         Err(e) => {
             tracing::error!("Render error: {:?}", e);
-            gpu.can_render = true;
-            gpu.pending_presentation_feedback = None;
+            surface.can_render = true;
+            surface.pending_presentation_feedback = None;
             // Render failed — no VBlank coming; unblock clients and re-arm
             // so we retry on the next iteration instead of getting stuck.
-            data.state.needs_render = true;
-            let elapsed = data.state.start_time.elapsed();
-            send_frame_callbacks(&data.state, &output, elapsed, None);
+            state.needs_render = true;
+            let elapsed = state.start_time.elapsed();
+            send_frame_callbacks(state, &output, elapsed, None);
         }
     }
 }
@@ -775,9 +1096,7 @@ fn render_frame(data: &mut UdevData) {
 /// Update per-frame counters and emit `beewm::frame` log lines at digestible
 /// rates: one line on every scanout↔composition transition (with the full
 /// element breakdown of *that* frame) and one summary every ~1 second.
-#[allow(clippy::too_many_arguments)]
-fn record_frame_stats(
-    stats: &mut FrameStats,
+struct FrameStatsSample {
     render_time: Duration,
     is_scanout: bool,
     is_empty: bool,
@@ -790,7 +1109,24 @@ fn record_frame_stats(
     count_cursor: usize,
     count_layers_above: usize,
     count_layers_below: usize,
-) {
+}
+
+fn record_frame_stats(stats: &mut FrameStats, sample: FrameStatsSample) {
+    let FrameStatsSample {
+        render_time,
+        is_scanout,
+        is_empty,
+        overlay_count,
+        cursor_plane_used,
+        fullscreen_active,
+        fullscreen_is_x11,
+        count_windows,
+        count_borders,
+        count_cursor,
+        count_layers_above,
+        count_layers_below,
+    } = sample;
+
     stats.frames += 1;
     if is_empty {
         stats.empty_frames += 1;
@@ -870,6 +1206,7 @@ fn init_gpu(
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     path: &Path,
     refresh_rate: Option<u32>,
+    output_configs: &[OutputConfig],
 ) -> Result<(GpuData, DmabufSetup, Option<DrmSyncobjState>), Box<dyn std::error::Error>> {
     // Open DRM device via session
     let fd = session.open(path, OFlags::RDWR | OFlags::CLOEXEC)?;
@@ -878,65 +1215,9 @@ fn init_gpu(
 
     let (mut drm_device, drm_notifier) = DrmDevice::new(drm_fd.clone(), false)?;
 
-    // Find a connected connector and pick the preferred mode
     let resources = drm_fd.resource_handles()?;
-    let mut selected_connector = None;
-    let mut selected_mode = None;
 
-    for conn_handle in resources.connectors() {
-        if let Ok(conn_info) = drm_fd.get_connector(*conn_handle, false) {
-            if conn_info.state() == connector::State::Connected && !conn_info.modes().is_empty() {
-                let preferred = conn_info
-                    .modes()
-                    .iter()
-                    .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-                    .copied()
-                    .unwrap_or(conn_info.modes()[0]);
-
-                let mode = if let Some(target_hz) = refresh_rate {
-                    let preferred_size = preferred.size();
-                    conn_info
-                        .modes()
-                        .iter()
-                        .find(|m| m.size() == preferred_size && m.vrefresh() == target_hz)
-                        .copied()
-                        .or_else(|| {
-                            tracing::warn!(
-                                "No mode found for {}x{}@{}Hz, falling back to preferred mode",
-                                preferred_size.0,
-                                preferred_size.1,
-                                target_hz,
-                            );
-                            None
-                        })
-                        .unwrap_or(preferred)
-                } else {
-                    preferred
-                };
-
-                selected_connector = Some(*conn_handle);
-                selected_mode = Some(mode);
-                tracing::info!(
-                    "Using connector {:?}, mode {}x{}@{}",
-                    conn_handle,
-                    mode.size().0,
-                    mode.size().1,
-                    mode.vrefresh()
-                );
-                break;
-            }
-        }
-    }
-
-    let connector_handle = selected_connector.ok_or("No connected display found")?;
-    let drm_mode = selected_mode.ok_or("No display mode available")?;
-
-    // Find a suitable CRTC for this connector
-    let crtc_handle = find_crtc_for_connector(&drm_fd, &resources, connector_handle)?;
-
-    // Create DRM surface
-    let drm_surface = drm_device.create_surface(crtc_handle, drm_mode, &[connector_handle])?;
-
+    // ── Device-level resources, shared by every connector's surface ──────────
     // Create GBM device
     let gbm_device = GbmDevice::new(drm_fd.clone())?;
 
@@ -1004,81 +1285,10 @@ fn init_gpu(
     };
 
     let renderer = unsafe { GlesRenderer::new(egl_context)? };
-
-    // Create GBM allocator + framebuffer exporter
-    let gbm_allocator = GbmAllocator::new(
-        gbm_device.clone(),
-        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-    );
-    let gbm_exporter = GbmFramebufferExporter::new(gbm_device.clone(), None);
-
-    // Create smithay Output
-    let (phys_w, phys_h) = {
-        if let Ok(info) = drm_fd.get_connector(connector_handle, false) {
-            let size = info.size().unwrap_or((0, 0));
-            (size.0 as i32, size.1 as i32)
-        } else {
-            (0, 0)
-        }
-    };
-
-    let output = Output::new(
-        format!("{:?}", connector_handle),
-        PhysicalProperties {
-            size: (phys_w, phys_h).into(),
-            subpixel: Subpixel::Unknown,
-            make: "beewm".into(),
-            model: "drm".into(),
-        },
-    );
-
-    let output_mode = OutputMode {
-        size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
-        refresh: (drm_mode.vrefresh() * 1000) as i32,
-    };
-
-    output.create_global::<Beewm>(display_handle);
-    output.change_current_state(
-        Some(output_mode),
-        Some(Transform::Normal),
-        None,
-        Some((0, 0).into()),
-    );
-    output.set_preferred(output_mode);
-
-    // Surface the exact present timing the rest of the pipeline will use. The
-    // frame interval here drives both the `wp_presentation` refresh reported to
-    // clients (XWayland/games use it to schedule vblanks) and the
-    // `beewm::presentation` cadence baseline, so a wrong value here would
-    // silently mis-pace every client.
-    let frame_interval = output_frame_interval(&output);
-    tracing::info!(
-        target: "beewm::presentation",
-        width = output_mode.size.w,
-        height = output_mode.size.h,
-        refresh_mhz = output_mode.refresh,
-        refresh_hz = output_mode.refresh as f64 / 1000.0,
-        frame_interval_us = frame_interval.as_micros() as u64,
-        "selected output mode",
-    );
-
-    // Create DRM compositor
     let cursor_size = drm_device.cursor_size();
 
     use smithay::backend::allocator::Fourcc;
     let color_formats = [Fourcc::Argb8888, Fourcc::Xrgb8888];
-
-    let compositor = DrmCompositor::new(
-        &output,
-        drm_surface,
-        None,
-        gbm_allocator,
-        gbm_exporter,
-        color_formats,
-        renderer_formats,
-        cursor_size,
-        Some(gbm_device.clone()),
-    )?;
 
     let syncobj_state = if crate::compositor::runtime_flags::flags().explicit_sync_disabled {
         tracing::warn!("Explicit sync disabled by BEEWM_NO_EXPLICIT_SYNC");
@@ -1101,18 +1311,113 @@ fn init_gpu(
         None
     };
 
-    // VBlank: frame was presented — acknowledge it and allow the next render.
+    // ── One surface per connected connector ──────────────────────────────────
+    // Multi-head is gated on BEEWM_MULTI_OUTPUT; with the gate off we drive only
+    // the first connected connector, exactly as before.
+    let multi_output = crate::compositor::runtime_flags::flags().multi_output_enabled;
+    let mut surfaces: Vec<SurfaceData> = Vec::new();
+    let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();
+    let mut x_offset: i32 = 0;
+
+    for conn_handle in resources.connectors() {
+        let conn_info = match drm_fd.get_connector(*conn_handle, false) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+        if conn_info.state() != connector::State::Connected || conn_info.modes().is_empty() {
+            continue;
+        }
+
+        let name = connector_name(&conn_info);
+        let cfg = config_for_output(output_configs, &name);
+        if cfg.map(|c| !c.enabled).unwrap_or(false) {
+            tracing::info!("Output {} disabled by config", name);
+            continue;
+        }
+
+        let Some(drm_mode) = resolve_connector_mode(&conn_info, cfg, refresh_rate) else {
+            continue;
+        };
+
+        let crtc_handle =
+            match find_crtc_for_connector(&drm_fd, &resources, *conn_handle, &used_crtcs) {
+                Ok(crtc) => crtc,
+                Err(error) => {
+                    tracing::warn!("Skipping connector {}: {}", name, error);
+                    continue;
+                }
+            };
+
+        // Honor a configured position; otherwise auto-pack left-to-right.
+        let position = cfg
+            .and_then(|c| c.position)
+            .map(|(x, y)| Point::<i32, Logical>::from((x, y)))
+            .unwrap_or_else(|| Point::from((x_offset, 0)));
+
+        match build_surface_for_connector(
+            &mut drm_device,
+            &gbm_device,
+            SurfaceBuildParams {
+                renderer_formats: &renderer_formats,
+                color_formats,
+                cursor_size,
+                display_handle,
+                name: &name,
+                connector_handle: *conn_handle,
+                conn_info: &conn_info,
+                drm_mode,
+                crtc_handle,
+                position,
+            },
+        ) {
+            Ok(surface) => {
+                used_crtcs.insert(crtc_handle);
+                // Keep the auto cursor past any explicitly-placed output so the
+                // next auto-positioned output doesn't overlap it.
+                x_offset = (position.x + drm_mode.size().0 as i32).max(x_offset);
+                surfaces.push(surface);
+            }
+            Err(error) => {
+                tracing::warn!("Failed to create surface for connector {}: {}", name, error);
+                continue;
+            }
+        }
+
+        // Default (gate off): drive only the first connected connector.
+        if !multi_output {
+            break;
+        }
+    }
+
+    if surfaces.is_empty() {
+        return Err("No connected display with a usable CRTC found".into());
+    }
+    tracing::info!(
+        "Initialized {} output surface(s) on {}",
+        surfaces.len(),
+        path.display()
+    );
+
+    // VBlank: route the page-flip completion to the surface whose CRTC fired,
+    // acknowledge it, emit presentation feedback, and re-arm that surface.
     let drm_notifier_token = event_loop.handle().insert_source(
         drm_notifier,
         |event, metadata, data: &mut UdevData| match event {
-            DrmEvent::VBlank(_crtc) => {
+            DrmEvent::VBlank(crtc) => {
+                if crate::compositor::runtime_flags::flags().wedge_trace {
+                    tracing::warn!(target: "beewm::wedge", ?crtc, "vblank: page-flip completed");
+                }
+                let mut vblank_output = None;
                 let mut feedback_presented = false;
-                if let Some(gpu) = data.gpu.as_mut() {
-                    if let Err(e) = gpu.compositor.frame_submitted() {
+                if let Some(gpu) = data.gpu.as_mut()
+                    && let Some(surface) =
+                        gpu.surfaces.iter_mut().find(|surface| surface.crtc == crtc)
+                {
+                    if let Err(e) = surface.compositor.frame_submitted() {
                         tracing::error!("frame_submitted error: {:?}", e);
                     }
-                    gpu.can_render = true;
-                    let interval = output_frame_interval(&gpu.output);
+                    surface.can_render = true;
+                    let interval = output_frame_interval(&surface.output);
                     let refresh = Refresh::fixed(interval);
                     let presentation_time = metadata
                         .as_ref()
@@ -1125,7 +1430,7 @@ fn init_gpu(
                         .as_ref()
                         .map(|meta| meta.sequence as u64)
                         .unwrap_or(0);
-                    if let Some(mut feedback) = gpu.pending_presentation_feedback.take() {
+                    if let Some(mut feedback) = surface.pending_presentation_feedback.take() {
                         feedback.presented(
                             presentation_time,
                             refresh,
@@ -1134,26 +1439,24 @@ fn init_gpu(
                         );
                         feedback_presented = true;
                     }
-                    // beewm::presentation — measure the real interval between
-                    // page-flip completions against the nominal refresh.
-                    gpu.present_stats.record_vblank(interval, feedback_presented);
+                    // beewm::presentation — real interval between page-flips.
+                    surface
+                        .present_stats
+                        .record_vblank(interval, feedback_presented);
+                    vblank_output = Some(surface.output.clone());
                 }
 
-                // By default frame callbacks were already sent right after the
-                // frame was queued (see render_frame), so the client has been
-                // rendering its next frame in parallel with this one's scan-out.
-                // Only send them here when the operator opted into the legacy
-                // at-vblank pacing for A/B comparison.
-                if crate::compositor::runtime_flags::flags().frame_callback_at_vblank {
+                // Legacy at-vblank frame-callback pacing (opt-in A/B test).
+                if crate::compositor::runtime_flags::flags().frame_callback_at_vblank
+                    && let Some(output) = vblank_output
+                {
                     let elapsed = data.state.start_time.elapsed();
-                    if let Some(gpu) = data.gpu.as_ref() {
-                        send_frame_callbacks(
-                            &data.state,
-                            &gpu.output,
-                            elapsed,
-                            Some(output_frame_interval(&gpu.output)),
-                        );
-                    }
+                    send_frame_callbacks(
+                        &data.state,
+                        &output,
+                        elapsed,
+                        Some(output_frame_interval(&output)),
+                    );
                     data.state.last_frame_callbacks_sent_at = Some(Instant::now());
                 }
             }
@@ -1163,20 +1466,387 @@ fn init_gpu(
 
     Ok((
         GpuData {
-            _drm_device: drm_device,
+            drm_device,
+            drm_fd,
             _drm_notifier_token: drm_notifier_token,
-            _gbm_device: gbm_device,
+            gbm_device,
             renderer,
-            compositor,
-            output,
-            can_render: true, // allow first frame immediately
-            pending_presentation_feedback: None,
-            frame_stats: FrameStats::new(),
-            present_stats: PresentStats::new(),
+            surfaces,
+            renderer_formats,
+            color_formats,
+            cursor_size,
         },
         dmabuf_setup,
         syncobj_state,
     ))
+}
+
+/// Build a render surface (its own `DrmCompositor` + `Output`) for one connected
+/// connector on `crtc_handle`, placed at `position`. Shared by initial
+/// enumeration and runtime hotplug so the two paths can never diverge.
+struct SurfaceBuildParams<'a> {
+    renderer_formats: &'a [Format],
+    color_formats: [smithay::backend::allocator::Fourcc; 2],
+    cursor_size: smithay::utils::Size<u32, smithay::utils::Buffer>,
+    display_handle: &'a smithay::reexports::wayland_server::DisplayHandle,
+    name: &'a str,
+    connector_handle: connector::Handle,
+    conn_info: &'a connector::Info,
+    drm_mode: DrmMode,
+    crtc_handle: crtc::Handle,
+    position: Point<i32, Logical>,
+}
+
+fn build_surface_for_connector(
+    drm_device: &mut DrmDevice,
+    gbm_device: &GbmDevice<DrmDeviceFd>,
+    params: SurfaceBuildParams<'_>,
+) -> Result<SurfaceData, Box<dyn std::error::Error>> {
+    let SurfaceBuildParams {
+        renderer_formats,
+        color_formats,
+        cursor_size,
+        display_handle,
+        name,
+        connector_handle,
+        conn_info,
+        drm_mode,
+        crtc_handle,
+        position,
+    } = params;
+
+    let drm_surface = drm_device.create_surface(crtc_handle, drm_mode, &[connector_handle])?;
+
+    // Per-surface allocator/exporter, both backed by the shared GBM device.
+    let gbm_allocator = GbmAllocator::new(
+        gbm_device.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+    );
+    let gbm_exporter = GbmFramebufferExporter::new(gbm_device.clone(), None);
+
+    let (phys_w, phys_h) = conn_info
+        .size()
+        .map(|(w, h)| (w as i32, h as i32))
+        .unwrap_or((0, 0));
+
+    let output = Output::new(
+        name.to_string(),
+        PhysicalProperties {
+            size: (phys_w, phys_h).into(),
+            subpixel: Subpixel::Unknown,
+            make: "beewm".into(),
+            model: "drm".into(),
+        },
+    );
+
+    let output_mode = OutputMode {
+        size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
+        refresh: (drm_mode.vrefresh() * 1000) as i32,
+    };
+
+    output.create_global::<Beewm>(display_handle);
+    output.change_current_state(
+        Some(output_mode),
+        Some(Transform::Normal),
+        None,
+        Some(position),
+    );
+    output.set_preferred(output_mode);
+
+    let frame_interval = output_frame_interval(&output);
+    tracing::info!(
+        target: "beewm::presentation",
+        connector = ?connector_handle,
+        width = output_mode.size.w,
+        height = output_mode.size.h,
+        refresh_mhz = output_mode.refresh,
+        refresh_hz = output_mode.refresh as f64 / 1000.0,
+        frame_interval_us = frame_interval.as_micros() as u64,
+        position_x = position.x,
+        "configured output mode",
+    );
+
+    let compositor = DrmCompositor::new(
+        &output,
+        drm_surface,
+        None,
+        gbm_allocator,
+        gbm_exporter,
+        color_formats,
+        renderer_formats.to_vec(),
+        cursor_size,
+        Some(gbm_device.clone()),
+    )?;
+
+    Ok(SurfaceData {
+        connector: connector_handle,
+        crtc: crtc_handle,
+        output,
+        position,
+        compositor,
+        can_render: true, // allow the first frame immediately
+        pending_presentation_feedback: None,
+        frame_stats: FrameStats::new(),
+        present_stats: PresentStats::new(),
+    })
+}
+
+/// Re-scan a device's connectors after a hotplug event and reconcile surfaces:
+/// build a surface for any newly-connected display, and tear down + migrate any
+/// surface whose connector has gone away. Only active under `BEEWM_MULTI_OUTPUT`.
+fn rescan_connectors(data: &mut UdevData) {
+    // Snapshot the live connector set (immutable borrow of the device fd).
+    let resources = match data.gpu.as_ref() {
+        Some(gpu) => match gpu.drm_fd.resource_handles() {
+            Ok(resources) => resources,
+            Err(error) => {
+                tracing::warn!("Hotplug rescan failed to read DRM resources: {}", error);
+                return;
+            }
+        },
+        None => return,
+    };
+    let connected: Vec<connector::Handle> = {
+        let Some(gpu) = data.gpu.as_ref() else { return };
+        resources
+            .connectors()
+            .iter()
+            .copied()
+            .filter(|conn| {
+                gpu.drm_fd
+                    .get_connector(*conn, false)
+                    .map(|info| {
+                        info.state() == connector::State::Connected && !info.modes().is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
+    };
+
+    // ── Tear down surfaces whose connector disappeared ───────────────────────
+    let gone: Vec<(connector::Handle, Output)> = data
+        .gpu
+        .as_ref()
+        .map(|gpu| {
+            gpu.surfaces
+                .iter()
+                .filter(|surface| !connected.contains(&surface.connector))
+                .map(|surface| (surface.connector, surface.output.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (connector, output) in gone {
+        tracing::info!("Output disconnected: connector {:?}", connector);
+        if let Some(gpu) = data.gpu.as_mut() {
+            gpu.surfaces
+                .retain(|surface| surface.connector != connector);
+        }
+        data.state.remove_output(&output);
+    }
+
+    // ── Build surfaces for newly-connected connectors ────────────────────────
+    let refresh_rate = data.state.config.refresh_rate;
+    let output_configs = data.state.config.outputs.clone();
+    let display_handle = data.state.display_handle.clone();
+    for conn_handle in connected {
+        // Skip connectors that already have a surface.
+        let already_driven = data
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.surfaces.iter().any(|s| s.connector == conn_handle))
+            .unwrap_or(true);
+        if already_driven {
+            continue;
+        }
+
+        // Resolve name/config/mode/CRTC under an immutable device borrow.
+        // `conn_info`/`name`/`cfg` are owned so they survive the later mutable
+        // borrow for surface creation.
+        let prepared = data.gpu.as_ref().and_then(|gpu| {
+            let conn_info = gpu.drm_fd.get_connector(conn_handle, false).ok()?;
+            let name = connector_name(&conn_info);
+            let cfg = config_for_output(&output_configs, &name).cloned();
+            if cfg.as_ref().map(|c| !c.enabled).unwrap_or(false) {
+                tracing::info!("Output {} disabled by config; not adding", name);
+                return None;
+            }
+            let drm_mode = resolve_connector_mode(&conn_info, cfg.as_ref(), refresh_rate)?;
+            let used: HashSet<crtc::Handle> =
+                gpu.surfaces.iter().map(|surface| surface.crtc).collect();
+            let crtc = find_crtc_for_connector(&gpu.drm_fd, &resources, conn_handle, &used).ok()?;
+            Some((conn_info, name, cfg, drm_mode, crtc))
+        });
+        let Some((conn_info, name, cfg, drm_mode, crtc_handle)) = prepared else {
+            continue;
+        };
+
+        // Honor a configured position; otherwise place to the right of every
+        // existing output.
+        let auto_x: i32 = data
+            .gpu
+            .as_ref()
+            .map(|gpu| {
+                gpu.surfaces
+                    .iter()
+                    .filter_map(|surface| {
+                        let geo = data.state.space.output_geometry(&surface.output)?;
+                        Some(geo.loc.x + geo.size.w)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let position = cfg
+            .as_ref()
+            .and_then(|c| c.position)
+            .map(|(x, y)| Point::<i32, Logical>::from((x, y)))
+            .unwrap_or_else(|| Point::from((auto_x, 0)));
+
+        // Create the surface (mutable device borrow), then register the output.
+        let built = if let Some(gpu) = data.gpu.as_mut() {
+            let GpuData {
+                drm_device,
+                gbm_device,
+                renderer_formats,
+                color_formats,
+                cursor_size,
+                surfaces,
+                ..
+            } = gpu;
+            match build_surface_for_connector(
+                drm_device,
+                gbm_device,
+                SurfaceBuildParams {
+                    renderer_formats,
+                    color_formats: *color_formats,
+                    cursor_size: *cursor_size,
+                    display_handle: &display_handle,
+                    name: &name,
+                    connector_handle: conn_handle,
+                    conn_info: &conn_info,
+                    drm_mode,
+                    crtc_handle,
+                    position,
+                },
+            ) {
+                Ok(surface) => {
+                    let registered = (surface.output.clone(), surface.position);
+                    surfaces.push(surface);
+                    Some(registered)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to build surface for hotplugged connector {}: {}",
+                        name,
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some((output, position)) = built {
+            tracing::info!("Output connected: {}", name);
+            let modes = output_modes_for(&conn_info, &output);
+            data.state.add_output(output.clone(), position);
+            data.state.set_output_modes(output, modes);
+        }
+    }
+
+    // Repack + relayout against the new output set.
+    data.state.handle_output_geometry_changed();
+}
+
+/// Human-readable connector name (`DP-3`, `eDP-1`, `HDMI-A-1`, …) for config
+/// matching, bars, and logs — instead of the opaque connector-handle debug
+/// string. Built from the Debug form of the interface so it stays correct even
+/// for connector kinds not explicitly mapped here.
+fn connector_name(info: &connector::Info) -> String {
+    let raw = format!("{:?}", info.interface());
+    let kind = match raw.as_str() {
+        "DisplayPort" => "DP",
+        "HDMIA" => "HDMI-A",
+        "HDMIB" => "HDMI-B",
+        "EmbeddedDisplayPort" => "eDP",
+        "DVID" => "DVI-D",
+        "DVII" => "DVI-I",
+        "DVIA" => "DVI-A",
+        "VGA" => "VGA",
+        "Virtual" => "Virtual",
+        "DSI" => "DSI",
+        other => other,
+    };
+    format!("{}-{}", kind, info.interface_id())
+}
+
+/// The config stanza matching a connector name, if any.
+fn config_for_output<'a>(configs: &'a [OutputConfig], name: &str) -> Option<&'a OutputConfig> {
+    configs.iter().find(|cfg| cfg.name == name)
+}
+
+/// Find the DRM mode matching a configured `WxH[@Hz]` spec, if the connector
+/// advertises one. Returns `None` so the caller can fall back to the preferred
+/// mode when the requested mode is unavailable.
+fn find_mode_for_spec(conn_info: &connector::Info, spec: OutputModeSpec) -> Option<DrmMode> {
+    conn_info
+        .modes()
+        .iter()
+        .find(|m| {
+            let (w, h) = m.size();
+            w as i32 == spec.width
+                && h as i32 == spec.height
+                && spec.refresh.map(|hz| m.vrefresh() == hz).unwrap_or(true)
+        })
+        .copied()
+}
+
+/// Resolve the mode for a connector honoring an `output … mode` override, else
+/// the configured global refresh rate, else the preferred mode.
+fn resolve_connector_mode(
+    conn_info: &connector::Info,
+    cfg: Option<&OutputConfig>,
+    refresh_rate: Option<u32>,
+) -> Option<DrmMode> {
+    if let Some(spec) = cfg.and_then(|c| c.mode) {
+        if let Some(mode) = find_mode_for_spec(conn_info, spec) {
+            return Some(mode);
+        }
+        tracing::warn!(
+            "Configured mode {}x{}{} not available on this output; using preferred",
+            spec.width,
+            spec.height,
+            spec.refresh.map(|hz| format!("@{hz}")).unwrap_or_default(),
+        );
+    }
+    select_connector_mode(conn_info, refresh_rate)
+}
+
+/// Choose the mode to drive a connector with: the PREFERRED mode (or the first
+/// available), optionally narrowed to a configured refresh rate at the same
+/// resolution.
+fn select_connector_mode(
+    conn_info: &connector::Info,
+    refresh_rate: Option<u32>,
+) -> Option<DrmMode> {
+    let preferred = conn_info
+        .modes()
+        .iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .copied()
+        .or_else(|| conn_info.modes().first().copied())?;
+
+    let mode = match refresh_rate {
+        Some(target_hz) => conn_info
+            .modes()
+            .iter()
+            .find(|m| m.size() == preferred.size() && m.vrefresh() == target_hz)
+            .copied()
+            .unwrap_or(preferred),
+        None => preferred,
+    };
+    Some(mode)
 }
 
 /// Find a CRTC that can drive the given connector.
@@ -1184,18 +1854,20 @@ fn find_crtc_for_connector(
     drm: &DrmDeviceFd,
     resources: &smithay::reexports::drm::control::ResourceHandles,
     connector: connector::Handle,
+    used: &HashSet<crtc::Handle>,
 ) -> Result<crtc::Handle, Box<dyn std::error::Error>> {
     let conn_info = drm.get_connector(connector, false)?;
 
     for encoder_handle in conn_info.encoders() {
         if let Ok(encoder_info) = drm.get_encoder(*encoder_handle) {
-            let possible_crtcs = encoder_info.possible_crtcs();
-            let crtcs = resources.filter_crtcs(possible_crtcs);
-            if let Some(&crtc_handle) = crtcs.first() {
+            let crtcs = resources.filter_crtcs(encoder_info.possible_crtcs());
+            // Skip CRTCs already claimed by an earlier connector so each output
+            // scans out on its own pipe.
+            if let Some(&crtc_handle) = crtcs.iter().find(|crtc| !used.contains(crtc)) {
                 return Ok(crtc_handle);
             }
         }
     }
 
-    Err("No suitable CRTC found for connector".into())
+    Err("No unused CRTC available for connector".into())
 }

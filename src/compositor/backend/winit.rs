@@ -33,7 +33,7 @@ use crate::compositor::render::{
     WindowElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
 use crate::compositor::screencopy::process_pending_screencopies;
-use crate::compositor::state::{Beewm, ClientState};
+use crate::compositor::state::{BackendRequest, Beewm, ClientState};
 use crate::xwayland::{delegate_backend_xwayland, start_xwayland};
 
 struct WinitData {
@@ -270,7 +270,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     .active_workspace_focused_window()
                     .map(crate::compositor::state::focused_window_title)
                     .unwrap_or_default();
-                let workspace_num = data.state.active_workspace + 1;
+                let workspace_num = data.state.active_workspace() + 1;
                 let initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
                 data.state.event_broadcaster.add_subscriber(stream, initial);
             }
@@ -306,6 +306,20 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Settings tray: a StatusNotifierItem D-Bus thread sends chosen menu actions
+    // back here over a channel; config reload can start/stop the tray thread.
+    let (tray_tx, tray_rx) =
+        smithay::reexports::calloop::channel::channel::<crate::compositor::tray::MenuAction>();
+    event_loop
+        .handle()
+        .insert_source(tray_rx, |event, _, data: &mut WinitData| {
+            if let ChannelEvent::Msg(action) = event {
+                data.state.apply_menu_action(action);
+                data.state.needs_render = true;
+            }
+        })?;
+    data.state.install_tray_action_sender(tray_tx);
+
     // Initialize winit backend
     let (mut winit_backend, winit_evt) = winit::init::<GlowRenderer>()?;
 
@@ -333,7 +347,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    data.state.space.map_output(&output, (0, 0));
+    data.state.add_output(output.clone(), (0, 0).into());
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
@@ -346,7 +360,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     size,
                     refresh: 60_000,
                 };
-                if let Some(output) = data.state.space.outputs().next().cloned() {
+                if let Some(output) = data.state.focused_output() {
                     output.change_current_state(Some(mode), None, None, None);
                 }
                 data.state.relayout();
@@ -387,6 +401,31 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_millis(100)
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
+
+        // Screen-timeout bookkeeping. The nested winit backend can't DPMS the
+        // host display, so DPMS requests are just drained/logged; the timeout
+        // logic (and the tray's Screen-timeout menu) still behaves correctly.
+        data.state.update_idle(Instant::now());
+        let requests: Vec<BackendRequest> = data.state.backend_requests.drain(..).collect();
+        for request in requests {
+            match request {
+                BackendRequest::SetDpms { on } => {
+                    tracing::debug!(target: "beewm::idle", on, "DPMS request ignored (winit)");
+                    if on {
+                        data.state.needs_render = true;
+                    }
+                }
+                BackendRequest::SetOutputMode { .. } => {
+                    // The nested winit output is sized by the host window.
+                    tracing::info!(
+                        target: "beewm::tray",
+                        "resolution/refresh changes aren't supported on the nested winit backend",
+                    );
+                }
+            }
+        }
+
+        data.state.apply_pending_map_focus();
         data.state.flush_pending_focus_publish();
 
         // Process pending surface state (sends wl_surface.enter/leave)
@@ -403,7 +442,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // Only render when something visual has changed. Rendering after
         // dispatch/flush keeps interactive resizes closer to the latest input.
         if data.state.needs_render {
-            let output = data.state.space.outputs().next().cloned();
+            let output = data.state.focused_output();
             if let Some(ref output) = output {
                 let border_elements = data.state.border_elements();
                 let mut submitted = false;
@@ -438,24 +477,27 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let locked = data.state.locked;
                         let mut elements: Vec<WinitRenderElement> = Vec::new();
                         if locked {
-                            let lock_elements = lock_render_elements(
-                                renderer,
-                                output,
-                                &data.state.lock_surfaces,
-                                1.0,
-                            );
-                            elements.extend(lock_elements.into_iter().map(WinitRenderElement::from));
+                            let lock_surface = data.state.lock_surfaces.get(output);
+                            let lock_elements =
+                                lock_render_elements(renderer, output, lock_surface, 1.0);
+                            elements
+                                .extend(lock_elements.into_iter().map(WinitRenderElement::from));
                         } else {
                             elements.extend(layers_above.into_iter().map(WinitRenderElement::from));
-                            elements.extend(border_elements.into_iter().map(WinitRenderElement::from));
-                            elements.extend(window_elements.into_iter().map(WinitRenderElement::from));
+                            elements
+                                .extend(border_elements.into_iter().map(WinitRenderElement::from));
+                            elements
+                                .extend(window_elements.into_iter().map(WinitRenderElement::from));
                             elements.extend(layers_below.into_iter().map(WinitRenderElement::from));
                         }
 
                         process_pending_screencopies(&mut data.state, renderer, output);
 
-                        let clear_color =
-                            if locked { [0.0, 0.0, 0.0, 1.0] } else { [0.1, 0.1, 0.1, 1.0] };
+                        let clear_color = if locked {
+                            [0.0, 0.0, 0.0, 1.0]
+                        } else {
+                            [0.1, 0.1, 0.1, 1.0]
+                        };
                         Some(damage_tracker.render_output(
                             renderer,
                             &mut framebuffer,

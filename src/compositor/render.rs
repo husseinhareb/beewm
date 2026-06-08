@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Instant;
 
 use smithay::backend::renderer::ImportAll;
@@ -8,7 +7,7 @@ use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::{
-    render_elements_from_surface_tree, WaylandSurfaceRenderElement,
+    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
 use smithay::backend::renderer::element::utils::{
     ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, RelocateRenderElement,
@@ -219,8 +218,8 @@ where
 
     // Front-to-back (topmost first), matching render_elements_for_region.
     for window in space.elements().rev() {
-        let visual = Beewm::window_root_surface(window)
-            .and_then(|root| animations.active_rect(&root, now));
+        let visual =
+            Beewm::window_root_surface(window).and_then(|root| animations.active_rect(&root, now));
 
         // Skip windows fully outside the region that are not being animated.
         if visual.is_none() && !region.overlaps(window.bbox()) {
@@ -307,13 +306,10 @@ where
 /// if any. Returns an empty vec when the output has no lock surface or the lock
 /// client has died — in both cases the caller renders solid black underneath,
 /// so the session is never exposed.
-// `Output` has interior mutability (Arc<Mutex<…>>) but its Hash/Eq use stable
-// identity, so it is a sound HashMap key — the standard smithay pattern.
-#[allow(clippy::mutable_key_type)]
 pub(crate) fn lock_render_elements<R>(
     renderer: &mut R,
     output: &Output,
-    lock_surfaces: &HashMap<Output, LockSurface>,
+    lock: Option<&LockSurface>,
     alpha: f32,
 ) -> Vec<WaylandSurfaceRenderElement<R>>
 where
@@ -321,7 +317,7 @@ where
     R::TextureId: Texture + Clone + 'static,
 {
     let scale = Scale::from(output.current_scale().fractional_scale());
-    match lock_surfaces.get(output) {
+    match lock {
         Some(lock) if lock.alive() => render_elements_from_surface_tree(
             renderer,
             lock.wl_surface(),

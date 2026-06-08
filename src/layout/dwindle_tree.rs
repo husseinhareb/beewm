@@ -273,14 +273,16 @@ impl<T: Clone + Eq> DwindleNode<T> {
                     ResizeSearch::Found => {
                         if edge_matches_branch(edge, *axis, ChildBranch::First) {
                             adjust_split_ratio(
-                                axis,
                                 ratio,
-                                first,
-                                second,
-                                &first_geo,
-                                &second_geo,
-                                delta,
-                                min_leaf_span,
+                                SplitRatioAdjustment {
+                                    axis: *axis,
+                                    first,
+                                    second,
+                                    first_geo: &first_geo,
+                                    second_geo: &second_geo,
+                                    delta,
+                                    min_leaf_span,
+                                },
                             );
                             return ResizeSearch::Handled;
                         }
@@ -294,14 +296,16 @@ impl<T: Clone + Eq> DwindleNode<T> {
                     ResizeSearch::Found => {
                         if edge_matches_branch(edge, *axis, ChildBranch::Second) {
                             adjust_split_ratio(
-                                axis,
                                 ratio,
-                                first,
-                                second,
-                                &first_geo,
-                                &second_geo,
-                                delta,
-                                min_leaf_span,
+                                SplitRatioAdjustment {
+                                    axis: *axis,
+                                    first,
+                                    second,
+                                    first_geo: &first_geo,
+                                    second_geo: &second_geo,
+                                    delta,
+                                    min_leaf_span,
+                                },
                             );
                             ResizeSearch::Handled
                         } else {
@@ -360,7 +364,7 @@ impl<T: Clone + Eq> DwindleNode<T> {
 }
 
 fn split_axis_for_depth(depth: usize) -> SplitAxis {
-    if depth % 2 == 0 {
+    if depth.is_multiple_of(2) {
         SplitAxis::Vertical
     } else {
         SplitAxis::Horizontal
@@ -421,16 +425,27 @@ fn edge_matches_branch(edge: ResizeEdge, axis: SplitAxis, branch: ChildBranch) -
     )
 }
 
-fn adjust_split_ratio<T: Clone + Eq>(
-    axis: &SplitAxis,
-    ratio: &mut f64,
-    first: &DwindleNode<T>,
-    second: &DwindleNode<T>,
-    first_geo: &Geometry,
-    second_geo: &Geometry,
+struct SplitRatioAdjustment<'a, T> {
+    axis: SplitAxis,
+    first: &'a DwindleNode<T>,
+    second: &'a DwindleNode<T>,
+    first_geo: &'a Geometry,
+    second_geo: &'a Geometry,
     delta: i32,
     min_leaf_span: u32,
-) {
+}
+
+fn adjust_split_ratio<T: Clone + Eq>(ratio: &mut f64, adjustment: SplitRatioAdjustment<'_, T>) {
+    let SplitRatioAdjustment {
+        axis,
+        first,
+        second,
+        first_geo,
+        second_geo,
+        delta,
+        min_leaf_span,
+    } = adjustment;
+
     let (current_first_span, total_span, min_first, min_second) = match axis {
         SplitAxis::Vertical => (
             first_geo.width,
