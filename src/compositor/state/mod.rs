@@ -1,16 +1,18 @@
 mod cursor;
 mod decorations;
 mod focus;
+mod output;
 pub(crate) mod popup;
 mod tiling;
 mod window_lifecycle;
 mod workspace;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::Id;
@@ -22,9 +24,11 @@ use smithay::input::keyboard::{XkbConfig, xkb};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
+use smithay::reexports::calloop::channel::Sender;
 use smithay::reexports::wayland_server::backend::{ClientData, GlobalId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
+use smithay::utils::IsAlive;
 use smithay::utils::{Clock, Logical, Monotonic, Point};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
@@ -34,6 +38,7 @@ use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::drm_syncobj::{DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::pointer_constraints::{
     PointerConstraint, PointerConstraintsState, with_pointer_constraint,
@@ -45,8 +50,8 @@ use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState};
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
-use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
@@ -54,7 +59,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWaylandClientData};
 
 use crate::compositor::animation::AnimationManager;
-use crate::config::{Config, Keybind, LayoutKind};
+use crate::config::{Config, Keybind, LayoutKind, OutputModeSpec};
 use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
 use crate::xwayland::PendingX11Window;
@@ -65,11 +70,13 @@ use super::event_broadcast::EventBroadcaster;
 use super::screencopy::{PendingScreencopyFrame, create_screencopy_global};
 
 use super::cursor::CursorThemeManager;
+use super::tray::{MenuAction, MenuItem, ModeMenu, SharedMenu, TrayHandle, build_menu_items};
 
 pub use self::decorations::{
     expand_by_border, root_is_swap_highlighted, visible_border_rectangles,
     window_border_overlaps_layer,
 };
+pub use self::output::OutputCtx;
 pub use self::popup::{
     centered_dialog_position, constrain_popup_geometry, is_dialog_size_cap, is_fixed_size,
     popup_constraint_target,
@@ -85,10 +92,61 @@ type SyncobjBlockerInstaller = dyn Fn(DrmSyncPointSource, Client);
 
 pub(crate) use super::types::{ActiveGrab, FloatingWindowData, ResolvedKeybind};
 
+/// Work the compositor wants the backend to perform on its next loop turn,
+/// because it needs DRM/GPU access the compositor side does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendRequest {
+    /// Power the outputs off (`on = false`, via `DrmCompositor::clear`) or back
+    /// on (`on = true`, by resuming rendering). Drives screen-timeout blanking.
+    SetDpms { on: bool },
+    /// Switch `output` to `mode` (a live DRM modeset). Gated on
+    /// `BEEWM_LIVE_MODESET`; logged and skipped otherwise.
+    SetOutputMode {
+        output: Output,
+        mode: OutputModeSpec,
+    },
+}
+
+/// The mode list reported by the backend for one output, used to populate the
+/// tray's Resolution/Refresh submenus.
+#[derive(Debug, Clone, Default)]
+pub struct OutputModes {
+    /// Every mode the connector advertises (`WxH@Hz`).
+    pub available: Vec<OutputModeSpec>,
+    /// The mode currently driving the output.
+    pub current: Option<OutputModeSpec>,
+}
+
 /// The main compositor state.
 pub struct Beewm {
     pub running: bool,
     pub config: Config,
+    /// Whether to publish the settings tray icon (a StatusNotifierItem on the
+    /// session bus). Resolved from config/env at startup.
+    pub tray_enabled: bool,
+    /// The current settings-menu tree, shared with the D-Bus tray thread which
+    /// reads it whenever the host opens the menu. Rebuilt by `refresh_tray_menu`.
+    pub tray_menu: SharedMenu,
+    /// Sender side of the calloop tray-action channel, installed once by the
+    /// active backend so config reloads can start the tray after startup.
+    pub tray_action_tx: Option<Sender<MenuAction>>,
+    /// Running StatusNotifierItem thread, if the settings tray is enabled.
+    pub tray_handle: Option<TrayHandle>,
+    /// Last time any input was seen; drives screen-timeout blanking.
+    pub last_activity: Instant,
+    /// True while the outputs are blanked (DPMS off) by the idle timeout.
+    pub blanked: bool,
+    /// Work queued for the backend to apply (DPMS now; output modes later).
+    pub backend_requests: VecDeque<BackendRequest>,
+    /// `zwp_idle_inhibit` manager global.
+    pub idle_inhibitor_state: IdleInhibitManagerState,
+    /// Surfaces currently inhibiting idle (e.g. a video player). While any is
+    /// alive, the screen-timeout blank is suppressed.
+    pub idle_inhibitors: HashSet<WlSurface>,
+    /// Mode list per output (backend-reported), for the tray's Resolution menu.
+    pub output_modes: HashMap<Output, OutputModes>,
+    /// Output modes written by the tray to `state.conf`, keyed by output name.
+    pub runtime_output_modes: HashMap<String, OutputModeSpec>,
     pub start_time: std::time::Instant,
     pub display_handle: DisplayHandle,
 
@@ -161,7 +219,13 @@ pub struct Beewm {
     /// Layout state saved while a tiled window is temporarily detached for a drag.
     pub tiled_swap_layout_snapshot: Option<Box<dyn LayoutManager<WlSurface>>>,
     pub workspaces: Vec<Workspace<Window>>,
-    pub active_workspace: usize,
+    /// Registry of outputs known to the compositor, kept in sync with the
+    /// `Space` via [`Beewm::add_output`]. The single source of truth for which
+    /// outputs exist and where they are positioned.
+    pub outputs: Vec<OutputCtx>,
+    /// Index into `outputs` that currently owns keyboard focus and receives
+    /// newly-mapped windows. Always valid while `outputs` is non-empty.
+    pub focused_output: usize,
     /// Windows that have been created but not yet committed their first buffer.
     pub pending_windows: Vec<Window>,
     /// Root wl_surface -> mapped window lookup for commit-time surface routing.
@@ -239,6 +303,12 @@ pub struct Beewm {
     /// NOT, because it re-enters `with_states` on a surface whose cached_state
     /// lock the caller is already holding, deadlocking the entire main loop.
     pub(crate) focus_publish_pending: bool,
+    /// Keyboard focus to assign to a freshly-mapped window, deferred out of the
+    /// `commit()` callback. Calling `set_keyboard_focus` synchronously during a
+    /// surface's own commit re-enters `with_pending_state`/`send_pending_configure`
+    /// on that same surface and self-deadlocks the main loop (same hazard as
+    /// `focus_publish_pending`). Applied right after dispatch instead.
+    pub(crate) pending_map_focus: Option<WlSurface>,
     /// Startup commands are delayed until both an output exists and XWayland startup has settled.
     pub(crate) startup_commands_spawned: bool,
     pub(crate) outputs_ready_for_startup: bool,
@@ -310,6 +380,12 @@ impl Beewm {
         let resolved_keybinds = resolve_keybinds(&config.keybinds);
         let border_color_focused = hex_to_color32f(config.border_color_focused);
         let border_color_unfocused = hex_to_color32f(config.border_color_unfocused);
+        // The tray icon is published when the config opts in OR the BEEWM_TRAY
+        // env flag is set.
+        let tray_enabled = Self::resolve_tray_enabled(&config);
+        let tray_menu: SharedMenu = Arc::new(Mutex::new(Vec::new()));
+        let runtime_output_modes = Config::runtime_output_modes().into_iter().collect();
+        let idle_inhibitor_state = IdleInhibitManagerState::new::<Self>(&display_handle);
         let animations = AnimationManager::from_config(&config);
         let cursor_shape_manager_state_ = CursorShapeManagerState::new::<Self>(&display_handle);
         let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
@@ -318,6 +394,17 @@ impl Beewm {
         let state = Self {
             running: true,
             config,
+            tray_enabled,
+            tray_menu,
+            tray_action_tx: None,
+            tray_handle: None,
+            last_activity: std::time::Instant::now(),
+            blanked: false,
+            backend_requests: VecDeque::new(),
+            idle_inhibitor_state,
+            idle_inhibitors: HashSet::new(),
+            output_modes: HashMap::new(),
+            runtime_output_modes,
             start_time: std::time::Instant::now(),
             display_handle: display_handle.clone(),
             compositor_state,
@@ -358,7 +445,8 @@ impl Beewm {
             layout_manager,
             tiled_swap_layout_snapshot: None,
             workspaces: (0..num_ws).map(|_| Workspace::new()).collect(),
-            active_workspace: 0,
+            outputs: Vec::new(),
+            focused_output: 0,
             pending_windows: Vec::new(),
             window_lookup: HashMap::new(),
             border_ids: Vec::new(),
@@ -382,6 +470,7 @@ impl Beewm {
             pending_screencopy_frames: Vec::new(),
             event_broadcaster: EventBroadcaster::new(),
             focus_publish_pending: false,
+            pending_map_focus: None,
             child_env: ChildEnvironment::default(),
             startup_commands_spawned: false,
             outputs_ready_for_startup: false,
@@ -396,6 +485,46 @@ impl Beewm {
         state.publish_workspace_state();
         state.publish_focused_window_state();
         state
+    }
+
+    fn resolve_tray_enabled(config: &Config) -> bool {
+        config.tray_enabled || crate::compositor::runtime_flags::flags().tray_enabled
+    }
+
+    pub(crate) fn install_tray_action_sender(&mut self, tray_action_tx: Sender<MenuAction>) {
+        self.tray_action_tx = Some(tray_action_tx);
+        self.sync_tray();
+    }
+
+    pub(crate) fn sync_tray(&mut self) {
+        if self
+            .tray_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            self.tray_handle.take();
+        }
+
+        if self.tray_enabled {
+            if self.tray_handle.is_some() {
+                return;
+            }
+
+            let Some(tray_action_tx) = self.tray_action_tx.clone() else {
+                tracing::warn!(
+                    target: "beewm::tray",
+                    "settings tray is enabled but the backend has not installed an action channel",
+                );
+                return;
+            };
+
+            self.refresh_tray_menu();
+            self.tray_handle =
+                crate::compositor::tray::spawn(self.tray_menu.clone(), tray_action_tx);
+        } else if let Some(tray_handle) = self.tray_handle.take() {
+            tray_handle.shutdown();
+        }
     }
 
     /// Re-read the config file and apply every hot-reloadable field in place.
@@ -429,7 +558,8 @@ impl Beewm {
         // For dwindle this affects future splits; for master-stack it also
         // changes the current master/stack division immediately.
         if new_config.split_ratio != self.config.split_ratio {
-            self.layout_manager.set_default_split_ratio(new_config.split_ratio);
+            self.layout_manager
+                .set_default_split_ratio(new_config.split_ratio);
         }
 
         // Layout algorithm change: rebuild the manager from scratch, re-inserting
@@ -456,20 +586,28 @@ impl Beewm {
         }
 
         // keyboard_layout: re-apply XKB config so the running session picks it up.
-        if new_config.keyboard_layout != self.config.keyboard_layout {
-            if let Some(keyboard) = self.seat.get_keyboard() {
-                let result = keyboard.set_xkb_config(
-                    self,
-                    XkbConfig {
-                        layout: &new_config.keyboard_layout,
-                        ..Default::default()
-                    },
+        if new_config.keyboard_layout != self.config.keyboard_layout
+            && let Some(keyboard) = self.seat.get_keyboard()
+        {
+            let result = keyboard.set_xkb_config(
+                self,
+                XkbConfig {
+                    layout: &new_config.keyboard_layout,
+                    ..Default::default()
+                },
+            );
+            if let Err(e) = result {
+                tracing::warn!(
+                    "Failed to apply keyboard_layout '{}': {:?}",
+                    new_config.keyboard_layout,
+                    e
                 );
-                if let Err(e) = result {
-                    tracing::warn!("Failed to apply keyboard_layout '{}': {:?}", new_config.keyboard_layout, e);
-                }
             }
         }
+
+        // Settings tray: re-resolve enabled (config OR BEEWM_TRAY), then
+        // `sync_tray` below starts/stops the StatusNotifierItem thread.
+        self.tray_enabled = Self::resolve_tray_enabled(&new_config);
 
         // autostart_commands are intentionally not re-executed on reload.
         // tap_to_click / natural_scroll take effect for devices added after
@@ -477,6 +615,8 @@ impl Beewm {
 
         self.config = new_config;
         self.animations.update_from_config(&self.config);
+        self.refresh_tray_menu();
+        self.sync_tray();
         tracing::info!(
             "Config reloaded: layout={:?}, border_width={}, gap={}, split_ratio={}",
             self.config.layout,
@@ -488,6 +628,175 @@ impl Beewm {
         // relayout() repositions all windows on the active workspace and sets
         // needs_render = true so the new gap/border values are picked up.
         self.relayout();
+    }
+
+    /// Rebuild the shared settings-menu tree from current state and publish it
+    /// to the D-Bus tray thread (which reads it the next time the host opens the
+    /// menu). Cheap; call it whenever an input to `build_tray_menu` changes.
+    pub(crate) fn refresh_tray_menu(&self) {
+        if let Ok(mut menu) = self.tray_menu.lock() {
+            *menu = self.build_tray_menu();
+        }
+    }
+
+    /// Record the backend-reported mode list for `output` (drives the tray's
+    /// Resolution/Refresh submenus) and refresh the published menu.
+    pub(crate) fn set_output_modes(&mut self, output: Output, modes: OutputModes) {
+        self.output_modes.insert(output, modes);
+        self.refresh_tray_menu();
+    }
+
+    /// Build the tray menu, populating Resolution/Refresh from the anchor
+    /// output's live mode list when known.
+    fn build_tray_menu(&self) -> Vec<MenuItem> {
+        let mode_menu = self
+            .focused_output()
+            .and_then(|output| self.output_modes.get(&output))
+            .map(|modes| {
+                let current_res = modes.current.map(|m| (m.width, m.height));
+                let mut resolutions: Vec<(i32, i32)> = modes
+                    .available
+                    .iter()
+                    .map(|m| (m.width, m.height))
+                    .collect();
+                resolutions.sort_unstable_by(|a, b| b.cmp(a));
+                resolutions.dedup();
+                let mut refresh_rates: Vec<u32> = modes
+                    .available
+                    .iter()
+                    .filter(|m| current_res == Some((m.width, m.height)))
+                    .filter_map(|m| m.refresh)
+                    .collect();
+                refresh_rates.sort_unstable_by(|a, b| b.cmp(a));
+                refresh_rates.dedup();
+                ModeMenu {
+                    resolutions,
+                    refresh_rates,
+                    current_res,
+                    current_hz: modes.current.and_then(|m| m.refresh),
+                }
+            });
+        build_menu_items(
+            mode_menu.as_ref(),
+            self.config.gap,
+            self.config.screen_timeout,
+        )
+    }
+
+    /// Persist tray-settable values so they survive a restart (written to the
+    /// `state.conf` overlay, not the user's hand-edited config).
+    fn persist_runtime_settings(&self) {
+        let output_modes: Vec<_> = self
+            .runtime_output_modes
+            .iter()
+            .map(|(name, mode)| (name.clone(), *mode))
+            .collect();
+        Config::write_state_overrides(self.config.gap, self.config.screen_timeout, &output_modes);
+    }
+
+    /// Remember a successfully applied tray output-mode change and persist it.
+    pub(crate) fn record_runtime_output_mode(&mut self, output_name: String, mode: OutputModeSpec) {
+        self.runtime_output_modes.insert(output_name.clone(), mode);
+        self.config.set_output_mode_override(output_name, mode);
+        self.persist_runtime_settings();
+    }
+
+    /// Apply a menu action chosen in the tray. Called from the D-Bus tray
+    /// channel on the main loop.
+    pub(crate) fn apply_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::SetGap(gap) => {
+                tracing::info!(target: "beewm::tray", gap, "set gap from tray");
+                self.config.gap = gap;
+                self.relayout();
+                self.persist_runtime_settings();
+                self.refresh_tray_menu();
+            }
+            MenuAction::SignOut => {
+                tracing::info!(target: "beewm::tray", "sign out from tray");
+                self.running = false;
+            }
+            MenuAction::SetScreenTimeout(secs) => {
+                tracing::info!(target: "beewm::tray", secs, "set screen timeout from tray");
+                self.config.screen_timeout = secs;
+                // Restart the countdown from now (and wake if currently blanked).
+                self.notify_activity();
+                self.persist_runtime_settings();
+                self.refresh_tray_menu();
+            }
+            MenuAction::SetResolution { width, height } => {
+                if let Some(output) = self.focused_output() {
+                    tracing::info!(target: "beewm::tray", width, height, "set resolution from tray");
+                    self.backend_requests
+                        .push_back(BackendRequest::SetOutputMode {
+                            output,
+                            mode: OutputModeSpec {
+                                width,
+                                height,
+                                // Pick the best refresh the backend can match at this size.
+                                refresh: None,
+                            },
+                        });
+                }
+            }
+            MenuAction::SetRefresh { hz } => {
+                if let Some(output) = self.focused_output() {
+                    // Keep the current resolution, change only the refresh rate.
+                    if let Some((width, height)) = self
+                        .output_modes
+                        .get(&output)
+                        .and_then(|m| m.current)
+                        .map(|m| (m.width, m.height))
+                    {
+                        tracing::info!(target: "beewm::tray", hz, "set refresh from tray");
+                        self.backend_requests
+                            .push_back(BackendRequest::SetOutputMode {
+                                output,
+                                mode: OutputModeSpec {
+                                    width,
+                                    height,
+                                    refresh: Some(hz),
+                                },
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record user input: restart the screen-timeout countdown and, if the
+    /// screen was blanked, wake it back up. Called from the input handlers.
+    pub(crate) fn notify_activity(&mut self) {
+        self.last_activity = Instant::now();
+        if self.blanked {
+            self.blanked = false;
+            self.backend_requests
+                .push_back(BackendRequest::SetDpms { on: true });
+            self.needs_render = true;
+        }
+    }
+
+    /// Any live idle inhibitor (e.g. a video player) suppresses blanking.
+    fn idle_inhibited(&mut self) -> bool {
+        self.idle_inhibitors.retain(|s| s.alive());
+        !self.idle_inhibitors.is_empty()
+    }
+
+    /// Evaluate the screen-timeout deadline; blank (DPMS off) when reached.
+    /// Called once per backend loop iteration.
+    pub(crate) fn update_idle(&mut self, now: Instant) {
+        let idle = now.saturating_duration_since(self.last_activity);
+        if should_blank(
+            self.config.screen_timeout,
+            self.blanked,
+            self.idle_inhibited(),
+            idle,
+        ) {
+            tracing::info!(target: "beewm::idle", "screen timeout reached; blanking (DPMS off)");
+            self.blanked = true;
+            self.backend_requests
+                .push_back(BackendRequest::SetDpms { on: false });
+        }
     }
 
     pub fn install_syncobj_blocker_source(&mut self, installer: Box<SyncobjBlockerInstaller>) {
@@ -536,7 +845,7 @@ impl Beewm {
         if super::runtime_flags::flags().workspace_publish_disabled {
             return;
         }
-        let active_workspace = active_workspace_state_contents(self.active_workspace);
+        let active_workspace = active_workspace_state_contents(self.active_workspace());
         if let Err(error) =
             write_state_file_atomically(Path::new(ACTIVE_WORKSPACE_STATE_PATH), &active_workspace)
         {
@@ -547,7 +856,7 @@ impl Beewm {
             );
         }
 
-        let state = workspace_state_contents(self.active_workspace, &self.workspaces);
+        let state = workspace_state_contents(self.active_workspace(), &self.workspaces);
         if let Err(error) = write_state_file_atomically(Path::new(WORKSPACE_STATE_PATH), &state) {
             tracing::warn!(
                 "Failed to publish workspace state to {}: {}",
@@ -556,8 +865,9 @@ impl Beewm {
             );
         }
 
-        let workspace_num = self.active_workspace + 1;
-        self.event_broadcaster.push_event(&format!("workspace>>{workspace_num}"));
+        let workspace_num = self.active_workspace() + 1;
+        self.event_broadcaster
+            .push_event(&format!("workspace>>{workspace_num}"));
     }
 
     /// Mark the focused-window IPC state as needing a republish. Cheap and
@@ -576,7 +886,32 @@ impl Beewm {
             return;
         }
         self.focus_publish_pending = false;
+        let trace = crate::compositor::runtime_flags::flags().wedge_trace;
+        if trace {
+            tracing::warn!(target: "beewm::wedge", "flush_focus_publish: begin");
+        }
         self.publish_focused_window_state();
+        if trace {
+            tracing::warn!(target: "beewm::wedge", "flush_focus_publish: done");
+        }
+    }
+
+    /// Assign keyboard focus to a window that was mapped during the last
+    /// dispatch. MUST be called from the main loop AFTER `event_loop.dispatch()`,
+    /// never from a dispatch callback — `set_keyboard_focus` re-enters the
+    /// committing surface's cached state and would self-deadlock (see field doc
+    /// on `pending_map_focus`).
+    pub(crate) fn apply_pending_map_focus(&mut self) {
+        if let Some(surface) = self.pending_map_focus.take() {
+            let trace = crate::compositor::runtime_flags::flags().wedge_trace;
+            if trace {
+                tracing::warn!(target: "beewm::wedge", "apply_pending_map_focus: begin");
+            }
+            self.set_keyboard_focus(Some(surface));
+            if trace {
+                tracing::warn!(target: "beewm::wedge", "apply_pending_map_focus: done");
+            }
+        }
     }
 
     /// Deactivate any active pointer-lock or confinement constraint on `surface`.
@@ -659,7 +994,8 @@ impl Beewm {
                 error
             );
         }
-        self.event_broadcaster.push_event(&format!("window>>{title}"));
+        self.event_broadcaster
+            .push_event(&format!("window>>{title}"));
     }
 }
 
@@ -728,6 +1064,13 @@ fn build_layout_manager(
             Box::new(MasterStackManager::new(num_workspaces, config.split_ratio))
         }
     }
+}
+
+/// Decide whether the screen should blank now. Pure so the timeout policy is
+/// unit-tested without a clock or DRM: blank only when a non-zero timeout has
+/// elapsed, nothing already blanked, and no idle inhibitor is active.
+fn should_blank(timeout_secs: u32, blanked: bool, inhibited: bool, idle: Duration) -> bool {
+    timeout_secs > 0 && !blanked && !inhibited && idle.as_secs() >= timeout_secs as u64
 }
 
 /// Convert a 0xRRGGBB hex color to smithay's Color32F (with alpha=1.0).
@@ -893,5 +1236,30 @@ impl ClientData for ClientState {
         _client_id: smithay::reexports::wayland_server::backend::ClientId,
         _reason: smithay::reexports::wayland_server::backend::DisconnectReason,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::should_blank;
+    use std::time::Duration;
+
+    #[test]
+    fn blanks_only_after_a_nonzero_timeout_elapses() {
+        // Not yet elapsed.
+        assert!(!should_blank(600, false, false, Duration::from_secs(599)));
+        // Elapsed.
+        assert!(should_blank(600, false, false, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn timeout_zero_never_blanks() {
+        assert!(!should_blank(0, false, false, Duration::from_secs(100_000)));
+    }
+
+    #[test]
+    fn already_blanked_or_inhibited_does_not_blank_again() {
+        assert!(!should_blank(60, true, false, Duration::from_secs(120)));
+        assert!(!should_blank(60, false, true, Duration::from_secs(120)));
     }
 }

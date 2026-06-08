@@ -50,23 +50,22 @@ impl Beewm {
     }
 
     pub fn active_workspace_focused_index(&self) -> Option<usize> {
-        if let Some(target) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) {
-            if let Some(surface) = target.wl_surface() {
-                if let Some(idx) = self.window_index_for_surface(self.active_workspace, &surface) {
-                    return Some(idx);
-                }
-            }
+        if let Some(target) = self.seat.get_keyboard().and_then(|kb| kb.current_focus())
+            && let Some(surface) = target.wl_surface()
+            && let Some(idx) = self.window_index_for_surface(self.active_workspace(), &surface)
+        {
+            return Some(idx);
         }
-        self.workspaces[self.active_workspace].focused_idx
+        self.workspaces[self.active_workspace()].focused_idx
     }
 
     pub fn active_workspace_focused_window(&self) -> Option<&Window> {
         let idx = self.active_workspace_focused_index()?;
-        self.workspaces[self.active_workspace].windows.get(idx)
+        self.workspaces[self.active_workspace()].windows.get(idx)
     }
 
     pub fn focus_current_window(&mut self) {
-        let Some(idx) = self.workspaces[self.active_workspace].focused_idx else {
+        let Some(idx) = self.workspaces[self.active_workspace()].focused_idx else {
             return;
         };
         self.focus_active_workspace_window(idx);
@@ -82,7 +81,7 @@ impl Beewm {
     /// workspace has no tiled windows (everything is floating), fall back to the
     /// insertion-order cycle so floating-only workspaces still cycle.
     pub fn focus_in_cycle(&mut self, forward: bool) {
-        let ws_idx = self.active_workspace;
+        let ws_idx = self.active_workspace();
         let ordered = self.layout_manager.ordered_roots(ws_idx);
         if ordered.is_empty() {
             let workspace = &mut self.workspaces[ws_idx];
@@ -116,7 +115,7 @@ impl Beewm {
             return;
         };
 
-        let Some(current_window) = self.workspaces[self.active_workspace]
+        let Some(current_window) = self.workspaces[self.active_workspace()]
             .windows
             .get(current_idx)
             .cloned()
@@ -129,7 +128,7 @@ impl Beewm {
         };
 
         let target_idx = {
-            let workspace = &self.workspaces[self.active_workspace];
+            let workspace = &self.workspaces[self.active_workspace()];
             best_directional_focus_candidate(
                 current_geometry,
                 workspace
@@ -157,50 +156,50 @@ impl Beewm {
     /// — which reads the seat — agrees with what we cache here. No other code
     /// path should assign `focused_idx` directly.
     pub fn note_keyboard_focus_change(&mut self, focused: Option<&WlSurface>) {
-        let new_idx = focused
-            .and_then(|s| self.window_index_for_surface(self.active_workspace, s));
+        let new_idx =
+            focused.and_then(|s| self.window_index_for_surface(self.active_workspace(), s));
 
-        let old_idx = self.workspaces[self.active_workspace].focused_idx;
+        let old_idx = self.workspaces[self.active_workspace()].focused_idx;
 
         if new_idx != old_idx {
-            if let Some(idx) = old_idx {
-                if let Some(window) = self.workspaces[self.active_workspace].windows.get(idx) {
-                    if let Some(toplevel) = window.toplevel() {
-                        toplevel.with_pending_state(|s| {
-                            s.states.unset(xdg_toplevel::State::Activated);
-                        });
-                        toplevel.send_pending_configure();
-                    }
-                    if let Some(x11) = window.x11_surface() {
-                        let _ = x11.set_activated(false);
-                    }
+            if let Some(idx) = old_idx
+                && let Some(window) = self.workspaces[self.active_workspace()].windows.get(idx)
+            {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|s| {
+                        s.states.unset(xdg_toplevel::State::Activated);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                if let Some(x11) = window.x11_surface() {
+                    let _ = x11.set_activated(false);
                 }
             }
-            if let Some(idx) = new_idx {
-                if let Some(window) = self.workspaces[self.active_workspace].windows.get(idx) {
-                    if let Some(toplevel) = window.toplevel() {
-                        toplevel.with_pending_state(|s| {
-                            s.states.set(xdg_toplevel::State::Activated);
-                        });
-                        toplevel.send_pending_configure();
-                    }
-                    if let Some(x11) = window.x11_surface() {
-                        let _ = x11.set_activated(true);
-                    }
+            if let Some(idx) = new_idx
+                && let Some(window) = self.workspaces[self.active_workspace()].windows.get(idx)
+            {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|s| {
+                        s.states.set(xdg_toplevel::State::Activated);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                if let Some(x11) = window.x11_surface() {
+                    let _ = x11.set_activated(true);
                 }
             }
         }
 
         if let Some(idx) = new_idx {
-            self.workspaces[self.active_workspace].focused_idx = Some(idx);
-            // The cache must agree with the seat keyboard focus we just synced
-            // from. `active_workspace_focused_index` prefers the seat, so this
-            // catches any drift between the two representations of focus.
-            debug_assert_eq!(
-                self.active_workspace_focused_index(),
-                Some(idx),
-                "focused_idx cache diverged from the seat keyboard focus",
-            );
+            let ws = self.active_workspace();
+            self.workspaces[ws].focused_idx = Some(idx);
+            // DO NOT call `active_workspace_focused_index()` (or anything else
+            // that reads `keyboard.current_focus()`) here. `note_keyboard_focus_change`
+            // runs from inside `SeatHandler::focus_changed`, which smithay invokes
+            // while holding the keyboard's internal mutex (see
+            // `KeyboardHandle::set_focus`). Re-locking it deadlocks the whole
+            // compositor — this was a `debug_assert_eq!` that hard-hung the session
+            // (frozen, dead VT) the instant a window opened under a debug build.
         }
 
         self.invalidate_borders();
@@ -230,6 +229,7 @@ impl Beewm {
 
     pub fn set_keyboard_focus_target(&mut self, focused: Option<KeyboardFocusTarget>) {
         let serial = SERIAL_COUNTER.next_serial();
+        let trace = crate::compositor::runtime_flags::flags().wedge_trace;
 
         // Dismiss any active popup grab before re-focusing. We unset the keyboard
         // grab first so that PopupPointerGrab::unset() finds keyboard.is_grabbed()
@@ -239,14 +239,26 @@ impl Beewm {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
+        if trace {
+            tracing::warn!(target: "beewm::wedge", grabbed = keyboard.is_grabbed(), "stkf: keyboard grab check");
+        }
         if keyboard.is_grabbed() {
             keyboard.unset_grab(self);
         }
+        if trace {
+            tracing::warn!(target: "beewm::wedge", "stkf: keyboard grab handled");
+        }
         if let Some(pointer) = self.seat.get_pointer() {
+            if trace {
+                tracing::warn!(target: "beewm::wedge", grabbed = pointer.is_grabbed(), "stkf: pointer grab check");
+            }
             if pointer.is_grabbed() {
                 let time_ms = self.start_time.elapsed().as_millis() as u32;
                 pointer.unset_grab(self, serial, time_ms);
             }
+        }
+        if trace {
+            tracing::warn!(target: "beewm::wedge", "stkf: calling keyboard.set_focus");
         }
 
         let is_none = focused.is_none();
@@ -254,20 +266,23 @@ impl Beewm {
             return;
         };
         keyboard.set_focus(self, focused, serial);
+        if trace {
+            tracing::warn!(target: "beewm::wedge", "stkf: keyboard.set_focus returned");
+        }
 
         // Smithay does not invoke SeatHandler::focus_changed when the focus is unset.
         if is_none {
-            if let Some(prev) = self.prev_keyboard_focus.take() {
-                if self.deactivate_pointer_constraint_for(&prev) {
-                    self.set_cursor_status(smithay::input::pointer::CursorImageStatus::default_named());
-                }
+            if let Some(prev) = self.prev_keyboard_focus.take()
+                && self.deactivate_pointer_constraint_for(&prev)
+            {
+                self.set_cursor_status(smithay::input::pointer::CursorImageStatus::default_named());
             }
             self.note_keyboard_focus_change(None);
         }
     }
 
     fn focus_active_workspace_window(&mut self, idx: usize) {
-        let Some(window) = self.workspaces[self.active_workspace]
+        let Some(window) = self.workspaces[self.active_workspace()]
             .windows
             .get(idx)
             .cloned()
@@ -307,19 +322,19 @@ impl Beewm {
     /// touches the wl_surface scene graph — X11 pointer event routing is
     /// driven by the X server's own z-order.
     pub(crate) fn raise_x11_window(&mut self, surface: &smithay::xwayland::X11Surface) {
-        if let Some(xwm) = self.xwm.as_mut() {
-            if let Err(error) = xwm.raise_window(surface) {
-                tracing::warn!(
-                    target: "beewm::xwayland",
-                    "Failed to raise X11 window in X server stacking order: {}",
-                    error,
-                );
-            }
+        if let Some(xwm) = self.xwm.as_mut()
+            && let Err(error) = xwm.raise_window(surface)
+        {
+            tracing::warn!(
+                target: "beewm::xwayland",
+                "Failed to raise X11 window in X server stacking order: {}",
+                error,
+            );
         }
     }
 }
 
-fn best_directional_focus_candidate(
+pub(crate) fn best_directional_focus_candidate(
     current: Rectangle<i32, Logical>,
     candidates: impl IntoIterator<Item = (usize, Rectangle<i32, Logical>)>,
     direction: FocusDirection,

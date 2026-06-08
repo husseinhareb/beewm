@@ -7,9 +7,7 @@ use super::{Beewm, root_surface};
 
 impl Beewm {
     pub(crate) fn window_root_surface(window: &Window) -> Option<WlSurface> {
-        window
-            .wl_surface()
-            .map(|surface| root_surface(&surface.into_owned()))
+        window.wl_surface().map(|surface| root_surface(&surface))
     }
 
     pub(crate) fn is_root_floating(&self, root: &WlSurface) -> bool {
@@ -18,7 +16,7 @@ impl Beewm {
 
     /// The window fullscreened on the *active* workspace, if any.
     pub(crate) fn active_fullscreen(&self) -> Option<&Window> {
-        self.workspaces[self.active_workspace].fullscreen.as_ref()
+        self.workspaces[self.active_workspace()].fullscreen.as_ref()
     }
 
     pub(crate) fn is_root_fullscreen(&self, root: &WlSurface) -> bool {
@@ -36,7 +34,7 @@ impl Beewm {
     }
 
     pub(crate) fn focused_tiled_window_root(&self, workspace_idx: usize) -> Option<WlSurface> {
-        let keyboard_focus = (workspace_idx == self.active_workspace)
+        let keyboard_focus = (workspace_idx == self.active_workspace())
             .then(|| {
                 self.seat
                     .get_keyboard()
@@ -112,10 +110,8 @@ impl Beewm {
 
     pub(crate) fn rectangle_covers_output(&self, geo: Rectangle<i32, Logical>) -> bool {
         let Some(output_geo) = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|output| self.space.output_geometry(output))
+            .focused_output()
+            .and_then(|output| self.space.output_geometry(&output))
         else {
             return false;
         };
@@ -169,7 +165,7 @@ impl Beewm {
     /// relative stacking of multiple floating windows: the most recently
     /// inserted one ends up on top because it is raised last.
     pub(crate) fn raise_floating_windows(&mut self) {
-        let ws_idx = self.active_workspace;
+        let ws_idx = self.active_workspace();
         let floating: Vec<Window> = self.workspaces[ws_idx]
             .windows
             .iter()

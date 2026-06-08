@@ -222,10 +222,8 @@ impl Beewm {
                 })
             })
             .or_else(|| {
-                self.space
-                    .outputs()
-                    .next()
-                    .and_then(|output| self.space.output_geometry(output))
+                self.focused_output()
+                    .and_then(|output| self.space.output_geometry(&output))
             })
     }
 

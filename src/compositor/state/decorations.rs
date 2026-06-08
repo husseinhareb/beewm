@@ -92,25 +92,21 @@ impl Beewm {
     /// Persistent panels usually reserve an exclusive zone and should not hide
     /// borders globally just because they are mapped.
     pub fn has_layer_surface_overlapping_borders(&self, bw: i32) -> bool {
-        let Some(output) = self.space.outputs().next() else {
+        let Some(output) = self.focused_output() else {
             return false;
         };
 
         let windows: Vec<Window> = self
             .space
             .elements()
-            .filter(|w| {
-                self.active_fullscreen()
-                    .map(|fs| fs != *w)
-                    .unwrap_or(true)
-            })
+            .filter(|w| self.active_fullscreen().map(|fs| fs != *w).unwrap_or(true))
             .cloned()
             .collect();
         if windows.is_empty() {
             return false;
         }
 
-        let layer_map = layer_map_for_output(output);
+        let layer_map = layer_map_for_output(&output);
         for layer in [WlrLayer::Overlay, WlrLayer::Top] {
             for layer_surface in layer_map.layers_on(layer) {
                 let Some(layer_geo) = layer_map.layer_geometry(layer_surface) else {
@@ -163,11 +159,7 @@ impl Beewm {
         let windows: Vec<Window> = self
             .space
             .elements()
-            .filter(|w| {
-                self.active_fullscreen()
-                    .map(|fs| fs != *w)
-                    .unwrap_or(true)
-            })
+            .filter(|w| self.active_fullscreen().map(|fs| fs != *w).unwrap_or(true))
             .cloned()
             .collect();
         let mut border_fragments = Vec::new();

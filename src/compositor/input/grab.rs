@@ -190,14 +190,14 @@ fn apply_tiled_resize_grab(
     {
         state.relayout();
 
-        if let Some(toplevel) = grab.window.toplevel() {
-            if let Some(size) = tiled_window_target_size(state, grab.workspace_idx, &root) {
-                toplevel.with_pending_state(|state| {
-                    state.states.set(xdg_toplevel::State::Resizing);
-                    state.size = Some(size);
-                });
-                toplevel.send_pending_configure();
-            }
+        if let Some(toplevel) = grab.window.toplevel()
+            && let Some(size) = tiled_window_target_size(state, grab.workspace_idx, &root)
+        {
+            toplevel.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Resizing);
+                state.size = Some(size);
+            });
+            toplevel.send_pending_configure();
         }
     }
 
@@ -243,11 +243,11 @@ pub(super) fn try_start_tiled_swap_grab(state: &mut Beewm) -> bool {
         root.clone(),
         FloatingWindowData::new(window_geo.loc, window_geo.size),
     );
-    state.remove_tiled_window(state.active_workspace, &root);
+    state.remove_tiled_window(state.active_workspace(), &root);
     state.tiled_swap_layout_snapshot = Some(layout_snapshot);
     state.active_grab = Some(ActiveGrab::TiledSwap(TiledSwapGrab {
         window: window.clone(),
-        workspace_idx: state.active_workspace,
+        workspace_idx: state.active_workspace(),
         start_pointer: state.pointer_location,
         start_window_pos: window_geo.loc,
         start_window_size: window_geo.size,
@@ -306,7 +306,7 @@ pub(super) fn try_start_tiled_resize_grab(state: &mut Beewm) -> bool {
     };
 
     let edges = resize_edges_for_pointer(window_geo.loc, window_geo.size, state.pointer_location);
-    let initial_size = tiled_window_target_size(state, state.active_workspace, &root)
+    let initial_size = tiled_window_target_size(state, state.active_workspace(), &root)
         .unwrap_or_else(|| Size::from((window_geo.size.w, window_geo.size.h)));
     focus_and_raise_window(state, &window);
 
@@ -320,7 +320,7 @@ pub(super) fn try_start_tiled_resize_grab(state: &mut Beewm) -> bool {
 
     state.active_grab = Some(ActiveGrab::TiledResize(TiledResizeGrab {
         window,
-        workspace_idx: state.active_workspace,
+        workspace_idx: state.active_workspace(),
         edges,
         last_pointer: state.pointer_location,
     }));
@@ -477,9 +477,7 @@ fn tiled_window_target_size(
 }
 
 fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
-    let Some(keyboard) = state.seat.get_keyboard() else {
-        return None;
-    };
+    let keyboard = state.seat.get_keyboard()?;
     let modifiers = keyboard.modifier_state();
     if !modifiers.logo {
         return None;
@@ -492,9 +490,7 @@ fn floating_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> 
 }
 
 fn tiled_window_under_pointer_with_logo(state: &mut Beewm) -> Option<Window> {
-    let Some(keyboard) = state.seat.get_keyboard() else {
-        return None;
-    };
+    let keyboard = state.seat.get_keyboard()?;
     let modifiers = keyboard.modifier_state();
     if !modifiers.logo {
         return None;

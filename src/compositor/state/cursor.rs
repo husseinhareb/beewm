@@ -1,7 +1,7 @@
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
-use smithay::backend::renderer::{ImportMem, Renderer};
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::{ImportMem, Renderer};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::utils::{Physical, Point};
 

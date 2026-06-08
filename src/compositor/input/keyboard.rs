@@ -8,6 +8,10 @@ use crate::compositor::state::Beewm;
 use crate::config::Action;
 
 pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEvent) {
+    // Any key counts as activity: restart the screen-timeout countdown and wake
+    // the screen if it was blanked.
+    state.notify_activity();
+
     let serial = SERIAL_COUNTER.next_serial();
     let time = Event::time_msec(&event);
     let keycode = event.key_code();
@@ -30,10 +34,10 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
                 let raw = keysym.raw();
                 if (0x1008FE01..=0x1008FE0C).contains(&raw) {
                     let vt = (raw - 0x1008FE01 + 1) as i32;
-                    if let Some(session) = state.session.as_mut() {
-                        if let Err(error) = session.change_vt(vt) {
-                            tracing::warn!("Failed to switch to VT {}: {}", vt, error);
-                        }
+                    if let Some(session) = state.session.as_mut()
+                        && let Err(error) = session.change_vt(vt)
+                    {
+                        tracing::warn!("Failed to switch to VT {}: {}", vt, error);
                     }
                     return FilterResult::Intercept(());
                 }
@@ -43,11 +47,11 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
                 // surface. This is what stops `mod+enter` (or any bind) from
                 // opening a terminal behind the lock. VT switching above is
                 // intentionally still allowed; the lock persists across VTs.
-                if !state.locked {
-                    if let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle) {
-                        execute_action(state, action);
-                        return FilterResult::Intercept(());
-                    }
+                if !state.locked
+                    && let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle)
+                {
+                    execute_action(state, action);
+                    return FilterResult::Intercept(());
                 }
             }
             FilterResult::Forward
@@ -107,11 +111,17 @@ fn execute_action(state: &mut Beewm, action: Action) {
         Action::FocusDirection(direction) => {
             state.focus_window_in_direction(direction);
         }
+        Action::FocusOutput(direction) => {
+            state.focus_output_in_direction(direction);
+        }
+        Action::MoveWindowToOutput(direction) => {
+            state.move_window_to_output(direction);
+        }
         Action::CloseWindow => {
-            if let Some(window) = state.active_workspace_focused_window() {
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.send_close();
-                }
+            if let Some(window) = state.active_workspace_focused_window()
+                && let Some(toplevel) = window.toplevel()
+            {
+                toplevel.send_close();
             }
         }
         Action::ToggleFullscreen => {

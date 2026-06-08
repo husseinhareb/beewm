@@ -8,15 +8,18 @@ use smithay::wayland::shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData};
 
 use crate::model::window::Geometry;
 
-use super::popup::{centered_dialog_position, classify_toplevel_floating, should_map_toplevel_floating};
+use super::popup::{
+    centered_dialog_position, classify_toplevel_floating, should_map_toplevel_floating,
+};
 use super::{Beewm, FloatingWindowData, root_surface};
 
 impl Beewm {
-    pub(crate) fn centered_floating_data(&self, window: &Window) -> Option<(WlSurface, FloatingWindowData)> {
-        let root = window
-            .wl_surface()
-            .map(|surface| root_surface(&surface.into_owned()))?;
-        let output = self.space.outputs().next().cloned()?;
+    pub(crate) fn centered_floating_data(
+        &self,
+        window: &Window,
+    ) -> Option<(WlSurface, FloatingWindowData)> {
+        let root = window.wl_surface().map(|surface| root_surface(&surface))?;
+        let output = self.output_for_window(window)?;
         let output_geo = self.space.output_geometry(&output)?;
         // Centre inside the non-exclusive zone so the dialog never slides under
         // beebar or other layer-shell exclusive surfaces.
@@ -73,8 +76,20 @@ impl Beewm {
 
         let default_w = ((usable_size.w / 3).max(320)).min(usable_size.w.max(1));
         let default_h = ((usable_size.h / 3).max(200)).min(usable_size.h.max(1));
-        let mut win_w = pick_axis(max_size.w, bbox_size.w, geo_size.w, default_w, usable_size.w);
-        let mut win_h = pick_axis(max_size.h, bbox_size.h, geo_size.h, default_h, usable_size.h);
+        let mut win_w = pick_axis(
+            max_size.w,
+            bbox_size.w,
+            geo_size.w,
+            default_w,
+            usable_size.w,
+        );
+        let mut win_h = pick_axis(
+            max_size.h,
+            bbox_size.h,
+            geo_size.h,
+            default_h,
+            usable_size.h,
+        );
         if min_size.w > 0 {
             win_w = win_w.max(min_size.w).min(usable_size.w.max(1));
         }
@@ -280,7 +295,7 @@ impl Beewm {
         // the window it belonged to, rather than whatever happens to be the
         // workspace's last-focused tile.
         let parent_surface = self.toplevel_parent_surface(&window);
-        let should_restore_focus = if ws_idx == self.active_workspace {
+        let should_restore_focus = if ws_idx == self.active_workspace() {
             match self
                 .seat
                 .get_keyboard()
@@ -336,17 +351,19 @@ impl Beewm {
             "removed window from layout",
         );
 
-        if ws_idx == self.active_workspace {
+        if ws_idx == self.active_workspace() {
             if should_restore_focus {
                 // Prefer the closed/unmapped dialog's parent if it is still
                 // mapped; fall back to the workspace's last-focused window.
                 let parent_focus = parent_surface
                     .filter(|parent| self.mapped_window_for_surface(parent).is_some());
                 let focus = parent_focus.or_else(|| {
-                    self.workspaces[self.active_workspace]
+                    self.workspaces[self.active_workspace()]
                         .focused_idx
                         .and_then(|focus_idx| {
-                            self.workspaces[self.active_workspace].windows.get(focus_idx)
+                            self.workspaces[self.active_workspace()]
+                                .windows
+                                .get(focus_idx)
                         })
                         .and_then(Self::window_root_surface)
                 });
@@ -398,10 +415,19 @@ impl Beewm {
     /// floating window can never be dragged entirely off-screen — there are no
     /// client-side titlebars to grab it back with.
     pub(crate) fn floating_usable_rect(&self) -> Option<Rectangle<i32, Logical>> {
-        let output = self.space.outputs().next()?.clone();
-        let output_geo = self.space.output_geometry(&output)?;
+        let output = self.focused_output()?;
+        self.floating_usable_rect_for(&output)
+    }
+
+    /// Floating-window reachable rectangle for a specific output (output minus
+    /// its own layer-shell exclusive zones, no tiling gap).
+    pub(crate) fn floating_usable_rect_for(
+        &self,
+        output: &smithay::output::Output,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let output_geo = self.space.output_geometry(output)?;
         let non_exclusive = {
-            let lm = smithay::desktop::layer_map_for_output(&output);
+            let lm = smithay::desktop::layer_map_for_output(output);
             lm.non_exclusive_zone()
         };
         Some(Rectangle::new(
@@ -411,12 +437,21 @@ impl Beewm {
     }
 
     pub(crate) fn tiling_usable_geometry(&self) -> Option<Geometry> {
-        let output = self.space.outputs().next()?.clone();
-        let output_geo = self.space.output_geometry(&output)?;
+        let output = self.focused_output()?;
+        self.tiling_usable_geometry_for(&output)
+    }
+
+    /// Tiling area (output minus that output's exclusive zones, inset by the
+    /// configured gap) for a specific output.
+    pub(crate) fn tiling_usable_geometry_for(
+        &self,
+        output: &smithay::output::Output,
+    ) -> Option<Geometry> {
+        let output_geo = self.space.output_geometry(output)?;
         let gap = self.config.gap as i32;
 
         let non_exclusive = {
-            let lm = smithay::desktop::layer_map_for_output(&output);
+            let lm = smithay::desktop::layer_map_for_output(output);
             lm.non_exclusive_zone()
         };
         let tile_origin = output_geo.loc + non_exclusive.loc;
@@ -459,7 +494,7 @@ impl Beewm {
         surface: &WlSurface,
     ) -> Option<Size<i32, smithay::utils::Logical>> {
         let usable = self.tiling_usable_geometry()?;
-        let ws_idx = self.active_workspace;
+        let ws_idx = self.active_workspace();
         let root = root_surface(surface);
 
         let geo = {
@@ -523,8 +558,8 @@ impl Beewm {
                     });
                     toplevel.send_configure();
                 }
-                let split_target = self.focused_tiled_window_root(self.active_workspace);
-                self.insert_tiled_window(self.active_workspace, &window, split_target.as_ref());
+                let split_target = self.focused_tiled_window_root(self.active_workspace());
+                self.insert_tiled_window(self.active_workspace(), &window, split_target.as_ref());
                 self.relayout();
             }
             super::workspace::FloatToggleTransition::KeepFloating => {
@@ -576,7 +611,7 @@ impl Beewm {
 
         self.workspaces[workspace_idx].swap_windows(first_idx, second_idx);
 
-        if workspace_idx == self.active_workspace {
+        if workspace_idx == self.active_workspace() {
             self.relayout();
         } else {
             self.needs_render = true;
@@ -600,7 +635,8 @@ impl Beewm {
 
         self.animations.forget(&root);
         self.floating_windows.insert(root.clone(), floating);
-        self.space.map_element(window.clone(), floating.position, true);
+        self.space
+            .map_element(window.clone(), floating.position, true);
 
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|state| {
@@ -640,10 +676,7 @@ impl Beewm {
             return;
         }
 
-        let Some(root) = window
-            .wl_surface()
-            .map(|s| root_surface(&s.into_owned()))
-        else {
+        let Some(root) = window.wl_surface().map(|s| root_surface(&s)) else {
             return;
         };
         let Some(workspace_idx) = self.workspace_idx_for_surface(&root) else {
@@ -673,7 +706,7 @@ impl Beewm {
         self.animations.forget(&root);
         self.floating_windows.insert(root, placeholder);
 
-        if workspace_idx == self.active_workspace {
+        if workspace_idx == self.active_workspace() {
             self.relayout();
             self.space.raise_element(&window, true);
             self.raise_floating_windows();
@@ -686,14 +719,11 @@ impl Beewm {
     }
 
     fn float_window(&mut self, window: Window) {
-        let root = match window
-            .wl_surface()
-            .map(|surface| root_surface(&surface.into_owned()))
-        {
+        let root = match window.wl_surface().map(|surface| root_surface(&surface)) {
             Some(r) => r,
             None => return,
         };
-        let output = match self.space.outputs().next().cloned() {
+        let output = match self.output_for_window(&window) {
             Some(o) => o,
             None => return,
         };
@@ -711,7 +741,7 @@ impl Beewm {
             });
             toplevel.send_configure();
         }
-        self.remove_tiled_window(self.active_workspace, &root);
+        self.remove_tiled_window(self.active_workspace(), &root);
         self.animations.forget(&root);
         self.space.map_element(window.clone(), pos, true);
         self.floating_windows.insert(
@@ -722,10 +752,9 @@ impl Beewm {
         self.needs_render = true;
     }
 
-    /// Re-place all floating windows on the active workspace back into the
-    /// space at their stored positions.
-    fn remap_floating_windows(&mut self) {
-        let ws_idx = self.active_workspace;
+    /// Re-place all floating windows of `ws_idx` back into the space at their
+    /// stored positions.
+    fn remap_floating_windows_for(&mut self, ws_idx: usize) {
         for window in self.workspaces[ws_idx].windows.clone() {
             let root = match window.wl_surface().map(|surface| surface.into_owned()) {
                 Some(surface) => root_surface(&surface),
@@ -746,7 +775,8 @@ impl Beewm {
                 Some(w) => w,
                 None => return,
             };
-            self.workspaces[self.active_workspace].fullscreen = Some(window.clone());
+            let ws = self.active_workspace();
+            self.workspaces[ws].fullscreen = Some(window.clone());
             self.show_fullscreen_window(&window);
         }
     }
@@ -757,13 +787,13 @@ impl Beewm {
     /// applies the on-screen presentation. Shared by `toggle_fullscreen` and the
     /// workspace-switch re-apply path so the two can never drift.
     pub(crate) fn show_fullscreen_window(&mut self, window: &Window) {
-        let Some(output) = self.space.outputs().next().cloned() else {
+        let Some(output) = self.output_for_window(window) else {
             return;
         };
         let Some(output_geo) = self.space.output_geometry(&output) else {
             return;
         };
-        let ws_idx = self.active_workspace;
+        let ws_idx = self.active_workspace();
         for sibling in self.workspaces[ws_idx].windows.clone() {
             if &sibling != window {
                 self.space.unmap_elem(&sibling);
@@ -792,7 +822,8 @@ impl Beewm {
     }
 
     fn exit_fullscreen_internal(&mut self, relayout: bool) -> Option<Window> {
-        let fs_window = self.workspaces[self.active_workspace].fullscreen.take()?;
+        let ws = self.active_workspace();
+        let fs_window = self.workspaces[ws].fullscreen.take()?;
         let restore_floating = Self::window_root_surface(&fs_window)
             .and_then(|root| self.floating_windows.get(&root).copied());
 
@@ -814,7 +845,7 @@ impl Beewm {
                 .map_element(fs_window.clone(), floating.position, true);
         }
 
-        let ws_idx = self.active_workspace;
+        let ws_idx = self.active_workspace();
         for window in self.workspaces[ws_idx].windows.clone() {
             if self.space.element_geometry(&window).is_none() {
                 self.space.map_element(window, (0, 0), false);
@@ -830,20 +861,45 @@ impl Beewm {
         Some(fs_window)
     }
 
-    /// Re-tile all windows in the space using the current layout.
+    /// Re-tile the visible workspace of every output. Single entry point used
+    /// across the compositor; with one output this is the old single-output
+    /// relayout.
     pub fn relayout(&mut self) {
-        let Some(usable) = self.tiling_usable_geometry() else {
+        self.relayout_all();
+    }
+
+    /// Re-tile the visible workspace on each connected output against that
+    /// output's own usable geometry.
+    pub fn relayout_all(&mut self) {
+        let outputs: Vec<smithay::output::Output> =
+            self.outputs.iter().map(|ctx| ctx.output.clone()).collect();
+        for output in outputs {
+            self.relayout_output(&output);
+        }
+    }
+
+    /// Re-tile the workspace currently visible on `output`.
+    pub(crate) fn relayout_output(&mut self, output: &smithay::output::Output) {
+        let Some(ws_idx) = self
+            .outputs
+            .iter()
+            .find(|ctx| &ctx.output == output)
+            .map(|ctx| ctx.active_workspace)
+        else {
+            return;
+        };
+        let Some(usable) = self.tiling_usable_geometry_for(output) else {
             return;
         };
 
-        let windows = &self.workspaces[self.active_workspace].windows;
+        let windows = &self.workspaces[ws_idx].windows;
         if windows.is_empty() {
             return;
         }
 
-        let tiled_windows = self.tiled_windows_in_workspace(self.active_workspace);
+        let tiled_windows = self.tiled_windows_in_workspace(ws_idx);
         if tiled_windows.is_empty() {
-            self.remap_floating_windows();
+            self.remap_floating_windows_for(ws_idx);
             return;
         }
         let tiled_roots: Vec<WlSurface> = tiled_windows
@@ -851,9 +907,9 @@ impl Beewm {
             .filter_map(Self::window_root_surface)
             .collect();
 
-        let keyed_geos =
-            self.layout_manager
-                .geometries(self.active_workspace, &usable, &tiled_roots);
+        let keyed_geos = self
+            .layout_manager
+            .geometries(ws_idx, &usable, &tiled_roots);
 
         let now = std::time::Instant::now();
         // Suppress animations entirely while a window owns the whole screen
@@ -905,6 +961,6 @@ impl Beewm {
             }
         }
         self.needs_render = true;
-        self.remap_floating_windows();
+        self.remap_floating_windows_for(ws_idx);
     }
 }

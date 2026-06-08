@@ -50,12 +50,7 @@ pub(in crate::compositor) fn surface_under(
     state: &Beewm,
     pos: Point<f64, Logical>,
 ) -> Option<(WlSurface, Point<f64, Logical>)> {
-    let output = state
-        .space
-        .output_under(pos)
-        .next()
-        .cloned()
-        .or_else(|| state.space.outputs().next().cloned())?;
+    let output = state.output_under_point(pos)?;
 
     // While locked, the pointer may only ever reach the lock surface — never a
     // window or layer-shell surface underneath. The lock surface is anchored at
@@ -154,8 +149,9 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     state: &mut Beewm,
     event: I::PointerMotionEvent,
 ) {
-    let output = match state.space.outputs().next() {
-        Some(o) => o.clone(),
+    state.notify_activity();
+    let output = match state.focused_output() {
+        Some(o) => o,
         None => return,
     };
 
@@ -263,23 +259,22 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     if state.config.focus_follows_mouse
         && !layer_surface_has_keyboard_focus(state)
         && !pointer_is_grabbed
+        && let Some((surface, _)) = under
     {
-        if let Some((surface, _)) = under {
-            let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
-                state.refresh_compositor_cursor();
-                return;
-            };
-            let Some(keyboard) = state.seat.get_keyboard() else {
-                return;
-            };
-            let already_focused = keyboard
-                .current_focus()
-                .as_ref()
-                .map(|f| *f == target)
-                .unwrap_or(false);
-            if !already_focused {
-                keyboard.set_focus(state, Some(target), serial);
-            }
+        let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
+            state.refresh_compositor_cursor();
+            return;
+        };
+        let Some(keyboard) = state.seat.get_keyboard() else {
+            return;
+        };
+        let already_focused = keyboard
+            .current_focus()
+            .as_ref()
+            .map(|f| *f == target)
+            .unwrap_or(false);
+        if !already_focused {
+            keyboard.set_focus(state, Some(target), serial);
         }
     }
 
@@ -290,8 +285,9 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
     state: &mut Beewm,
     event: I::PointerMotionAbsoluteEvent,
 ) {
-    let output = match state.space.outputs().next() {
-        Some(o) => o.clone(),
+    state.notify_activity();
+    let output = match state.focused_output() {
+        Some(o) => o,
         None => return,
     };
 
@@ -331,23 +327,22 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
     if state.config.focus_follows_mouse
         && !layer_surface_has_keyboard_focus(state)
         && !pointer_is_grabbed
+        && let Some((surface, _)) = under
     {
-        if let Some((surface, _)) = under {
-            let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
-                state.refresh_compositor_cursor();
-                return;
-            };
-            let Some(keyboard) = state.seat.get_keyboard() else {
-                return;
-            };
-            let already_focused = keyboard
-                .current_focus()
-                .as_ref()
-                .map(|f| *f == target)
-                .unwrap_or(false);
-            if !already_focused {
-                keyboard.set_focus(state, Some(target), serial);
-            }
+        let Some(target) = keyboard_focus_target_under_pointer(state, &surface) else {
+            state.refresh_compositor_cursor();
+            return;
+        };
+        let Some(keyboard) = state.seat.get_keyboard() else {
+            return;
+        };
+        let already_focused = keyboard
+            .current_focus()
+            .as_ref()
+            .map(|f| *f == target)
+            .unwrap_or(false);
+        if !already_focused {
+            keyboard.set_focus(state, Some(target), serial);
         }
     }
 
@@ -358,6 +353,8 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
     state: &mut Beewm,
     event: I::PointerButtonEvent,
 ) {
+    state.notify_activity();
+
     let serial = SERIAL_COUNTER.next_serial();
     let button = event.button_code();
     let btn_state = event.state();
@@ -403,10 +400,8 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
         }
     }
 
-    if button == BTN_RIGHT && btn_state == ButtonState::Released {
-        if finish_resize_grab(state) {
-            return;
-        }
+    if button == BTN_RIGHT && btn_state == ButtonState::Released && finish_resize_grab(state) {
+        return;
     }
 
     // Click-to-focus: on any button press with no compositor-level grab active,
@@ -414,30 +409,28 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
     // (via set_keyboard_focus) when the user clicks outside a popup.
     if btn_state == ButtonState::Pressed && state.active_grab.is_none() {
         let pos = state.pointer_location;
-        if let Some((surface, _)) = surface_under(state, pos) {
-            if let Some(target) = keyboard_focus_target_under_pointer(state, &surface) {
-                let x11_target = match &target {
-                    crate::compositor::focus_target::KeyboardFocusTarget::X11(x11) => {
-                        Some(x11.clone())
-                    }
-                    crate::compositor::focus_target::KeyboardFocusTarget::Wayland(_) => None,
-                };
-                if let Some(x11) = x11_target {
-                    // Keep XWayland's stacking in sync even when focus was
-                    // already on this window. Steam can keep the focus border
-                    // while an old sibling remains above it in the X server.
-                    state.raise_x11_window(&x11);
-                }
+        if let Some((surface, _)) = surface_under(state, pos)
+            && let Some(target) = keyboard_focus_target_under_pointer(state, &surface)
+        {
+            let x11_target = match &target {
+                crate::compositor::focus_target::KeyboardFocusTarget::X11(x11) => Some(x11.clone()),
+                crate::compositor::focus_target::KeyboardFocusTarget::Wayland(_) => None,
+            };
+            if let Some(x11) = x11_target {
+                // Keep XWayland's stacking in sync even when focus was
+                // already on this window. Steam can keep the focus border
+                // while an old sibling remains above it in the X server.
+                state.raise_x11_window(&x11);
+            }
 
-                let already_focused = state
-                    .seat
-                    .get_keyboard()
-                    .and_then(|kb| kb.current_focus())
-                    .map(|f| f == target)
-                    .unwrap_or(false);
-                if !already_focused {
-                    state.set_keyboard_focus_target(Some(target));
-                }
+            let already_focused = state
+                .seat
+                .get_keyboard()
+                .and_then(|kb| kb.current_focus())
+                .map(|f| f == target)
+                .unwrap_or(false);
+            if !already_focused {
+                state.set_keyboard_focus_target(Some(target));
             }
         }
     }
@@ -454,6 +447,52 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
             time: Event::time_msec(&event),
         },
     );
+    pointer.frame(state);
+}
+
+pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {
+    state.notify_activity();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+
+    let source = event.source();
+    let horizontal_amount = event.amount(Axis::Horizontal);
+    let vertical_amount = event.amount(Axis::Vertical);
+    let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
+    let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
+
+    let mut frame = AxisFrame::new(Event::time_msec(&event)).source(source);
+
+    if let Some(amount) = horizontal_amount {
+        if amount != 0.0 {
+            frame = frame.value(Axis::Horizontal, amount);
+            if let Some(discrete) = horizontal_amount_v120 {
+                frame = frame.v120(Axis::Horizontal, discrete as i32);
+            }
+        } else if source == AxisSource::Finger {
+            frame = frame.stop(Axis::Horizontal);
+        }
+    } else if let Some(discrete) = horizontal_amount_v120 {
+        frame = frame.value(Axis::Horizontal, discrete * 3.0 / 120.0);
+        frame = frame.v120(Axis::Horizontal, discrete as i32);
+    }
+
+    if let Some(amount) = vertical_amount {
+        if amount != 0.0 {
+            frame = frame.value(Axis::Vertical, amount);
+            if let Some(discrete) = vertical_amount_v120 {
+                frame = frame.v120(Axis::Vertical, discrete as i32);
+            }
+        } else if source == AxisSource::Finger {
+            frame = frame.stop(Axis::Vertical);
+        }
+    } else if let Some(discrete) = vertical_amount_v120 {
+        frame = frame.value(Axis::Vertical, discrete * 3.0 / 120.0);
+        frame = frame.v120(Axis::Vertical, discrete as i32);
+    }
+
+    pointer.axis(state, frame);
     pointer.frame(state);
 }
 
@@ -484,49 +523,4 @@ mod tests {
             LeftButtonReleaseAction::ForwardToClient
         );
     }
-}
-
-pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {
-    let Some(pointer) = state.seat.get_pointer() else {
-        return;
-    };
-
-    let source = event.source();
-    let horizontal_amount = event.amount(Axis::Horizontal);
-    let vertical_amount = event.amount(Axis::Vertical);
-    let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
-    let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
-
-    let mut frame = AxisFrame::new(Event::time_msec(&event)).source(source);
-
-    if let Some(amount) = horizontal_amount {
-        if amount != 0.0 {
-            frame = frame.value(Axis::Horizontal, amount);
-            if let Some(discrete) = horizontal_amount_v120 {
-                frame = frame.v120(Axis::Horizontal, discrete as i32);
-            }
-        } else if source == AxisSource::Finger {
-            frame = frame.stop(Axis::Horizontal);
-        }
-    } else if let Some(discrete) = horizontal_amount_v120 {
-        frame = frame.value(Axis::Horizontal, discrete as f64 * 3.0 / 120.0);
-        frame = frame.v120(Axis::Horizontal, discrete as i32);
-    }
-
-    if let Some(amount) = vertical_amount {
-        if amount != 0.0 {
-            frame = frame.value(Axis::Vertical, amount);
-            if let Some(discrete) = vertical_amount_v120 {
-                frame = frame.v120(Axis::Vertical, discrete as i32);
-            }
-        } else if source == AxisSource::Finger {
-            frame = frame.stop(Axis::Vertical);
-        }
-    } else if let Some(discrete) = vertical_amount_v120 {
-        frame = frame.value(Axis::Vertical, discrete as f64 * 3.0 / 120.0);
-        frame = frame.v120(Axis::Vertical, discrete as i32);
-    }
-
-    pointer.axis(state, frame);
-    pointer.frame(state);
 }
