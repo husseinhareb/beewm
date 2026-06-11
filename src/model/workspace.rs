@@ -7,6 +7,10 @@ pub struct Workspace<W = ()> {
     /// per workspace (not globally) so switching away from and back to a
     /// workspace preserves its fullscreen state.
     pub fullscreen: Option<W>,
+    /// Index into `Beewm.outputs` of the output this workspace is currently
+    /// homed on. Seeded to 0 in the single-output world; the per-output
+    /// workspace model reads this to decide which output a workspace renders on.
+    pub output: usize,
 }
 
 impl<W> Workspace<W> {
@@ -15,6 +19,7 @@ impl<W> Workspace<W> {
             windows: Vec::new(),
             focused_idx: None,
             fullscreen: None,
+            output: 0,
         }
     }
 

@@ -21,6 +21,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 xcursor = "0.3"
+# The settings tray is a real freedesktop StatusNotifierItem on the session
+# bus (like Spotify/Discord/nm-applet), served from a small Tokio runtime.
+zbus = { version = "4", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 # Aggressive release profile: cross-crate inlining + monomorphization-friendly
 # codegen so input → render hot paths fold into tight straight-line code. The

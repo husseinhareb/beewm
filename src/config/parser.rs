@@ -2,7 +2,9 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
 
-use super::{Action, Config, ConfigError, FocusDirection, Keybind, LayoutKind};
+use super::{
+    Action, Config, ConfigError, FocusDirection, Keybind, LayoutKind, OutputConfig, OutputModeSpec,
+};
 
 pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
     let defaults = Config::default();
@@ -82,6 +84,48 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let hz: u32 = parse_number(value, line_no, directive)?;
                 config.refresh_rate = Some(hz);
             }
+            "screen_timeout" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.screen_timeout = parse_number(value, line_no, directive)?;
+            }
+            // Primary, `key value` form — consistent with the rest of the config.
+            "tray_enabled" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.tray_enabled = parse_bool(value, line_no, directive)?;
+            }
+            "tray_corner" => {
+                return Err(ConfigError::Parse {
+                    line: line_no,
+                    message: "tray_corner was removed; tray placement is controlled by the \
+                              StatusNotifier host"
+                        .into(),
+                });
+            }
+            // Alias subcommand form: `tray enable | disable`.
+            "tray" => {
+                let sub = parts.next().ok_or_else(|| ConfigError::Parse {
+                    line: line_no,
+                    message: "tray requires an argument: enable | disable".into(),
+                })?;
+                match sub {
+                    "enable" | "on" | "true" => config.tray_enabled = true,
+                    "disable" | "off" | "false" => config.tray_enabled = false,
+                    "corner" => {
+                        return Err(ConfigError::Parse {
+                            line: line_no,
+                            message: "tray corner was removed; tray placement is controlled by \
+                                      the StatusNotifier host"
+                                .into(),
+                        });
+                    }
+                    other => {
+                        return Err(ConfigError::Parse {
+                            line: line_no,
+                            message: format!("unknown tray subcommand '{}'", other),
+                        });
+                    }
+                }
+            }
             "enable_animations" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.enable_animations = parse_bool(value, line_no, directive)?;
@@ -100,8 +144,7 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
             }
             "disable_animations_for_fullscreen" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
-                config.disable_animations_for_fullscreen =
-                    parse_bool(value, line_no, directive)?;
+                config.disable_animations_for_fullscreen = parse_bool(value, line_no, directive)?;
             }
             "open_animation_duration_ms" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
@@ -140,6 +183,14 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let rest = line[directive.len()..].trim();
                 config.keybinds.push(parse_keybind(rest, line_no)?);
             }
+            "output" => {
+                let output = parse_output_config(parts, line_no)?;
+                // Last stanza for a given connector wins.
+                config
+                    .outputs
+                    .retain(|existing| existing.name != output.name);
+                config.outputs.push(output);
+            }
             _ => {
                 return Err(ConfigError::Parse {
                     line: line_no,
@@ -154,6 +205,86 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
     }
 
     config.validate()
+}
+
+/// Parse `output <name> [position X Y] [mode WxH[@Hz]] [disable|enable]`.
+fn parse_output_config(
+    mut parts: std::str::SplitWhitespace,
+    line_no: usize,
+) -> Result<OutputConfig, ConfigError> {
+    let err = |message: String| ConfigError::Parse {
+        line: line_no,
+        message,
+    };
+    let name = parts
+        .next()
+        .ok_or_else(|| err("output requires a connector name".into()))?;
+    let mut output = OutputConfig {
+        name: name.to_string(),
+        enabled: true,
+        position: None,
+        mode: None,
+    };
+
+    while let Some(key) = parts.next() {
+        match key {
+            "position" | "pos" => {
+                let x = parts
+                    .next()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .ok_or_else(|| err("output position needs integer X Y".into()))?;
+                let y = parts
+                    .next()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .ok_or_else(|| err("output position needs integer X Y".into()))?;
+                output.position = Some((x, y));
+            }
+            "mode" | "resolution" => {
+                let spec = parts
+                    .next()
+                    .ok_or_else(|| err("output mode needs a WxH[@Hz] value".into()))?;
+                output.mode = Some(parse_mode_spec(spec, line_no)?);
+            }
+            "disable" | "off" => output.enabled = false,
+            "enable" | "on" => output.enabled = true,
+            other => {
+                return Err(err(format!("unknown output option '{}'", other)));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Parse a `WxH` or `WxH@Hz` mode string.
+fn parse_mode_spec(value: &str, line_no: usize) -> Result<OutputModeSpec, ConfigError> {
+    let err = |message: String| ConfigError::Parse {
+        line: line_no,
+        message,
+    };
+    let (dims, refresh) = match value.split_once('@') {
+        Some((dims, hz)) => {
+            let hz = hz
+                .parse::<u32>()
+                .map_err(|_| err(format!("invalid refresh rate in mode '{}'", value)))?;
+            (dims, Some(hz))
+        }
+        None => (value, None),
+    };
+    let (w, h) = dims
+        .split_once(['x', 'X'])
+        .ok_or_else(|| err(format!("mode '{}' must be WxH[@Hz]", value)))?;
+    let width = w
+        .parse::<i32>()
+        .map_err(|_| err(format!("invalid width in mode '{}'", value)))?;
+    let height = h
+        .parse::<i32>()
+        .map_err(|_| err(format!("invalid height in mode '{}'", value)))?;
+    Ok(OutputModeSpec {
+        width,
+        height,
+        refresh,
+    })
 }
 
 fn parse_command_value<'a>(
@@ -333,6 +464,14 @@ fn parse_action(action_text: &str, line_no: usize) -> Result<Action, ConfigError
         "focus_right" => Ok(Action::FocusDirection(FocusDirection::Right)),
         "focus_up" => Ok(Action::FocusDirection(FocusDirection::Up)),
         "focus_down" => Ok(Action::FocusDirection(FocusDirection::Down)),
+        "focus_output_left" => Ok(Action::FocusOutput(FocusDirection::Left)),
+        "focus_output_right" => Ok(Action::FocusOutput(FocusDirection::Right)),
+        "focus_output_up" => Ok(Action::FocusOutput(FocusDirection::Up)),
+        "focus_output_down" => Ok(Action::FocusOutput(FocusDirection::Down)),
+        "move_to_output_left" => Ok(Action::MoveWindowToOutput(FocusDirection::Left)),
+        "move_to_output_right" => Ok(Action::MoveWindowToOutput(FocusDirection::Right)),
+        "move_to_output_up" => Ok(Action::MoveWindowToOutput(FocusDirection::Up)),
+        "move_to_output_down" => Ok(Action::MoveWindowToOutput(FocusDirection::Down)),
         "close_window" | "kill" => Ok(Action::CloseWindow),
         "fullscreen" | "toggle_fullscreen" => Ok(Action::ToggleFullscreen),
         "float" | "toggle_float" => Ok(Action::ToggleFloat),

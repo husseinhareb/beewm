@@ -15,6 +15,7 @@ mod render;
 pub(crate) mod runtime_flags;
 mod screencopy;
 pub(crate) mod state;
+pub(crate) mod tray;
 pub mod types;
 
 pub use backend::{run_udev, run_winit};

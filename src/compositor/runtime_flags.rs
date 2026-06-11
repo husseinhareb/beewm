@@ -57,6 +57,25 @@ pub struct RuntimeFlags {
     /// callbacks from the vblank handler instead of right after the frame is
     /// queued for scan-out. Used to A/B test the frame-pacing fix.
     pub frame_callback_at_vblank: bool,
+    /// Opt-in: drive *every* connected connector as its own output instead of
+    /// only the first one. Off by default while the multi-head DRM backend
+    /// (per-CRTC `DrmCompositor` + per-vblank routing) is validated on real
+    /// dual-monitor hardware — with it unset beewm enumerates a single
+    /// connector exactly as before. Set `BEEWM_MULTI_OUTPUT=1` to enable.
+    pub multi_output_enabled: bool,
+    /// Opt-in: force-enable the StatusNotifier settings tray even when the
+    /// config has not set `tray enable`. The two are OR'd, so this is a quick way
+    /// to try the tray without editing the config. Set `BEEWM_TRAY=1`.
+    pub tray_enabled: bool,
+    /// Opt-in: allow the tray's Resolution/Refresh menu to perform a *live* DRM
+    /// modeset (rebuilds the connector's surface). Off by default because the
+    /// runtime modeset path is not yet hardware-validated; when unset the
+    /// request is logged and skipped. Set `BEEWM_LIVE_MODESET=1`.
+    pub live_modeset_enabled: bool,
+    /// Diagnostic: emit fsync'd breadcrumb logs around each DRM operation
+    /// (render / queue_frame / vblank) so the last line before a hard GPU wedge
+    /// survives an unclean reboot and names the hung call. Set `BEEWM_WEDGE_TRACE=1`.
+    pub wedge_trace: bool,
 }
 
 impl RuntimeFlags {
@@ -75,6 +94,10 @@ impl RuntimeFlags {
             animations_disabled: on("BEEWM_DISABLE_ANIMATIONS"),
             session_env_export_disabled: on("BEEWM_NO_SESSION_ENV_EXPORT"),
             frame_callback_at_vblank: on("BEEWM_FRAME_CALLBACK_AT_VBLANK"),
+            multi_output_enabled: on("BEEWM_MULTI_OUTPUT"),
+            tray_enabled: on("BEEWM_TRAY"),
+            live_modeset_enabled: on("BEEWM_LIVE_MODESET"),
+            wedge_trace: on("BEEWM_WEDGE_TRACE"),
         };
         if flags.focus_ipc_disabled
             || flags.workspace_publish_disabled
@@ -99,6 +122,21 @@ impl RuntimeFlags {
             tracing::warn!(
                 "BEEWM_FRAME_CALLBACK_AT_VBLANK set: using legacy at-vblank frame \
                  callbacks (no pipelining) — expect lower in-game FPS"
+            );
+        }
+        if flags.multi_output_enabled {
+            tracing::warn!(
+                "BEEWM_MULTI_OUTPUT set: enabling experimental multi-head output \
+                 enumeration (per-connector outputs) — validate scan-out/FPS on your hardware"
+            );
+        }
+        if flags.tray_enabled {
+            tracing::warn!("BEEWM_TRAY set: force-enabling the experimental settings tray icon");
+        }
+        if flags.live_modeset_enabled {
+            tracing::warn!(
+                "BEEWM_LIVE_MODESET set: enabling experimental runtime resolution/refresh \
+                 changes from the tray (rebuilds the output surface) — unvalidated on hardware"
             );
         }
         flags

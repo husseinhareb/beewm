@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use beewm::config::{Action, Config, ConfigError, FocusDirection, LayoutKind};
+use beewm::config::{
+    Action, Config, ConfigError, FocusDirection, LayoutKind, OutputConfig, OutputModeSpec,
+};
 
 fn remove_dir_all_if_exists(path: &Path) {
     if let Err(error) = std::fs::remove_dir_all(path) {
@@ -332,4 +334,133 @@ fn animation_duration_ms_sets_all_three() {
     assert_eq!(config.open_animation_duration_ms, 100);
     assert_eq!(config.close_animation_duration_ms, 100);
     assert_eq!(config.layout_animation_duration_ms, 100);
+}
+
+#[test]
+fn parses_output_directives() {
+    let config = Config::parse(
+        r#"
+        output eDP-1 position 0 0
+        output DP-3 position 2560 0 mode 2560x1440@165
+        output HDMI-A-1 disable
+        "#,
+    )
+    .expect("output config should parse");
+
+    assert_eq!(
+        config.outputs,
+        vec![
+            OutputConfig {
+                name: "eDP-1".into(),
+                enabled: true,
+                position: Some((0, 0)),
+                mode: None,
+            },
+            OutputConfig {
+                name: "DP-3".into(),
+                enabled: true,
+                position: Some((2560, 0)),
+                mode: Some(OutputModeSpec {
+                    width: 2560,
+                    height: 1440,
+                    refresh: Some(165),
+                }),
+            },
+            OutputConfig {
+                name: "HDMI-A-1".into(),
+                enabled: false,
+                position: None,
+                mode: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn output_mode_without_refresh_parses() {
+    let config = Config::parse("output DP-1 mode 1920x1080\n").expect("should parse");
+    assert_eq!(
+        config.outputs[0].mode,
+        Some(OutputModeSpec {
+            width: 1920,
+            height: 1080,
+            refresh: None,
+        })
+    );
+}
+
+#[test]
+fn later_output_stanza_replaces_earlier_for_same_connector() {
+    let config = Config::parse("output DP-1 position 0 0\noutput DP-1 position 100 200 disable\n")
+        .expect("should parse");
+    assert_eq!(config.outputs.len(), 1);
+    assert_eq!(config.outputs[0].position, Some((100, 200)));
+    assert!(!config.outputs[0].enabled);
+}
+
+#[test]
+fn rejects_unknown_output_option() {
+    let error = Config::parse("output DP-1 bogus\n").unwrap_err();
+    assert!(matches!(error, ConfigError::Parse { .. }));
+}
+
+#[test]
+fn tray_is_enabled_by_default_and_can_be_disabled() {
+    let config = Config::parse("layout dwindle\n").expect("should parse");
+    assert!(config.tray_enabled);
+
+    let off = Config::parse("tray disable\n").expect("should parse");
+    assert!(!off.tray_enabled);
+
+    // `key value` form (consistent with the rest of the config) is also accepted.
+    let kv_off = Config::parse("tray_enabled false\n").expect("should parse");
+    assert!(!kv_off.tray_enabled);
+}
+
+#[test]
+fn parses_tray_enable() {
+    let config = Config::parse("tray enable\n").expect("should parse");
+    assert!(config.tray_enabled);
+}
+
+#[test]
+fn tray_disable_turns_it_off() {
+    let config = Config::parse("tray enable\ntray disable\n").expect("should parse");
+    assert!(!config.tray_enabled);
+}
+
+#[test]
+fn rejects_removed_tray_corner_directives() {
+    let error = Config::parse("tray corner bottom_left\n").unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::Parse {
+            message,
+            ..
+        } if message.contains("tray corner was removed")
+    ));
+
+    let error = Config::parse("tray_corner bottom_left\n").unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::Parse {
+            message,
+            ..
+        } if message.contains("tray_corner was removed")
+    ));
+}
+
+#[test]
+fn rejects_unknown_tray_subcommand() {
+    let error = Config::parse("tray bogus\n").unwrap_err();
+    assert!(matches!(error, ConfigError::Parse { .. }));
+}
+
+#[test]
+fn screen_timeout_defaults_and_parses() {
+    assert_eq!(Config::default().screen_timeout, 600);
+    let config = Config::parse("screen_timeout 120\n").expect("should parse");
+    assert_eq!(config.screen_timeout, 120);
+    let off = Config::parse("screen_timeout 0\n").expect("should parse");
+    assert_eq!(off.screen_timeout, 0);
 }
