@@ -109,6 +109,14 @@ pub struct Config {
     /// Seconds of inactivity before the screen blanks (DPMS off). `0` disables
     /// blanking entirely. Also settable live from the tray's Screen-timeout menu.
     pub screen_timeout: u32,
+    /// Command used to start the ext-session-lock client. The compositor enters
+    /// its secure locked state before spawning this process, so a failed locker
+    /// leaves a black locked screen rather than exposing the session.
+    pub lock_command: String,
+    /// Lock before system suspend is allowed to continue.
+    pub lock_on_suspend: bool,
+    /// Keep the resumed session locked until the lock client authenticates.
+    pub lock_on_resume: bool,
     /// Per-output configuration from `output <name> …` directives.
     pub outputs: Vec<OutputConfig>,
     pub autostart_commands: Vec<String>,
@@ -150,6 +158,9 @@ impl Default for Config {
             refresh_rate: None,
             tray_enabled: true,
             screen_timeout: 600,
+            lock_command: "beelock".to_string(),
+            lock_on_suspend: true,
+            lock_on_resume: true,
             outputs: Vec::new(),
             autostart_commands: Vec::new(),
             keybinds: Self::default_keybinds_for(num_workspaces),
@@ -426,6 +437,10 @@ impl Config {
         text.push_str("# tray_enabled false\n");
         text.push_str("# Seconds of inactivity before the screen blanks (DPMS off); 0 = never.\n");
         text.push_str(&format!("screen_timeout {}\n", default.screen_timeout));
+        text.push_str("# Lock command used on suspend/resume; must support ext-session-lock-v1.\n");
+        text.push_str(&format!("lock_command {}\n", default.lock_command));
+        text.push_str(&format!("lock_on_suspend {}\n", default.lock_on_suspend));
+        text.push_str(&format!("lock_on_resume {}\n", default.lock_on_resume));
         text.push('\n');
         text.push_str(
             "# Multi-monitor: arrange outputs by connector name (DP-3, eDP-1, HDMI-A-1).\n",

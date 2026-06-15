@@ -88,6 +88,17 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.screen_timeout = parse_number(value, line_no, directive)?;
             }
+            "lock_command" => {
+                config.lock_command = parse_command_value(&line, directive, line_no)?.to_string();
+            }
+            "lock_on_suspend" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.lock_on_suspend = parse_bool(value, line_no, directive)?;
+            }
+            "lock_on_resume" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.lock_on_resume = parse_bool(value, line_no, directive)?;
+            }
             // Primary, `key value` form — consistent with the rest of the config.
             "tray_enabled" => {
                 let value = expect_single_argument(parts, line_no, directive)?;

@@ -464,3 +464,21 @@ fn screen_timeout_defaults_and_parses() {
     let off = Config::parse("screen_timeout 0\n").expect("should parse");
     assert_eq!(off.screen_timeout, 0);
 }
+
+#[test]
+fn lock_settings_default_and_parse() {
+    let default = Config::default();
+    assert_eq!(default.lock_command, "beelock");
+    assert!(default.lock_on_suspend);
+    assert!(default.lock_on_resume);
+
+    let config = Config::parse(
+        "lock_command swaylock --daemonize\n\
+         lock_on_suspend false\n\
+         lock_on_resume true\n",
+    )
+    .expect("should parse");
+    assert_eq!(config.lock_command, "swaylock --daemonize");
+    assert!(!config.lock_on_suspend);
+    assert!(config.lock_on_resume);
+}
