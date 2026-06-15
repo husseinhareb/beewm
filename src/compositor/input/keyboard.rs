@@ -57,6 +57,11 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
             FilterResult::Forward
         },
     );
+
+    // XKB state is now up to date for this key; let event-socket subscribers
+    // (bars) know if the lock/Shift status changed. The physical LEDs are
+    // handled separately via `SeatHandler::led_state_changed`.
+    state.publish_keyboard_status();
 }
 
 fn match_keybind(

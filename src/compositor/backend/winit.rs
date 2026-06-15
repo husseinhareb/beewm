@@ -271,7 +271,11 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     .map(crate::compositor::state::focused_window_title)
                     .unwrap_or_default();
                 let workspace_num = data.state.active_workspace() + 1;
-                let initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
+                let mut initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
+                if let Some(status) = data.state.keyboard_status() {
+                    initial.push_str(&status.event_payload());
+                    initial.push('\n');
+                }
                 data.state.event_broadcaster.add_subscriber(stream, initial);
             }
             ChannelEvent::Closed => {

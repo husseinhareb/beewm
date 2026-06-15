@@ -1,5 +1,6 @@
 mod grab;
 mod keyboard;
+pub mod leds;
 mod pointer;
 
 use smithay::backend::input::{InputBackend, InputEvent};

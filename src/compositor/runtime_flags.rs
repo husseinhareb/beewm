@@ -13,6 +13,7 @@
 //! | `BEEWM_NO_DMABUF`              | wp_linux_dmabuf global (force shm clients) |
 //! | `BEEWM_DISABLE_ANIMATIONS`     | All compositor-driven window animations    |
 //! | `BEEWM_NO_SESSION_ENV_EXPORT`  | Pushing session env to D-Bus/systemd (portals) |
+//! | `BEEWM_NO_KEYBOARD_LEDS`       | Lock-key LED writes to physical keyboards  |
 //!
 //! These exist purely as a debugging aid; once the freeze is root-caused
 //! they should all be removed (or promoted to real config options).
@@ -53,6 +54,11 @@ pub struct RuntimeFlags {
     /// portal find the display; this switch exists only to isolate problems
     /// (e.g. a hanging `systemctl`/`dbus-update-activation-environment`).
     pub session_env_export_disabled: bool,
+    /// When true, never write lock-key LED state (Caps/Num/Scroll) to
+    /// physical keyboards. The writes are tiny libinput calls made while
+    /// processing key events; this switch isolates them when debugging
+    /// input-path stalls or misbehaving keyboard firmware.
+    pub keyboard_leds_disabled: bool,
     /// When true, restore the legacy behaviour of sending `wl_surface.frame`
     /// callbacks from the vblank handler instead of right after the frame is
     /// queued for scan-out. Used to A/B test the frame-pacing fix.
@@ -93,6 +99,7 @@ impl RuntimeFlags {
             dmabuf_disabled: on("BEEWM_NO_DMABUF"),
             animations_disabled: on("BEEWM_DISABLE_ANIMATIONS"),
             session_env_export_disabled: on("BEEWM_NO_SESSION_ENV_EXPORT"),
+            keyboard_leds_disabled: on("BEEWM_NO_KEYBOARD_LEDS"),
             frame_callback_at_vblank: on("BEEWM_FRAME_CALLBACK_AT_VBLANK"),
             multi_output_enabled: on("BEEWM_MULTI_OUTPUT"),
             tray_enabled: on("BEEWM_TRAY"),
@@ -106,9 +113,10 @@ impl RuntimeFlags {
             || flags.dmabuf_disabled
             || flags.animations_disabled
             || flags.session_env_export_disabled
+            || flags.keyboard_leds_disabled
         {
             tracing::warn!(
-                "BEEWM runtime kill-switches active: focus_ipc_disabled={} workspace_publish_disabled={} event_broadcaster_disabled={} explicit_sync_disabled={} dmabuf_disabled={} animations_disabled={} session_env_export_disabled={}",
+                "BEEWM runtime kill-switches active: focus_ipc_disabled={} workspace_publish_disabled={} event_broadcaster_disabled={} explicit_sync_disabled={} dmabuf_disabled={} animations_disabled={} session_env_export_disabled={} keyboard_leds_disabled={}",
                 flags.focus_ipc_disabled,
                 flags.workspace_publish_disabled,
                 flags.event_broadcaster_disabled,
@@ -116,6 +124,7 @@ impl RuntimeFlags {
                 flags.dmabuf_disabled,
                 flags.animations_disabled,
                 flags.session_env_export_disabled,
+                flags.keyboard_leds_disabled,
             );
         }
         if flags.frame_callback_at_vblank {
