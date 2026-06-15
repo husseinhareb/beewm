@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use beewm::{config::Config, run_udev, run_winit};
@@ -34,22 +36,52 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SyncWriter {
     }
 }
 
+fn absolute_nonempty_path(value: Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    path.is_absolute().then_some(path)
+}
+
+fn log_dir_from_env(xdg_state_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(mut path) = absolute_nonempty_path(xdg_state_home) {
+        path.push("beewm");
+        path.push("log");
+        return path;
+    }
+
+    if let Some(mut path) = absolute_nonempty_path(home) {
+        path.push(".local");
+        path.push("state");
+        path.push("beewm");
+        path.push("log");
+        return path;
+    }
+
+    PathBuf::from("/var/tmp/beewm/log")
+}
+
+fn default_log_dir() -> PathBuf {
+    log_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+fn default_log_path() -> PathBuf {
+    let mut path = default_log_dir();
+    path.push("beewm-debug.log");
+    path
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let has_display =
         std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
 
-    // Log to a PERSISTENT, fsync'd file under $HOME so the trail survives a hard
+    // Log to a persistent, fsync'd XDG state log so the trail survives a hard
     // reboot after a GPU wedge (/tmp is usually tmpfs and is lost on reboot).
     // Default filter is verbose for the beewm crate, quiet for smithay; RUST_LOG
     // overrides — e.g. `RUST_LOG=warn,beewm=debug`.
-    use std::fs::OpenOptions;
-    let log_path = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .map(|mut p| {
-            p.push("beewm-debug.log");
-            p
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/beewm.log"));
+    use std::fs::{self, OpenOptions};
+    let log_path = default_log_path();
+    if let Some(log_dir) = log_path.parent() {
+        fs::create_dir_all(log_dir)?;
+    }
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -89,4 +121,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("beewm exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_dir_prefers_xdg_state_home() {
+        let dir = log_dir_from_env(Some("/run/user-state".into()), Some("/home/alice".into()));
+
+        assert_eq!(dir, PathBuf::from("/run/user-state/beewm/log"));
+    }
+
+    #[test]
+    fn log_dir_falls_back_to_xdg_state_default_under_home() {
+        let dir = log_dir_from_env(None, Some("/home/alice".into()));
+
+        assert_eq!(dir, PathBuf::from("/home/alice/.local/state/beewm/log"));
+    }
+
+    #[test]
+    fn relative_xdg_state_home_is_ignored() {
+        let dir = log_dir_from_env(Some("relative-state".into()), Some("/home/alice".into()));
+
+        assert_eq!(dir, PathBuf::from("/home/alice/.local/state/beewm/log"));
+    }
 }
