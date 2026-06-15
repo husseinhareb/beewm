@@ -147,7 +147,10 @@ impl WindowAnimation {
     /// (content uncovered/covered from the top-left). Non-reveal animations
     /// (`GeometryChange`) scale the buffer into the visual rect instead.
     pub fn is_reveal(&self) -> bool {
-        matches!(self.kind, WindowAnimationKind::Open | WindowAnimationKind::Close)
+        matches!(
+            self.kind,
+            WindowAnimationKind::Open | WindowAnimationKind::Close
+        )
     }
 }
 

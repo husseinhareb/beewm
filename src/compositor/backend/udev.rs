@@ -25,7 +25,9 @@ use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationT
 use smithay::reexports::drm::control::{
     Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, connector, crtc,
 };
-use smithay::reexports::input::{Libinput, ScrollMethod};
+use smithay::reexports::input::{
+    Device as LibinputDevice, DeviceCapability, Libinput, ScrollMethod,
+};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Logical, Point, Transform};
@@ -42,8 +44,10 @@ use crate::compositor::feedback::{
     collect_presentation_feedback, output_frame_interval, send_frame_callbacks,
     update_primary_scanout_output,
 };
+use crate::compositor::input::leds::LedDeviceRegistry;
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
+use crate::compositor::power::{PowerEvent, PowerState};
 use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
@@ -157,6 +161,8 @@ impl FrameStats {
 struct UdevData {
     state: Beewm,
     gpu: Option<GpuData>,
+    power_state: PowerState,
+    resume_lock_pending: bool,
     /// Owned so we can call flush_clients() anywhere in the main loop.
     display: Display<Beewm>,
 }
@@ -234,6 +240,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let state = Beewm::new(&display, config);
     let (_ipc_server, ipc_channel) = ipc::start()?;
     let (_event_server, event_channel) = ipc::start_event_listener()?;
+    let (power_tx, power_rx) = smithay::reexports::calloop::channel::channel::<PowerEvent>();
 
     // Clone the display fd before moving display into UdevData — used to
     // wake calloop when clients send data.
@@ -245,6 +252,8 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut data = UdevData {
         state,
         gpu: None,
+        power_state: PowerState::Awake,
+        resume_lock_pending: false,
         display,
     };
 
@@ -277,36 +286,10 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .handle()
         .insert_source(notifier, |event, _, data| match event {
             SessionEvent::PauseSession => {
-                tracing::info!("Session paused");
-                if let Some(gpu) = data.gpu.as_mut() {
-                    gpu.drm_device.pause();
-                    for surface in &mut gpu.surfaces {
-                        surface.can_render = false;
-                    }
-                }
-                data.state.needs_render = false;
+                handle_session_paused(data);
             }
             SessionEvent::ActivateSession => {
-                tracing::info!("Session activated");
-                if let Some(gpu) = data.gpu.as_mut() {
-                    if let Err(err) = gpu.drm_device.activate(true) {
-                        tracing::error!("Failed to reactivate DRM device: {}", err);
-                        for surface in &mut gpu.surfaces {
-                            surface.can_render = false;
-                        }
-                        return;
-                    }
-                    for surface in &mut gpu.surfaces {
-                        if let Err(err) = surface.compositor.reset_state() {
-                            tracing::error!(
-                                "Failed to reset compositor state after reactivation: {}",
-                                err
-                            );
-                        }
-                        surface.can_render = true;
-                    }
-                }
-                data.state.needs_render = true;
+                handle_session_activated(data);
             }
         })?;
 
@@ -386,11 +369,39 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     .map(crate::compositor::state::focused_window_title)
                     .unwrap_or_default();
                 let workspace_num = data.state.active_workspace() + 1;
-                let initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
+                let mut initial = format!("window>>{title}\nworkspace>>{workspace_num}\n");
+                if let Some(status) = data.state.keyboard_status() {
+                    initial.push_str(&status.event_payload());
+                    initial.push('\n');
+                }
                 data.state.event_broadcaster.add_subscriber(stream, initial);
             }
             ChannelEvent::Closed => {
                 tracing::warn!("Event socket channel closed");
+            }
+        })?;
+
+    if let Err(error) = crate::compositor::power::start_logind_sleep_monitor(power_tx) {
+        tracing::debug!(
+            target: "beewm::power",
+            %error,
+            "failed to start logind sleep monitor thread",
+        );
+    }
+    event_loop
+        .handle()
+        .insert_source(power_rx, |event, _, data: &mut UdevData| match event {
+            ChannelEvent::Msg(PowerEvent::PrepareSuspend { ack }) => {
+                handle_prepare_suspend(data, "logind");
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
+            ChannelEvent::Msg(PowerEvent::Resume) => {
+                handle_resume(data, "logind");
+            }
+            ChannelEvent::Closed => {
+                tracing::debug!(target: "beewm::power", "logind sleep monitor channel closed");
             }
         })?;
 
@@ -443,12 +454,40 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to assign libinput seat")?;
 
     let libinput_backend = LibinputInputBackend::new(libinput_context);
+
+    // Track every libinput keyboard so lock-LED updates (Caps/Num/Scroll)
+    // reach all of them. The hotplug arms below maintain the device list
+    // through one clone of the registry; the clone installed in compositor
+    // state is what `SeatHandler::led_state_changed` writes through.
+    let keyboards: LedDeviceRegistry<LibinputDevice> = LedDeviceRegistry::new();
+    let leds_enabled = !crate::compositor::runtime_flags::flags().keyboard_leds_disabled;
+    if leds_enabled {
+        data.state
+            .keyboard_leds
+            .install_controller(Box::new(keyboards.clone()));
+    } else {
+        tracing::warn!("Keyboard LED sync disabled by BEEWM_NO_KEYBOARD_LEDS");
+    }
+
     event_loop
         .handle()
-        .insert_source(libinput_backend, |event, _, data| {
-            // Tap-to-click is a libinput-specific feature; configure it as
-            // devices appear (e.g. touchpad at startup or on hotplug).
-            if let InputEvent::DeviceAdded { mut device } = event {
+        .insert_source(libinput_backend, move |event, _, data| match event {
+            InputEvent::DeviceAdded { mut device } => {
+                // A keyboard that just (re)appeared carries whatever LED
+                // state firmware or a previous VT owner left; sync it to the
+                // compositor's XKB state and track it for future updates.
+                if leds_enabled && device.has_capability(DeviceCapability::Keyboard) {
+                    let current = data
+                        .state
+                        .seat
+                        .get_keyboard()
+                        .map(|keyboard| keyboard.led_state().into())
+                        .unwrap_or_default();
+                    keyboards.add_device(device.clone(), current);
+                }
+
+                // Tap-to-click is a libinput-specific feature; configure it as
+                // devices appear (e.g. touchpad at startup or on hotplug).
                 let is_touchpad = device.config_tap_finger_count() > 0;
                 if is_touchpad {
                     // Tap-to-click
@@ -484,9 +523,13 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-                return;
             }
-            crate::compositor::input::handle_input(&mut data.state, event);
+            InputEvent::DeviceRemoved { device } => {
+                if leds_enabled && device.has_capability(DeviceCapability::Keyboard) {
+                    keyboards.remove_device(&device);
+                }
+            }
+            event => crate::compositor::input::handle_input(&mut data.state, event),
         })?;
 
     // --- Udev: enumerate GPUs ---
@@ -645,6 +688,141 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn handle_session_paused(data: &mut UdevData) {
+    tracing::info!(target: "beewm::power", "session paused");
+    data.power_state = data.power_state.suspended();
+    pause_drm(data);
+}
+
+fn handle_session_activated(data: &mut UdevData) {
+    tracing::info!(target: "beewm::power", "session activated");
+    handle_resume(data, "libseat");
+}
+
+fn handle_prepare_suspend(data: &mut UdevData, source: &'static str) {
+    data.power_state = data.power_state.prepare_suspend();
+    tracing::info!(
+        target: "beewm::power",
+        source,
+        state = ?data.power_state,
+        "preparing suspend/session pause",
+    );
+
+    if data.state.config.lock_on_suspend {
+        data.state.secure_lock("suspend");
+        data.resume_lock_pending = true;
+        if let Err(err) = data.display.flush_clients() {
+            tracing::warn!("Failed to flush Wayland clients before suspend: {}", err);
+        }
+    } else if data.state.config.lock_on_resume || data.state.locked {
+        data.resume_lock_pending = true;
+    }
+}
+
+fn handle_resume(data: &mut UdevData, source: &'static str) {
+    let next = data.power_state.resume();
+    if next == PowerState::Awake {
+        return;
+    }
+    data.power_state = next;
+    tracing::info!(
+        target: "beewm::power",
+        source,
+        state = ?data.power_state,
+        "resuming session",
+    );
+
+    let resume_lock_pending = data.resume_lock_pending;
+    data.resume_lock_pending = false;
+    data.state.secure_resume_lock(resume_lock_pending);
+    let activated = activate_drm(data);
+    // `secure_resume_lock` may have queued DPMS-on work if the screen timed out
+    // before suspend. Apply it before the first forced render.
+    process_backend_requests(data);
+
+    if activated {
+        if crate::compositor::runtime_flags::flags().multi_output_enabled {
+            rescan_connectors(data);
+        }
+        data.power_state = PowerState::Awake;
+        tracing::info!(target: "beewm::power", "resume completed");
+    } else {
+        data.power_state = PowerState::Degraded;
+        tracing::error!(
+            target: "beewm::power",
+            "resume degraded: DRM activation failed; compositor remains alive and locked",
+        );
+    }
+
+    force_frame(data);
+    if let Err(err) = data.display.flush_clients() {
+        tracing::warn!("Failed to flush Wayland clients after resume: {}", err);
+    }
+}
+
+fn pause_drm(data: &mut UdevData) {
+    let mut callback_outputs = Vec::new();
+    if let Some(gpu) = data.gpu.as_mut() {
+        tracing::info!(target: "beewm::power", "pausing DRM device");
+        gpu.drm_device.pause();
+        for surface in &mut gpu.surfaces {
+            surface.can_render = false;
+            surface.pending_presentation_feedback = None;
+            callback_outputs.push(surface.output.clone());
+        }
+    }
+
+    let elapsed = data.state.start_time.elapsed();
+    for output in callback_outputs {
+        send_frame_callbacks(&mut data.state, &output, elapsed, None);
+    }
+    data.state.last_frame_callbacks_sent_at = Some(Instant::now());
+    data.state.needs_render = false;
+}
+
+fn activate_drm(data: &mut UdevData) -> bool {
+    let Some(gpu) = data.gpu.as_mut() else {
+        return true;
+    };
+
+    if let Err(err) = gpu.drm_device.activate(true) {
+        tracing::error!(target: "beewm::power", "failed to reactivate DRM device: {}", err);
+        for surface in &mut gpu.surfaces {
+            surface.can_render = false;
+        }
+        return false;
+    }
+
+    for surface in &mut gpu.surfaces {
+        if let Err(err) = surface.compositor.reset_state() {
+            tracing::error!(
+                target: "beewm::power",
+                output = %surface.output.name(),
+                "failed to reset compositor state after resume: {}",
+                err,
+            );
+        }
+        surface.can_render = true;
+        surface.pending_presentation_feedback = None;
+        surface.frame_stats = FrameStats::new();
+        surface.present_stats = PresentStats::new();
+    }
+
+    // Whoever owned the VT meanwhile (firmware, agetty, another compositor)
+    // may have rewritten keyboard LEDs; force one re-push.
+    data.state.keyboard_leds.invalidate();
+    data.state.sync_keyboard_leds();
+    data.state.needs_render = true;
+    true
+}
+
+fn force_frame(data: &mut UdevData) {
+    if data.gpu.is_some() && !data.state.blanked {
+        data.state.needs_render = false;
+        render_frame(data);
+    }
 }
 
 /// Apply queued backend work that needs DRM access (currently DPMS for the

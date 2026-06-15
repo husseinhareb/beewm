@@ -23,12 +23,11 @@ use smithay::input::pointer::{
     GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
 };
 use smithay::input::touch::{
-    DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget,
-    UpEvent,
+    DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget, UpEvent,
 };
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{IsAlive, Serial};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::xwayland::X11Surface;
@@ -49,9 +48,7 @@ impl KeyboardFocusTarget {
         if let Some(x11) = window.x11_surface().cloned() {
             return Some(Self::X11(x11));
         }
-        window
-            .wl_surface()
-            .map(|s| Self::Wayland(s.into_owned()))
+        window.wl_surface().map(|s| Self::Wayland(s.into_owned()))
     }
 }
 
@@ -294,12 +291,7 @@ impl PointerTarget<Beewm> for KeyboardFocusTarget {
         }
     }
 
-    fn gesture_hold_end(
-        &self,
-        seat: &Seat<Beewm>,
-        data: &mut Beewm,
-        event: &GestureHoldEndEvent,
-    ) {
+    fn gesture_hold_end(&self, seat: &Seat<Beewm>, data: &mut Beewm, event: &GestureHoldEndEvent) {
         if let Some(s) = self.wl_surface() {
             PointerTarget::gesture_hold_end(&*s, seat, data, event);
         }

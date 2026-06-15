@@ -11,6 +11,7 @@ mod handlers;
 mod input;
 mod ipc;
 mod layering;
+pub(crate) mod power;
 mod render;
 pub(crate) mod runtime_flags;
 mod screencopy;
@@ -19,6 +20,10 @@ pub(crate) mod tray;
 pub mod types;
 
 pub use backend::{run_udev, run_winit};
+pub use input::leds::{
+    KeyboardLedController, KeyboardLedState, KeyboardLeds, KeyboardStatus, LedDevice,
+    LedDeviceRegistry,
+};
 pub use input::{resize_edges_for_pointer, resized_window_geometry_from_start};
 pub use layering::{
     layers_hit_tested_after_windows, layers_hit_tested_before_windows,

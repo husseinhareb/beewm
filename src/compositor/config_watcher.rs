@@ -10,16 +10,20 @@ use std::path::Path;
 /// Watching the directory (rather than the file itself) handles atomic-rename
 /// saves from editors like Vim, which write a temp file then rename it into
 /// place — triggering `IN_MOVED_TO` rather than `IN_CLOSE_WRITE`.
-pub fn make_config_watch_fd(
-    config_path: &Path,
-) -> Result<(OwnedFd, OsString), std::io::Error> {
+pub fn make_config_watch_fd(config_path: &Path) -> Result<(OwnedFd, OsString), std::io::Error> {
     let dir = config_path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "config path has no parent directory")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no parent directory",
+        )
     })?;
     let filename = config_path
         .file_name()
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "config path has no filename")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "config path has no filename",
+            )
         })?
         .to_os_string();
 
@@ -30,7 +34,10 @@ pub fn make_config_watch_fd(
     let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
     let dir_cstr = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "config directory path contains a null byte")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config directory path contains a null byte",
+        )
     })?;
 
     let wd = unsafe {
@@ -61,9 +68,7 @@ pub fn drain_config_event(fd: BorrowedFd<'_>, config_filename: &OsStr) -> bool {
     let mut found = false;
 
     loop {
-        let n = unsafe {
-            libc::read(fd.as_raw_fd(), buf.0.as_mut_ptr().cast(), buf.0.len())
-        };
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.0.as_mut_ptr().cast(), buf.0.len()) };
 
         if n <= 0 {
             // EAGAIN / EOF: no more events right now.
@@ -74,9 +79,7 @@ pub fn drain_config_event(fd: BorrowedFd<'_>, config_filename: &OsStr) -> bool {
         let mut offset = 0;
 
         while offset + mem::size_of::<libc::inotify_event>() <= n {
-            let event = unsafe {
-                &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event)
-            };
+            let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
             let name_len = event.len as usize;
             let event_size = mem::size_of::<libc::inotify_event>() + name_len;
 
@@ -90,7 +93,9 @@ pub fn drain_config_event(fd: BorrowedFd<'_>, config_filename: &OsStr) -> bool {
                 && offset + event_size <= n
             {
                 let name_ptr = unsafe {
-                    buf.0.as_ptr().add(offset + mem::size_of::<libc::inotify_event>())
+                    buf.0
+                        .as_ptr()
+                        .add(offset + mem::size_of::<libc::inotify_event>())
                 };
                 let name_bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
                 // The name field is null-terminated and may include padding bytes.

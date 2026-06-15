@@ -26,6 +26,7 @@ use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, Window, WindowSurfaceType,
 };
 use smithay::desktop::utils::surface_primary_scanout_output;
+use smithay::input::keyboard::LedState;
 use smithay::input::pointer::{CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
@@ -741,6 +742,13 @@ impl SeatHandler for Beewm {
             tracing::warn!(target: "beewm::wedge", "focus_changed: done");
         }
     }
+
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        // Smithay fires this after XKB has processed a key event or a keymap
+        // change (config reload) that toggled a lock indicator. Push the new
+        // state to physical keyboards through the active backend.
+        self.keyboard_leds.apply(led_state.into());
+    }
 }
 
 impl OutputHandler for Beewm {
@@ -866,6 +874,7 @@ impl SessionLockHandler for Beewm {
         tracing::info!(target: "beewm::lock", "Session unlock requested by lock client");
         self.locked = false;
         self.lock_surfaces.clear();
+        self.lock_client_last_spawn = None;
         // Hand keyboard focus back to the active window.
         self.focus_current_window();
         self.needs_render = true;
@@ -892,6 +901,7 @@ impl SessionLockHandler for Beewm {
         // these keys reach only the lock client.
         let wl_surface = surface.wl_surface().clone();
         self.lock_surfaces.insert(output, surface);
+        self.lock_client_last_spawn = None;
 
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         if let Some(keyboard) = self.seat.get_keyboard() {

@@ -25,11 +25,12 @@ use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::channel::Sender;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, GlobalId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::IsAlive;
-use smithay::utils::{Clock, Logical, Monotonic, Point};
+use smithay::utils::{Clock, Logical, Monotonic, Point, Size};
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorState, add_blocker, add_pre_commit_hook, get_parent,
     with_states,
@@ -45,6 +46,7 @@ use smithay::wayland::pointer_constraints::{
 };
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState};
@@ -64,9 +66,10 @@ use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
 use crate::xwayland::PendingX11Window;
 
-use super::commands::ChildEnvironment;
+use super::commands::{ChildEnvironment, spawn_shell_command};
 use super::diagnostics::{CommitTracker, SyncStats};
 use super::event_broadcast::EventBroadcaster;
+use super::input::leds::{KeyboardLeds, KeyboardStatus};
 use super::screencopy::{PendingScreencopyFrame, create_screencopy_global};
 
 use super::cursor::CursorThemeManager;
@@ -176,6 +179,14 @@ pub struct Beewm {
     pub presentation_clock: Clock<Monotonic>,
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
+    /// Lock-key LED plumbing: the backend controller (installed by the udev
+    /// backend, libinput-backed) plus the last-applied cache. The nested
+    /// winit backend installs no controller — the host compositor owns the
+    /// keyboards — so LED writes are a safe no-op there.
+    pub keyboard_leds: KeyboardLeds,
+    /// Last `keyboard>>…` lock/Shift snapshot pushed to the event socket,
+    /// so subscribers only hear about actual changes.
+    pub(crate) last_keyboard_status: Option<KeyboardStatus>,
 
     // Pointer
     pub pointer_location: Point<f64, Logical>,
@@ -212,6 +223,9 @@ pub struct Beewm {
     /// Per-output lock surfaces supplied by the lock client. Absence of a
     /// surface for a locked output means that output renders solid black.
     pub lock_surfaces: HashMap<Output, LockSurface>,
+    /// Last attempt to spawn the configured lock client. Used to avoid a tight
+    /// respawn loop if the command is missing or exits immediately.
+    pub(crate) lock_client_last_spawn: Option<Instant>,
 
     // Desktop management
     pub space: Space<Window>,
@@ -429,6 +443,8 @@ impl Beewm {
             presentation_clock,
             seat_state,
             seat,
+            keyboard_leds: KeyboardLeds::new(),
+            last_keyboard_status: None,
             pointer_location: Point::from((0.0, 0.0)),
             cursor_status_serial: 0,
             cursor_status: CursorImageStatus::default_named(),
@@ -441,6 +457,7 @@ impl Beewm {
             session: None,
             locked: false,
             lock_surfaces: HashMap::new(),
+            lock_client_last_spawn: None,
             space: Space::default(),
             layout_manager,
             tiled_swap_layout_snapshot: None,
@@ -776,6 +793,138 @@ impl Beewm {
         }
     }
 
+    /// Enter the compositor-enforced secure lock state and start the configured
+    /// session-lock client if needed.
+    ///
+    /// This does not wait for the lock client to draw. Until a real lock
+    /// surface exists the renderer shows solid black, and input is prevented
+    /// from reaching normal clients by `locked`.
+    pub(crate) fn secure_lock(&mut self, reason: &'static str) {
+        self.cancel_interactions_for_lock();
+        self.pending_map_focus = None;
+        self.set_keyboard_focus_target(None);
+
+        if !self.locked {
+            tracing::info!(target: "beewm::lock", reason, "secure lock engaged");
+            self.locked = true;
+        } else {
+            tracing::debug!(target: "beewm::lock", reason, "secure lock already engaged");
+        }
+
+        self.ensure_lock_client_running(reason);
+        self.needs_render = true;
+    }
+
+    /// Reassert the lock after resume and wake outputs if the idle timeout had
+    /// powered them down before suspend.
+    pub(crate) fn secure_resume_lock(&mut self, force_lock: bool) {
+        if force_lock || self.locked {
+            self.secure_lock("resume");
+        }
+        self.notify_activity();
+        self.needs_render = true;
+    }
+
+    fn ensure_lock_client_running(&mut self, reason: &'static str) {
+        if !self.locked || !self.lock_surfaces.is_empty() {
+            return;
+        }
+
+        let command = self.config.lock_command.trim();
+        if command.is_empty() {
+            tracing::warn!(
+                target: "beewm::lock",
+                reason,
+                "lock_command is empty; staying on compositor black lock screen",
+            );
+            return;
+        }
+
+        let now = Instant::now();
+        if self
+            .lock_client_last_spawn
+            .map(|last| now.saturating_duration_since(last) < Duration::from_secs(2))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.lock_client_last_spawn = Some(now);
+
+        tracing::info!(
+            target: "beewm::lock",
+            reason,
+            command,
+            "spawning session lock client",
+        );
+        if let Err(error) = spawn_shell_command(command, &self.child_env) {
+            tracing::error!(
+                target: "beewm::lock",
+                %error,
+                command,
+                "failed to spawn session lock client; session remains compositor-locked",
+            );
+        }
+    }
+
+    fn cancel_interactions_for_lock(&mut self) {
+        let active_grab = self.active_grab.take();
+        if let Some(super::types::ActiveGrab::TiledSwap(grab)) = &active_grab {
+            if let Some(layout_snapshot) = self.tiled_swap_layout_snapshot.take() {
+                self.layout_manager = layout_snapshot;
+            }
+            if let Some(root) = Self::window_root_surface(&grab.window) {
+                self.floating_windows.remove(&root);
+            }
+            self.tiled_swap_target = None;
+            self.relayout();
+        } else {
+            self.tiled_swap_layout_snapshot = None;
+            self.tiled_swap_target = None;
+        }
+
+        match active_grab {
+            Some(super::types::ActiveGrab::Resize(grab)) => {
+                if let Some(toplevel) = grab.window.toplevel() {
+                    toplevel.with_pending_state(|state| {
+                        state.states.unset(xdg_toplevel::State::Resizing);
+                        state.size = Some(Size::from((
+                            grab.current_window_size.w,
+                            grab.current_window_size.h,
+                        )));
+                    });
+                    toplevel.send_configure();
+                }
+            }
+            Some(super::types::ActiveGrab::TiledResize(grab)) => {
+                if let Some(toplevel) = grab.window.toplevel() {
+                    toplevel.with_pending_state(|state| {
+                        state.states.unset(xdg_toplevel::State::Resizing);
+                        state.size = None;
+                    });
+                    toplevel.send_configure();
+                }
+            }
+            Some(super::types::ActiveGrab::Move(_))
+            | Some(super::types::ActiveGrab::TiledSwap(_))
+            | None => {}
+        }
+
+        if let Some(focused) = self.prev_keyboard_focus.clone() {
+            self.deactivate_pointer_constraint_for(&focused);
+        }
+        if let Some(focused) = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|target| target.wl_surface().map(|surface| surface.into_owned()))
+        {
+            self.deactivate_pointer_constraint_for(&focused);
+        }
+
+        self.compositor_cursor_icon = None;
+        self.refresh_compositor_cursor();
+    }
+
     /// Any live idle inhibitor (e.g. a video player) suppresses blanking.
     fn idle_inhibited(&mut self) -> bool {
         self.idle_inhibitors.retain(|s| s.alive());
@@ -868,6 +1017,45 @@ impl Beewm {
         let workspace_num = self.active_workspace() + 1;
         self.event_broadcaster
             .push_event(&format!("workspace>>{workspace_num}"));
+    }
+
+    /// Push the seat keyboard's current XKB LED state to physical keyboards.
+    /// Cheap when nothing changed (the write is skipped). Used wherever the
+    /// LED state may be stale outside the normal `led_state_changed` flow,
+    /// e.g. after a VT switch back (paired with `keyboard_leds.invalidate()`).
+    pub fn sync_keyboard_leds(&mut self) {
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            self.keyboard_leds.apply(keyboard.led_state().into());
+        }
+    }
+
+    /// Snapshot of the lock/Shift state on the seat keyboard, for the
+    /// `keyboard>>…` event-socket line. Shift is reported here (it has no
+    /// physical LED); Scroll Lock comes from the XKB indicator since it is
+    /// not a modifier.
+    pub fn keyboard_status(&self) -> Option<KeyboardStatus> {
+        let keyboard = self.seat.get_keyboard()?;
+        let modifiers = keyboard.modifier_state();
+        let leds = keyboard.led_state();
+        Some(KeyboardStatus {
+            caps_lock: modifiers.caps_lock,
+            num_lock: modifiers.num_lock,
+            scroll_lock: leds.scroll.unwrap_or(false),
+            shift: modifiers.shift,
+        })
+    }
+
+    /// Publish `keyboard>>…` to event-socket subscribers when the lock/Shift
+    /// state changed since the last publish.
+    pub(crate) fn publish_keyboard_status(&mut self) {
+        let Some(status) = self.keyboard_status() else {
+            return;
+        };
+        if self.last_keyboard_status == Some(status) {
+            return;
+        }
+        self.last_keyboard_status = Some(status);
+        self.event_broadcaster.push_event(&status.event_payload());
     }
 
     /// Mark the focused-window IPC state as needing a republish. Cheap and

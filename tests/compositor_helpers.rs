@@ -6,11 +6,11 @@ use beewm::compositor::{
     FloatToggleTransition, ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge,
     active_workspace_state_contents, centered_dialog_position, constrain_popup_geometry,
     expand_by_border, float_toggle_transition, is_dialog_size_cap, is_fixed_size,
-    layers_hit_tested_after_windows,
-    layers_hit_tested_before_windows, layers_rendered_above_windows, layers_rendered_below_windows,
-    popup_constraint_target, resize_edges_for_pointer, resized_window_geometry_from_start,
-    root_is_swap_highlighted, visible_border_rectangles, window_border_overlaps_layer,
-    workspace_state_contents, write_state_file_atomically,
+    layers_hit_tested_after_windows, layers_hit_tested_before_windows,
+    layers_rendered_above_windows, layers_rendered_below_windows, popup_constraint_target,
+    resize_edges_for_pointer, resized_window_geometry_from_start, root_is_swap_highlighted,
+    visible_border_rectangles, window_border_overlaps_layer, workspace_state_contents,
+    write_state_file_atomically,
 };
 use beewm::layout::dwindle_tree::{DwindleTree, ResizeEdge};
 use beewm::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
@@ -93,9 +93,15 @@ fn small_max_size_is_a_dialog_cap() {
 fn large_or_sentinel_max_size_is_not_a_dialog_cap() {
     // A parent app advertising display dimensions or a "no real max" sentinel
     // must NOT be classified as a dialog — otherwise Zed/Spotify/Claude float.
-    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((1920, 1080))));
-    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((3840, 2160))));
-    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((32767, 32767))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((
+        1920, 1080
+    ))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((
+        3840, 2160
+    ))));
+    assert!(!is_dialog_size_cap(Size::<i32, Logical>::from((
+        32767, 32767
+    ))));
 }
 
 #[test]
@@ -494,7 +500,10 @@ fn removing_an_unmapped_sibling_gives_the_survivor_the_full_area() {
     manager.insert(0, None, 1u8);
     manager.insert(0, None, 2u8);
     let split = manager.geometries(0, &screen, &[1u8, 2u8]);
-    assert_ne!(split[&1], screen, "two mapped windows should not each fill the screen");
+    assert_ne!(
+        split[&1], screen,
+        "two mapped windows should not each fill the screen"
+    );
 
     // The stale window (id 1) unmaps. The compositor removes it from the tree
     // AND from the set of tiled ids it lays out.

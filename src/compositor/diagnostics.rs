@@ -377,8 +377,18 @@ mod tests {
             is_x11: true,
             on_scanout_output: false,
         };
-        tracker.record(1, Some(Duration::from_millis(3)), BufferKind::Dmabuf, on.clone());
-        tracker.record(1, Some(Duration::from_millis(5)), BufferKind::Dmabuf, off.clone());
+        tracker.record(
+            1,
+            Some(Duration::from_millis(3)),
+            BufferKind::Dmabuf,
+            on.clone(),
+        );
+        tracker.record(
+            1,
+            Some(Duration::from_millis(5)),
+            BufferKind::Dmabuf,
+            off.clone(),
+        );
         tracker.record(1, None, BufferKind::None, off.clone()); // state-only commit
         tracker.record(2, Some(Duration::from_millis(40)), BufferKind::Shm, on);
 

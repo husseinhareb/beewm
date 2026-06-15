@@ -236,13 +236,38 @@ pub(crate) fn export_session_environment(child_env: &ChildEnvironment) {
     // dbus-update-activation-environment is unavailable but systemd is present.
     let key_args: Vec<OsString> = pairs.iter().map(|(k, _)| k.clone()).collect();
     let mut systemctl = Command::new("systemctl");
-    systemctl.arg("--user").arg("import-environment").args(&key_args);
+    systemctl
+        .arg("--user")
+        .arg("import-environment")
+        .args(&key_args);
     configure_child(&mut systemctl, child_env);
     if let Err(error) = systemctl.spawn() {
         tracing::debug!(
             target = "beewm::portal",
             %error,
             "systemctl --user import-environment unavailable (non-systemd session?)",
+        );
+    }
+
+    // Activate the graphical session target now that the environment is in
+    // place. `xdg-desktop-portal.service` (and other session units) carry a
+    // hard `Requisite=graphical-session.target`, which `RefuseManualStart=yes`
+    // forbids starting directly — it can only be pulled in as a dependency.
+    // `beewm-session.target` (installed by `portal/install.sh`) `BindsTo` it,
+    // so starting our target is what legally activates graphical-session and
+    // unblocks the ScreenCast portal. Best-effort: a missing unit (target not
+    // installed) or non-systemd session is logged, never fatal.
+    let mut session = Command::new("systemctl");
+    session
+        .arg("--user")
+        .arg("start")
+        .arg("beewm-session.target");
+    configure_child(&mut session, child_env);
+    if let Err(error) = session.spawn() {
+        tracing::debug!(
+            target = "beewm::portal",
+            %error,
+            "systemctl --user start beewm-session.target unavailable (non-systemd session?)",
         );
     }
 }
