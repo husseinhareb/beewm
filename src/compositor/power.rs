@@ -1,8 +1,11 @@
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use smithay::reexports::calloop::channel::Sender;
+
+const RESUME_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+const RESUME_WATCHDOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// Backend-visible suspend/resume lifecycle.
 ///
@@ -47,7 +50,24 @@ impl PowerState {
 #[derive(Debug)]
 pub(crate) enum PowerEvent {
     PrepareSuspend { ack: Option<mpsc::Sender<()>> },
-    Resume,
+    Resume { source: ResumeSource },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeSource {
+    Logind,
+    Watchdog,
+    Libseat,
+}
+
+impl ResumeSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Logind => "logind",
+            Self::Watchdog => "resume-watchdog",
+            Self::Libseat => "libseat",
+        }
+    }
 }
 
 /// Start a best-effort logind sleep monitor.
@@ -61,6 +81,58 @@ pub(crate) fn start_logind_sleep_monitor(sender: Sender<PowerEvent>) -> std::io:
         .name("beewm-logind-sleep".into())
         .spawn(move || logind_sleep_monitor(sender))
         .map(|_| ())
+}
+
+/// Start a fallback resume detector based on wall-clock time.
+///
+/// Some systems resume userspace without delivering a logind
+/// `PrepareForSleep(false)` signal to this process and without a libseat
+/// activate event. A large wall-clock jump compared to `Instant` means the
+/// process was suspended; sending a best-effort resume event wakes calloop and
+/// lets the backend revalidate DRM even in that case.
+pub(crate) fn start_resume_watchdog(sender: Sender<PowerEvent>) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("beewm-resume-watchdog".into())
+        .spawn(move || resume_watchdog(sender))
+        .map(|_| ())
+}
+
+fn resume_watchdog(sender: Sender<PowerEvent>) {
+    let mut last_instant = Instant::now();
+    let mut last_wall = SystemTime::now();
+
+    loop {
+        thread::sleep(RESUME_WATCHDOG_INTERVAL);
+
+        let now_instant = Instant::now();
+        let now_wall = SystemTime::now();
+        let instant_elapsed = now_instant.saturating_duration_since(last_instant);
+        let wall_elapsed = now_wall.duration_since(last_wall).unwrap_or(Duration::ZERO);
+
+        if wall_clock_resume_gap(wall_elapsed, instant_elapsed) {
+            tracing::info!(
+                target: "beewm::power",
+                wall_ms = wall_elapsed.as_millis() as u64,
+                monotonic_ms = instant_elapsed.as_millis() as u64,
+                "resume watchdog detected suspend gap",
+            );
+            if sender
+                .send(PowerEvent::Resume {
+                    source: ResumeSource::Watchdog,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        last_instant = now_instant;
+        last_wall = now_wall;
+    }
+}
+
+fn wall_clock_resume_gap(wall_elapsed: Duration, instant_elapsed: Duration) -> bool {
+    wall_elapsed > instant_elapsed.saturating_add(RESUME_WATCHDOG_THRESHOLD)
 }
 
 fn logind_sleep_monitor(sender: Sender<PowerEvent>) {
@@ -139,7 +211,9 @@ fn logind_sleep_monitor(sender: Sender<PowerEvent>) {
             // Releasing this fd lets logind continue the suspend.
             inhibitor.take();
         } else {
-            let _ = sender.send(PowerEvent::Resume);
+            let _ = sender.send(PowerEvent::Resume {
+                source: ResumeSource::Logind,
+            });
             inhibitor = acquire_sleep_delay_inhibitor(&proxy);
         }
     }
@@ -174,7 +248,9 @@ fn acquire_sleep_delay_inhibitor(
 
 #[cfg(test)]
 mod tests {
-    use super::PowerState;
+    use std::time::Duration;
+
+    use super::{PowerState, wall_clock_resume_gap};
 
     #[test]
     fn suspend_transition_is_idempotent() {
@@ -206,5 +282,17 @@ mod tests {
         assert_eq!(PowerState::Awake.resume(), PowerState::Awake);
         assert_eq!(PowerState::Suspended.resume(), PowerState::Resuming);
         assert_eq!(PowerState::Degraded.resume(), PowerState::Resuming);
+    }
+
+    #[test]
+    fn wall_clock_resume_gap_detects_suspend_jump() {
+        assert!(wall_clock_resume_gap(
+            Duration::from_secs(10),
+            Duration::from_secs(1)
+        ));
+        assert!(!wall_clock_resume_gap(
+            Duration::from_millis(1100),
+            Duration::from_secs(1)
+        ));
     }
 }

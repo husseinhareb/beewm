@@ -22,6 +22,7 @@ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::channel::Event as ChannelEvent;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, PostAction, RegistrationToken};
+use smithay::reexports::drm::Device as BasicDrmDevice;
 use smithay::reexports::drm::control::{
     Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, connector, crtc,
 };
@@ -47,7 +48,7 @@ use crate::compositor::feedback::{
 use crate::compositor::input::leds::LedDeviceRegistry;
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
-use crate::compositor::power::{PowerEvent, PowerState};
+use crate::compositor::power::{PowerEvent, PowerState, ResumeSource};
 use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
@@ -77,6 +78,9 @@ enum DmabufSetup {
 type DrmCompositorImpl =
     DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
 
+const FRAME_FAILURE_RETRY_BASE: Duration = Duration::from_millis(100);
+const FRAME_FAILURE_RETRY_MAX: Duration = Duration::from_secs(2);
+
 /// One rendered output: a single CRTC's `DrmCompositor` plus its `Output` and
 /// per-output pacing/feedback bookkeeping. Every surface on a device shares that
 /// device's single `GlesRenderer` (see [`GpuData::renderer`]).
@@ -93,6 +97,11 @@ struct SurfaceData {
     compositor: DrmCompositorImpl,
     /// True when this surface's vblank has fired and it may render again.
     can_render: bool,
+    /// Backoff deadline after a failed render/queue. Without this, a bad DRM
+    /// atomic state can spin the compositor hard enough to starve input/session
+    /// events, which makes a recoverable resume problem feel like a total freeze.
+    retry_after: Option<Instant>,
+    consecutive_frame_failures: u32,
     pending_presentation_feedback: Option<smithay::desktop::utils::OutputPresentationFeedback>,
     /// Rolling counters for the `beewm::frame` instrumentation. Reset whenever
     /// a summary line is emitted so the file stays digestible at high refresh
@@ -381,6 +390,13 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
+    if let Err(error) = crate::compositor::power::start_resume_watchdog(power_tx.clone()) {
+        tracing::debug!(
+            target: "beewm::power",
+            %error,
+            "failed to start resume watchdog thread",
+        );
+    }
     if let Err(error) = crate::compositor::power::start_logind_sleep_monitor(power_tx) {
         tracing::debug!(
             target: "beewm::power",
@@ -397,8 +413,8 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = ack.send(());
                 }
             }
-            ChannelEvent::Msg(PowerEvent::Resume) => {
-                handle_resume(data, "logind");
+            ChannelEvent::Msg(PowerEvent::Resume { source }) => {
+                handle_resume(data, source);
             }
             ChannelEvent::Closed => {
                 tracing::debug!(target: "beewm::power", "logind sleep monitor channel closed");
@@ -698,7 +714,7 @@ fn handle_session_paused(data: &mut UdevData) {
 
 fn handle_session_activated(data: &mut UdevData) {
     tracing::info!(target: "beewm::power", "session activated");
-    handle_resume(data, "libseat");
+    handle_resume(data, ResumeSource::Libseat);
 }
 
 fn handle_prepare_suspend(data: &mut UdevData, source: &'static str) {
@@ -721,7 +737,7 @@ fn handle_prepare_suspend(data: &mut UdevData, source: &'static str) {
     }
 }
 
-fn handle_resume(data: &mut UdevData, source: &'static str) {
+fn handle_resume(data: &mut UdevData, source: ResumeSource) {
     let next = data.power_state.resume();
     if next == PowerState::Awake {
         return;
@@ -729,7 +745,7 @@ fn handle_resume(data: &mut UdevData, source: &'static str) {
     data.power_state = next;
     tracing::info!(
         target: "beewm::power",
-        source,
+        source = source.as_str(),
         state = ?data.power_state,
         "resuming session",
     );
@@ -737,7 +753,8 @@ fn handle_resume(data: &mut UdevData, source: &'static str) {
     let resume_lock_pending = data.resume_lock_pending;
     data.resume_lock_pending = false;
     data.state.secure_resume_lock(resume_lock_pending);
-    let activated = activate_drm(data);
+    let force_drm_reset = matches!(source, ResumeSource::Logind | ResumeSource::Watchdog);
+    let activated = activate_drm(data, force_drm_reset);
     // `secure_resume_lock` may have queued DPMS-on work if the screen timed out
     // before suspend. Apply it before the first forced render.
     process_backend_requests(data);
@@ -763,37 +780,72 @@ fn handle_resume(data: &mut UdevData, source: &'static str) {
 }
 
 fn pause_drm(data: &mut UdevData) {
-    let mut callback_outputs = Vec::new();
     if let Some(gpu) = data.gpu.as_mut() {
-        tracing::info!(target: "beewm::power", "pausing DRM device");
+        tracing::info!(
+            target: "beewm::power",
+            active = gpu.drm_device.is_active(),
+            "pausing DRM device",
+        );
         gpu.drm_device.pause();
+        tracing::info!(
+            target: "beewm::power",
+            active = gpu.drm_device.is_active(),
+            "DRM device paused",
+        );
         for surface in &mut gpu.surfaces {
             surface.can_render = false;
+            surface.retry_after = None;
             surface.pending_presentation_feedback = None;
-            callback_outputs.push(surface.output.clone());
         }
     }
 
-    let elapsed = data.state.start_time.elapsed();
-    for output in callback_outputs {
-        send_frame_callbacks(&mut data.state, &output, elapsed, None);
-    }
-    data.state.last_frame_callbacks_sent_at = Some(Instant::now());
     data.state.needs_render = false;
 }
 
-fn activate_drm(data: &mut UdevData) -> bool {
+fn activate_drm(data: &mut UdevData, force_reset: bool) -> bool {
     let Some(gpu) = data.gpu.as_mut() else {
         return true;
     };
+
+    let was_active = gpu.drm_device.is_active();
+    tracing::info!(
+        target: "beewm::power",
+        was_active,
+        force_reset,
+        "activating DRM device",
+    );
 
     if let Err(err) = gpu.drm_device.activate(true) {
         tracing::error!(target: "beewm::power", "failed to reactivate DRM device: {}", err);
         for surface in &mut gpu.surfaces {
             surface.can_render = false;
+            surface.retry_after = Some(Instant::now() + FRAME_FAILURE_RETRY_MAX);
         }
         return false;
     }
+    if force_reset && was_active {
+        tracing::info!(
+            target: "beewm::power",
+            "forcing DRM state reset after sleep while device remained active",
+        );
+        if let Err(err) = gpu.drm_device.reset_state() {
+            tracing::error!(
+                target: "beewm::power",
+                "failed to reset active DRM device after resume: {}",
+                err,
+            );
+            for surface in &mut gpu.surfaces {
+                surface.can_render = false;
+                surface.retry_after = Some(Instant::now() + FRAME_FAILURE_RETRY_MAX);
+            }
+            return false;
+        }
+    }
+    tracing::info!(
+        target: "beewm::power",
+        active = gpu.drm_device.is_active(),
+        "DRM device activated",
+    );
 
     for surface in &mut gpu.surfaces {
         if let Err(err) = surface.compositor.reset_state() {
@@ -803,8 +855,13 @@ fn activate_drm(data: &mut UdevData) -> bool {
                 "failed to reset compositor state after resume: {}",
                 err,
             );
+            surface.can_render = false;
+            surface.retry_after = Some(Instant::now() + FRAME_FAILURE_RETRY_MAX);
+        } else {
+            surface.can_render = true;
+            surface.retry_after = None;
+            surface.consecutive_frame_failures = 0;
         }
-        surface.can_render = true;
         surface.pending_presentation_feedback = None;
         surface.frame_stats = FrameStats::new();
         surface.present_stats = PresentStats::new();
@@ -839,6 +896,7 @@ fn process_backend_requests(data: &mut UdevData) {
                         // Re-arm so the next render re-enables the CRTC (queueing
                         // a frame brings DPMS back on per DrmCompositor::clear).
                         surface.can_render = true;
+                        surface.retry_after = None;
                     } else if let Err(err) = surface.compositor.clear() {
                         tracing::warn!(
                             target: "beewm::idle",
@@ -983,6 +1041,8 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
             position,
             compositor,
             can_render: true,
+            retry_after: None,
+            consecutive_frame_failures: 0,
             pending_presentation_feedback: None,
             frame_stats: FrameStats::new(),
             present_stats: PresentStats::new(),
@@ -1023,7 +1083,16 @@ fn render_frame(data: &mut UdevData) {
         renderer, surfaces, ..
     } = gpu;
     let mut any_skipped = false;
+    let now = Instant::now();
     for surface in surfaces.iter_mut() {
+        if let Some(retry_after) = surface.retry_after {
+            if retry_after > now {
+                any_skipped = true;
+                continue;
+            }
+            surface.retry_after = None;
+            surface.can_render = true;
+        }
         if surface.can_render {
             render_one_surface(state, renderer, surface);
         } else {
@@ -1034,6 +1103,68 @@ fn render_frame(data: &mut UdevData) {
         // At least one surface is still waiting on its page-flip; keep the dirty
         // flag set so it renders once its vblank fires.
         state.needs_render = true;
+    }
+}
+
+fn retry_delay_for_frame_failure(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(5);
+    let delay = FRAME_FAILURE_RETRY_BASE.saturating_mul(1 << shift);
+    std::cmp::min(delay, FRAME_FAILURE_RETRY_MAX)
+}
+
+fn record_frame_success(surface: &mut SurfaceData, output: &Output) {
+    if surface.consecutive_frame_failures > 0 {
+        tracing::info!(
+            target: "beewm::frame",
+            output = %output.name(),
+            failures = surface.consecutive_frame_failures,
+            "DRM frame output recovered",
+        );
+    }
+    surface.retry_after = None;
+    surface.consecutive_frame_failures = 0;
+}
+
+fn record_frame_failure<E: std::fmt::Debug>(
+    state: &mut Beewm,
+    surface: &mut SurfaceData,
+    output: &Output,
+    stage: &'static str,
+    error: &E,
+) {
+    surface.consecutive_frame_failures = surface.consecutive_frame_failures.saturating_add(1);
+    let failures = surface.consecutive_frame_failures;
+    let retry_delay = retry_delay_for_frame_failure(failures);
+
+    surface.can_render = false;
+    surface.retry_after = Some(Instant::now() + retry_delay);
+    surface.pending_presentation_feedback = None;
+    state.needs_render = true;
+
+    let elapsed = state.start_time.elapsed();
+    send_frame_callbacks(state, output, elapsed, None);
+    state.last_frame_callbacks_sent_at = Some(Instant::now());
+
+    if failures == 1 || failures.is_power_of_two() {
+        tracing::error!(
+            target: "beewm::frame",
+            output = %output.name(),
+            stage,
+            failures,
+            retry_ms = retry_delay.as_millis() as u64,
+            "DRM frame output failed; backing off before retry: {:?}",
+            error,
+        );
+    } else {
+        tracing::debug!(
+            target: "beewm::frame",
+            output = %output.name(),
+            stage,
+            failures,
+            retry_ms = retry_delay.as_millis() as u64,
+            "DRM frame output still failing: {:?}",
+            error,
+        );
     }
 }
 
@@ -1181,6 +1312,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
                 // No damage — nothing to scan out. The caller already
                 // cleared `needs_render`; re-allow the next render and send
                 // frame callbacks now since no VBlank will fire to do it.
+                record_frame_success(surface, &output);
                 surface.can_render = true;
                 surface.pending_presentation_feedback = None;
                 let elapsed = state.start_time.elapsed();
@@ -1201,16 +1333,9 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
                 }
                 r
             } {
-                tracing::error!("Failed to queue frame: {:?}", e);
-                surface.can_render = true;
-                surface.pending_presentation_feedback = None;
-                // Frame was never queued — no VBlank coming; unblock clients
-                // and re-arm the render so the next dispatch retries.
-                state.needs_render = true;
-                let elapsed = state.start_time.elapsed();
-                send_frame_callbacks(state, &output, elapsed, None);
-                state.last_frame_callbacks_sent_at = Some(Instant::now());
+                record_frame_failure(state, surface, &output, "queue_frame", &e);
             } else {
+                record_frame_success(surface, &output);
                 surface.pending_presentation_feedback = Some(collect_presentation_feedback(
                     state,
                     &output,
@@ -1259,14 +1384,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
             // VBlank handler once the hardware confirms the frame is on screen.
         }
         Err(e) => {
-            tracing::error!("Render error: {:?}", e);
-            surface.can_render = true;
-            surface.pending_presentation_feedback = None;
-            // Render failed — no VBlank coming; unblock clients and re-arm
-            // so we retry on the next iteration instead of getting stuck.
-            state.needs_render = true;
-            let elapsed = state.start_time.elapsed();
-            send_frame_callbacks(state, &output, elapsed, None);
+            record_frame_failure(state, surface, &output, "render_frame", &e);
         }
     }
 }
@@ -1468,8 +1586,15 @@ fn init_gpu(
     use smithay::backend::allocator::Fourcc;
     let color_formats = [Fourcc::Argb8888, Fourcc::Xrgb8888];
 
+    let nvidia_drm = is_nvidia_drm_device(&drm_fd);
     let syncobj_state = if crate::compositor::runtime_flags::flags().explicit_sync_disabled {
         tracing::warn!("Explicit sync disabled by BEEWM_NO_EXPLICIT_SYNC");
+        None
+    } else if nvidia_drm {
+        tracing::warn!(
+            target: "beewm::sync",
+            "explicit sync disabled on NVIDIA DRM device; IN_FENCE_FD atomic commits are unreliable across suspend/resume",
+        );
         None
     } else if supports_syncobj_eventfd(&drm_fd) {
         tracing::info!(
@@ -1659,6 +1784,24 @@ fn init_gpu(
     ))
 }
 
+fn is_nvidia_drm_device(drm_fd: &DrmDeviceFd) -> bool {
+    match drm_fd.get_driver() {
+        Ok(driver) => {
+            let name = driver.name().to_string_lossy().to_lowercase();
+            let description = driver.description().to_string_lossy().to_lowercase();
+            name.contains("nvidia") || description.contains("nvidia")
+        }
+        Err(error) => {
+            tracing::debug!(
+                target: "beewm::sync",
+                %error,
+                "could not query DRM driver while deciding explicit-sync support",
+            );
+            false
+        }
+    }
+}
+
 /// Build a render surface (its own `DrmCompositor` + `Output`) for one connected
 /// connector on `crtc_handle`, placed at `position`. Shared by initial
 /// enumeration and runtime hotplug so the two paths can never diverge.
@@ -1763,6 +1906,8 @@ fn build_surface_for_connector(
         position,
         compositor,
         can_render: true, // allow the first frame immediately
+        retry_after: None,
+        consecutive_frame_failures: 0,
         pending_presentation_feedback: None,
         frame_stats: FrameStats::new(),
         present_stats: PresentStats::new(),
