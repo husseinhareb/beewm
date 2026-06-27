@@ -268,6 +268,12 @@ impl CompositorHandler for Beewm {
                 .toplevel_parent_surface(&window)
                 .map(|parent| parent.id().protocol_id());
 
+            // Browser Picture-in-Picture (Firefox and Chromium both title it
+            // exactly "Picture-in-Picture") follows you across workspaces.
+            if class.title.as_deref() == Some("Picture-in-Picture") {
+                self.sticky_windows.insert(window_root.clone());
+            }
+
             if should_float {
                 self.map_as_floating_centered(&window);
                 self.relayout();

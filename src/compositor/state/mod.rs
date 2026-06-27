@@ -270,6 +270,11 @@ pub struct Beewm {
     /// The key is the root WlSurface; the value is where the window is placed
     /// and how large it should be when restored.
     pub floating_windows: HashMap<WlSurface, FloatingWindowData>,
+    /// Root WlSurfaces marked "sticky": shown on every workspace at the same
+    /// place instead of being unmapped on workspace switch. Auto-set for browser
+    /// Picture-in-Picture, toggleable on the focused window. Sticky implies
+    /// floating (a single surface can't occupy every workspace's tiling tree).
+    pub sticky_windows: HashSet<WlSurface>,
     /// Root WlSurfaces whose window was transitioned from tiled to floating
     /// mid-session. We sent a `size = None` configure so the client will
     /// re-commit at its natural size; on that next commit we re-center the
@@ -475,6 +480,7 @@ impl Beewm {
             xdisplay: None,
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),
+            sticky_windows: HashSet::new(),
             pending_float_centers: HashSet::new(),
             pending_should_float: HashSet::new(),
             mapped_with_buffer: HashSet::new(),

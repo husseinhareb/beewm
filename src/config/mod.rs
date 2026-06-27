@@ -35,6 +35,7 @@ pub enum Action {
     CloseWindow,
     ToggleFullscreen,
     ToggleFloat,
+    ToggleSticky,
     SwitchWorkspace(usize),
     MoveToWorkspace(usize),
     Spawn(String),
@@ -261,6 +262,11 @@ impl Config {
                 modifiers: vec!["mod4".into()],
                 key: "v".into(),
                 action: Action::ToggleFloat,
+            },
+            Keybind {
+                modifiers: vec!["mod4".into()],
+                key: "s".into(),
+                action: Action::ToggleSticky,
             },
         ];
 

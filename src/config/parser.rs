@@ -486,6 +486,7 @@ fn parse_action(action_text: &str, line_no: usize) -> Result<Action, ConfigError
         "close_window" | "kill" => Ok(Action::CloseWindow),
         "fullscreen" | "toggle_fullscreen" => Ok(Action::ToggleFullscreen),
         "float" | "toggle_float" => Ok(Action::ToggleFloat),
+        "sticky" | "toggle_sticky" => Ok(Action::ToggleSticky),
         "quit" | "exit" => Ok(Action::Quit),
         "workspace" | "switch_workspace" => {
             let workspace = parse_workspace_argument(parts.next(), line_no, name)?;

@@ -82,9 +82,16 @@ impl Beewm {
         tracing::info!("Switching workspace {} -> {}", current + 1, idx + 1);
 
         // Leave the current workspace's fullscreen state intact — it is
-        // re-presented when we return. Just unmap everything currently shown.
+        // re-presented when we return. Unmap everything currently shown except
+        // sticky windows, which stay mapped at their position so they follow us
+        // onto the next workspace.
         for window in &self.workspaces[current].windows {
-            self.space.unmap_elem(window);
+            let is_sticky = Self::window_root_surface(window)
+                .map(|root| self.sticky_windows.contains(&root))
+                .unwrap_or(false);
+            if !is_sticky {
+                self.space.unmap_elem(window);
+            }
         }
 
         self.set_active_workspace(idx);
@@ -92,6 +99,8 @@ impl Beewm {
 
         self.needs_render = true;
         self.relayout();
+        // Keep sticky windows above the freshly relaid-out workspace.
+        self.raise_sticky_windows();
 
         // If the workspace we entered had a fullscreen window, re-present it
         // over the freshly relaid-out tiles.

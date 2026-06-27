@@ -135,6 +135,9 @@ fn execute_action(state: &mut Beewm, action: Action) {
         Action::ToggleFloat => {
             state.toggle_float();
         }
+        Action::ToggleSticky => {
+            state.toggle_sticky();
+        }
         Action::Quit => {
             tracing::info!("Quit requested");
             state.running = false;

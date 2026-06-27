@@ -280,6 +280,7 @@ impl Beewm {
             // a half-tracked surface can't leave a ghost behind.
             self.mapped_with_buffer.remove(&root);
             self.floating_windows.remove(&root);
+            self.sticky_windows.remove(&root);
             self.untrack_window_for_surface(&root);
             return None;
         };
@@ -337,6 +338,7 @@ impl Beewm {
 
         // Clean up floating state and the tiling tree node.
         self.floating_windows.remove(&root);
+        self.sticky_windows.remove(&root);
         self.remove_tiled_window(ws_idx, &root);
         self.space.unmap_elem(&window);
         self.publish_workspace_state();
@@ -569,6 +571,43 @@ impl Beewm {
             }
             super::workspace::FloatToggleTransition::MakeFloating => {
                 self.float_window(window);
+            }
+        }
+    }
+
+    /// Toggle "show on all workspaces" for the focused window. Marking a tiled
+    /// window sticky first floats it — a single surface can't live in every
+    /// workspace's tiling tree, so sticky always means floating.
+    pub fn toggle_sticky(&mut self) {
+        let window = match self.active_workspace_focused_window().cloned() {
+            Some(w) => w,
+            None => return,
+        };
+        let Some(root) = Self::window_root_surface(&window) else {
+            return;
+        };
+
+        if self.sticky_windows.remove(&root) {
+            tracing::info!(target: "beewm::floating", id = root.id().protocol_id(), "unstuck window");
+            return;
+        }
+
+        if !self.is_root_floating(&root) {
+            self.float_window(window.clone());
+        }
+        self.sticky_windows.insert(root.clone());
+        self.space.raise_element(&window, true);
+        self.needs_render = true;
+        tracing::info!(target: "beewm::floating", id = root.id().protocol_id(), "stuck window to all workspaces");
+    }
+
+    /// Raise every mapped sticky window to the top of the stack. Called after a
+    /// workspace switch so they don't end up behind the new workspace's tiles.
+    pub(crate) fn raise_sticky_windows(&mut self) {
+        let sticky: Vec<WlSurface> = self.sticky_windows.iter().cloned().collect();
+        for root in sticky {
+            if let Some(window) = self.mapped_window_for_surface(&root) {
+                self.space.raise_element(&window, true);
             }
         }
     }

@@ -81,6 +81,13 @@ type DrmCompositorImpl =
 const FRAME_FAILURE_RETRY_BASE: Duration = Duration::from_millis(100);
 const FRAME_FAILURE_RETRY_MAX: Duration = Duration::from_secs(2);
 
+/// How often a `Degraded` resume re-attempts DRM activation. On NVIDIA laptops
+/// the watchdog can fire `handle_resume` before logind/libseat has handed DRM
+/// master back, so the first `activate(true)` fails with EACCES; we retry until
+/// master returns instead of latching black. Each failed `activate` ioctl can
+/// itself stall ~5s, so the effective cadence is governed by that, not this.
+const RESUME_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// One rendered output: a single CRTC's `DrmCompositor` plus its `Output` and
 /// per-output pacing/feedback bookkeeping. Every surface on a device shares that
 /// device's single `GlesRenderer` (see [`GpuData::renderer`]).
@@ -94,7 +101,9 @@ struct SurfaceData {
     /// Top-left of this output in the global Space coordinate space; mirrored
     /// into the compositor's `OutputCtx` via `Beewm::add_output`.
     position: Point<i32, Logical>,
-    compositor: DrmCompositorImpl,
+    /// `None` only transiently across suspend/resume, while the old KMS surface
+    /// has been torn down and a fresh one not yet rebuilt (see `activate_drm`).
+    compositor: Option<DrmCompositorImpl>,
     /// True when this surface's vblank has fired and it may render again.
     can_render: bool,
     /// Backoff deadline after a failed render/queue. Without this, a bad DRM
@@ -172,6 +181,12 @@ struct UdevData {
     gpu: Option<GpuData>,
     power_state: PowerState,
     resume_lock_pending: bool,
+    /// Throttles `Degraded` resume retries from the main loop. `None` means a
+    /// retry may run on the next iteration.
+    resume_retry_at: Option<Instant>,
+    /// The VT beewm runs on, read once at startup. Used to re-assert the VT on a
+    /// stuck resume (NVIDIA's resume `chvt`-back doesn't reliably reactivate us).
+    session_vt: Option<i32>,
     /// Owned so we can call flush_clients() anywhere in the main loop.
     display: Display<Beewm>,
 }
@@ -238,6 +253,17 @@ fn warn_if_nvidia_modeset_disabled() {
     }
 }
 
+/// The active VT number, e.g. `1` for `tty1`. Read at startup while beewm is the
+/// foreground session, so it identifies beewm's own VT.
+fn current_vt() -> Option<i32> {
+    std::fs::read_to_string("/sys/class/tty/tty0/active")
+        .ok()?
+        .trim()
+        .strip_prefix("tty")?
+        .parse()
+        .ok()
+}
+
 /// Run the compositor on real hardware from a TTY using DRM/KMS.
 pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     warn_if_nvidia_modeset_disabled();
@@ -263,6 +289,9 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         gpu: None,
         power_state: PowerState::Awake,
         resume_lock_pending: false,
+        resume_retry_at: None,
+        // Read while we are the foreground VT, so this is our own VT number.
+        session_vt: current_vt(),
         display,
     };
 
@@ -642,6 +671,40 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // VBlank, so no busy loop), and clears back to idle when they finish.
         data.state.tick_animations(Instant::now());
 
+        // A resume left the DRM device unusable (typically EACCES because we
+        // didn't hold DRM master yet). Keep re-attempting activation — master
+        // comes back once logind/libseat reactivates the session, which on some
+        // NVIDIA laptops never arrives as a libseat ActivateSession event, so
+        // the main loop is the only thing that drives recovery.
+        // ponytail: no retry cap — if master never returns the panel is dead
+        // anyway; the user can VT-switch out. Add a cap if it ever wedges.
+        if data.power_state == PowerState::Degraded
+            && data
+                .resume_retry_at
+                .is_none_or(|at| Instant::now() >= at)
+        {
+            data.resume_retry_at = Some(Instant::now() + RESUME_RETRY_INTERVAL);
+            // If our session is inactive, NVIDIA's resume `chvt`-back left the
+            // kernel on its scratch VT and never reactivated us — so we never
+            // regain DRM master and every commit EACCESes. Re-assert our VT to
+            // force logind/libseat to reactivate, the programmatic equivalent of
+            // the Ctrl+Alt+Fn switch that recovers it by hand.
+            if let (Some(vt), Some(session)) = (data.session_vt, data.state.session.as_mut())
+                && !session.is_active()
+            {
+                match session.change_vt(vt) {
+                    Ok(()) => tracing::info!(
+                        target: "beewm::power", vt,
+                        "re-asserting VT to recover DRM master after resume",
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "beewm::power", %error, vt, "resume VT re-assert failed",
+                    ),
+                }
+            }
+            handle_resume(&mut data, ResumeSource::Watchdog);
+        }
+
         // All event sources (DRM VBlank, Wayland fd, libinput, IPC, config
         // watcher) wake calloop immediately when they have data, so the
         // dispatch timeout is just an upper bound when the compositor is
@@ -735,6 +798,16 @@ fn handle_prepare_suspend(data: &mut UdevData, source: &'static str) {
     } else if data.state.config.lock_on_resume || data.state.locked {
         data.resume_lock_pending = true;
     }
+
+    // Draw one (now-locked) frame while the GPU is still up, then release the
+    // device. logind delays the actual suspend until we ack this handler, so the
+    // GPU is guaranteed alive here — but once it powers down, an in-flight atomic
+    // commit blocks forever and wedges the whole event loop (the nvidia
+    // no-freeze-session setup keeps us running straight into suspend). Pausing
+    // now means the main loop issues no commits during the suspend window and
+    // stays responsive to drive recovery on resume.
+    force_frame(data);
+    pause_drm(data);
 }
 
 fn handle_resume(data: &mut UdevData, source: ResumeSource) {
@@ -764,6 +837,7 @@ fn handle_resume(data: &mut UdevData, source: ResumeSource) {
             rescan_connectors(data);
         }
         data.power_state = PowerState::Awake;
+        data.resume_retry_at = None;
         tracing::info!(target: "beewm::power", "resume completed");
     } else {
         data.power_state = PowerState::Degraded;
@@ -803,6 +877,10 @@ fn pause_drm(data: &mut UdevData) {
 }
 
 fn activate_drm(data: &mut UdevData, force_reset: bool) -> bool {
+    // Read before borrowing `gpu` (both live on `data`); needed to rebuild
+    // surfaces below.
+    let refresh_rate = data.state.config.refresh_rate;
+    let output_configs = data.state.config.outputs.clone();
     let Some(gpu) = data.gpu.as_mut() else {
         return true;
     };
@@ -847,24 +925,58 @@ fn activate_drm(data: &mut UdevData, force_reset: bool) -> bool {
         "DRM device activated",
     );
 
-    for surface in &mut gpu.surfaces {
-        if let Err(err) = surface.compositor.reset_state() {
-            tracing::error!(
-                target: "beewm::power",
-                output = %surface.output.name(),
-                "failed to reset compositor state after resume: {}",
-                err,
-            );
-            surface.can_render = false;
-            surface.retry_after = Some(Instant::now() + FRAME_FAILURE_RETRY_MAX);
-        } else {
-            surface.can_render = true;
-            surface.retry_after = None;
-            surface.consecutive_frame_failures = 0;
+    // Rebuild each surface's DrmCompositor from scratch rather than resetting the
+    // suspended one — the stale KMS state otherwise hangs the first commit (see
+    // `rebuild_surface_compositor`). A failure here means master/KMS isn't truly
+    // back yet, so report degraded and let the caller retry.
+    let GpuData {
+        drm_device,
+        gbm_device,
+        drm_fd,
+        renderer_formats,
+        color_formats,
+        cursor_size,
+        surfaces,
+        ..
+    } = gpu;
+    let color_formats = *color_formats;
+    let cursor_size = *cursor_size;
+    let mut all_ok = true;
+    for surface in surfaces.iter_mut() {
+        match rebuild_surface_compositor(
+            drm_device,
+            gbm_device,
+            drm_fd,
+            renderer_formats,
+            color_formats,
+            cursor_size,
+            surface,
+            refresh_rate,
+            &output_configs,
+        ) {
+            Ok(()) => {
+                surface.can_render = true;
+                surface.retry_after = None;
+                surface.consecutive_frame_failures = 0;
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "beewm::power",
+                    output = %surface.output.name(),
+                    "failed to rebuild compositor after resume: {}",
+                    err,
+                );
+                surface.can_render = false;
+                surface.retry_after = Some(Instant::now() + FRAME_FAILURE_RETRY_MAX);
+                all_ok = false;
+            }
         }
         surface.pending_presentation_feedback = None;
         surface.frame_stats = FrameStats::new();
         surface.present_stats = PresentStats::new();
+    }
+    if !all_ok {
+        return false;
     }
 
     // Whoever owned the VT meanwhile (firmware, agetty, another compositor)
@@ -897,7 +1009,9 @@ fn process_backend_requests(data: &mut UdevData) {
                         // a frame brings DPMS back on per DrmCompositor::clear).
                         surface.can_render = true;
                         surface.retry_after = None;
-                    } else if let Err(err) = surface.compositor.clear() {
+                    } else if let Some(Err(err)) =
+                        surface.compositor.as_mut().map(|c| c.clear())
+                    {
                         tracing::warn!(
                             target: "beewm::idle",
                             "DPMS off (clear) failed: {:?}", err
@@ -1039,7 +1153,7 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
             crtc,
             output: reused_output.clone(),
             position,
-            compositor,
+            compositor: Some(compositor),
             can_render: true,
             retry_after: None,
             consecutive_frame_failures: 0,
@@ -1172,6 +1286,11 @@ fn record_frame_failure<E: std::fmt::Debug>(
 fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &mut SurfaceData) {
     surface.can_render = false;
 
+    // No KMS surface right now (torn down across suspend, awaiting rebuild).
+    if surface.compositor.is_none() {
+        return;
+    }
+
     let frame_start = Instant::now();
 
     let wedge_trace = crate::compositor::runtime_flags::flags().wedge_trace;
@@ -1289,7 +1408,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
             "render_frame: begin",
         );
     }
-    let result = surface.compositor.render_frame::<_, OutputRenderElement>(
+    let result = surface.compositor.as_mut().unwrap().render_frame::<_, OutputRenderElement>(
         renderer,
         &elements,
         clear_color,
@@ -1327,7 +1446,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
                 if wedge_trace {
                     tracing::warn!(target: "beewm::wedge", "queue_frame: begin (atomic commit)");
                 }
-                let r = surface.compositor.queue_frame(());
+                let r = surface.compositor.as_mut().unwrap().queue_frame(());
                 if wedge_trace {
                     tracing::warn!(target: "beewm::wedge", ok = r.is_ok(), "queue_frame: returned");
                 }
@@ -1586,34 +1705,6 @@ fn init_gpu(
     use smithay::backend::allocator::Fourcc;
     let color_formats = [Fourcc::Argb8888, Fourcc::Xrgb8888];
 
-    let nvidia_drm = is_nvidia_drm_device(&drm_fd);
-    let syncobj_state = if crate::compositor::runtime_flags::flags().explicit_sync_disabled {
-        tracing::warn!("Explicit sync disabled by BEEWM_NO_EXPLICIT_SYNC");
-        None
-    } else if nvidia_drm {
-        tracing::warn!(
-            target: "beewm::sync",
-            "explicit sync disabled on NVIDIA DRM device; IN_FENCE_FD atomic commits are unreliable across suspend/resume",
-        );
-        None
-    } else if supports_syncobj_eventfd(&drm_fd) {
-        tracing::info!(
-            target: "beewm::sync",
-            "explicit sync enabled (linux-drm-syncobj-v1 with eventfd waits)"
-        );
-        Some(DrmSyncobjState::new::<Beewm>(
-            display_handle,
-            drm_fd.clone(),
-        ))
-    } else {
-        tracing::info!(
-            target: "beewm::sync",
-            "DRM syncobj eventfd unsupported on {} — explicit sync off",
-            path.display()
-        );
-        None
-    };
-
     // ── One surface per connected connector ──────────────────────────────────
     // Multi-head is gated on BEEWM_MULTI_OUTPUT; with the gate off we drive only
     // the first connected connector, exactly as before.
@@ -1695,6 +1786,35 @@ fn init_gpu(
     if surfaces.is_empty() {
         return Err("No connected display with a usable CRTC found".into());
     }
+
+    let nvidia_drm = is_nvidia_drm_device(&drm_fd);
+    let syncobj_state = if crate::compositor::runtime_flags::flags().explicit_sync_disabled {
+        tracing::warn!("Explicit sync disabled by BEEWM_NO_EXPLICIT_SYNC");
+        None
+    } else if nvidia_drm {
+        tracing::warn!(
+            target: "beewm::sync",
+            "explicit sync disabled on NVIDIA DRM device; IN_FENCE_FD atomic commits are unreliable across suspend/resume",
+        );
+        None
+    } else if supports_syncobj_eventfd(&drm_fd) {
+        tracing::info!(
+            target: "beewm::sync",
+            "explicit sync enabled (linux-drm-syncobj-v1 with eventfd waits)"
+        );
+        Some(DrmSyncobjState::new::<Beewm>(
+            display_handle,
+            drm_fd.clone(),
+        ))
+    } else {
+        tracing::info!(
+            target: "beewm::sync",
+            "DRM syncobj eventfd unsupported on {} — explicit sync off",
+            path.display()
+        );
+        None
+    };
+
     tracing::info!(
         "Initialized {} output surface(s) on {}",
         surfaces.len(),
@@ -1716,7 +1836,7 @@ fn init_gpu(
                     && let Some(surface) =
                         gpu.surfaces.iter_mut().find(|surface| surface.crtc == crtc)
                 {
-                    if let Err(e) = surface.compositor.frame_submitted() {
+                    if let Some(Err(e)) = surface.compositor.as_mut().map(|c| c.frame_submitted()) {
                         tracing::error!("frame_submitted error: {:?}", e);
                     }
                     surface.can_render = true;
@@ -1818,6 +1938,56 @@ struct SurfaceBuildParams<'a> {
     position: Point<i32, Logical>,
 }
 
+/// Replace a surface's `DrmCompositor` with a freshly created one (new KMS
+/// surface, new GBM swapchain), reusing the existing `Output`.
+///
+/// This is the resume recovery path. After suspend the NVIDIA driver leaves the
+/// old `DrmCompositor`'s KMS state stale: `reset_state()` is not enough, and the
+/// first atomic commit on it hangs the whole event loop (the panel never lights
+/// — "atomic commits unreliable across suspend/resume"). Building a brand-new
+/// compositor reproduces the boot path, which always does a clean modeset, while
+/// keeping the same `Output` so wl_output clients aren't disturbed.
+fn rebuild_surface_compositor(
+    drm_device: &mut DrmDevice,
+    gbm_device: &GbmDevice<DrmDeviceFd>,
+    drm_fd: &DrmDeviceFd,
+    renderer_formats: &[Format],
+    color_formats: [smithay::backend::allocator::Fourcc; 2],
+    cursor_size: smithay::utils::Size<u32, smithay::utils::Buffer>,
+    surface: &mut SurfaceData,
+    refresh_rate: Option<u32>,
+    output_configs: &[OutputConfig],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn_info = drm_fd.get_connector(surface.connector, false)?;
+    let name = connector_name(&conn_info);
+    let cfg = config_for_output(output_configs, &name);
+    let drm_mode = resolve_connector_mode(&conn_info, cfg, refresh_rate)
+        .ok_or("no usable mode for connector on resume")?;
+
+    // Drop the old compositor first: it holds the CRTC's primary-plane claim, and
+    // `create_surface` would fail with NoPlane while that claim is live.
+    surface.compositor = None;
+    let drm_surface = drm_device.create_surface(surface.crtc, drm_mode, &[surface.connector])?;
+    let gbm_allocator = GbmAllocator::new(
+        gbm_device.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+    );
+    let gbm_exporter = GbmFramebufferExporter::new(gbm_device.clone(), None);
+    let compositor = DrmCompositor::new(
+        &surface.output,
+        drm_surface,
+        None,
+        gbm_allocator,
+        gbm_exporter,
+        color_formats,
+        renderer_formats.to_vec(),
+        cursor_size,
+        Some(gbm_device.clone()),
+    )?;
+    surface.compositor = Some(compositor);
+    Ok(())
+}
+
 fn build_surface_for_connector(
     drm_device: &mut DrmDevice,
     gbm_device: &GbmDevice<DrmDeviceFd>,
@@ -1904,7 +2074,7 @@ fn build_surface_for_connector(
         crtc: crtc_handle,
         output,
         position,
-        compositor,
+        compositor: Some(compositor),
         can_render: true, // allow the first frame immediately
         retry_after: None,
         consecutive_frame_failures: 0,
