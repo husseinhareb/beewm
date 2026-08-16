@@ -1,10 +1,10 @@
 # beewm
 
-A Wayland tiling window manager written in Rust.
+A tiling Wayland compositor written in Rust.
 
 ## Features
 
-- Wayland compositor backend
+- Native DRM/KMS backend, plus a nested (winit) backend for development
 - Dwindle tiling layout
 - Optional master-stack layout
 - i3-style numbered workspaces
