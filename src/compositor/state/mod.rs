@@ -61,6 +61,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWaylandClientData};
 
 use crate::compositor::animation::AnimationManager;
+use crate::compositor::overview::Overview;
 use crate::config::{Config, Keybind, LayoutKind, OutputModeSpec};
 use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
@@ -296,6 +297,19 @@ pub struct Beewm {
     /// no-buffer round-trip commits during the initial map handshake never
     /// trip the unmap path.
     pub(crate) mapped_with_buffer: HashSet<WlSurface>,
+    /// The hold-Super window overview, while it is on screen. See
+    /// [`crate::compositor::overview`].
+    pub(crate) overview: Option<Overview>,
+    /// When Super went down with nothing else pressed. The overview opens once
+    /// this is [`crate::compositor::overview::HOLD_DELAY`] old, and is cleared
+    /// as soon as any other key or pointer button is pressed.
+    pub(crate) overview_hold: Option<Instant>,
+    /// Whether Super was down after the previous key event, so press/release
+    /// edges can be told apart from repeats and from other modifier keys.
+    pub(crate) logo_held: bool,
+    /// Button whose press the overview consumed, so its release is dropped
+    /// instead of reaching a client that never saw the press.
+    pub(crate) overview_swallowed_button: Option<u32>,
     /// Active pointer grab (move, resize, or tiled swap). Only one can be
     /// active at a time.
     pub active_grab: Option<ActiveGrab>,
@@ -484,6 +498,10 @@ impl Beewm {
             pending_float_centers: HashSet::new(),
             pending_should_float: HashSet::new(),
             mapped_with_buffer: HashSet::new(),
+            overview: None,
+            overview_hold: None,
+            logo_held: false,
+            overview_swallowed_button: None,
             active_grab: None,
             tiled_swap_target: None,
             resolved_keybinds,
@@ -873,6 +891,10 @@ impl Beewm {
     }
 
     fn cancel_interactions_for_lock(&mut self) {
+        // The overview is not rendered while locked; drop it (without focusing
+        // anything) so it can't reappear over the session after unlock.
+        self.close_overview(false);
+        self.overview_hold = None;
         let active_grab = self.active_grab.take();
         if let Some(super::types::ActiveGrab::TiledSwap(grab)) = &active_grab {
             if let Some(layout_snapshot) = self.tiled_swap_layout_snapshot.take() {

@@ -223,6 +223,12 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     }
     state.pointer_location = new_pos;
 
+    // While the overview grid is up it owns the pointer: hovering a thumbnail
+    // selects it and nothing reaches the clients behind it.
+    if state.overview_pointer_moved(new_pos) {
+        return;
+    }
+
     if handle_active_grab(state, new_pos) {
         return;
     }
@@ -301,6 +307,10 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
     }
     state.pointer_location = pos;
 
+    if state.overview_pointer_moved(pos) {
+        return;
+    }
+
     if handle_active_grab(state, pos) {
         return;
     }
@@ -358,6 +368,26 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
     let serial = SERIAL_COUNTER.next_serial();
     let button = event.button_code();
     let btn_state = event.state();
+
+    // A button going down cancels a *pending* overview, so holding Super to
+    // start a `mod+drag` never turns into the grid, and picks the hovered
+    // thumbnail when the grid is already up. The matching release is swallowed
+    // too, so no client sees a release it never saw a press for.
+    match btn_state {
+        ButtonState::Pressed => {
+            state.cancel_overview_hold();
+            if state.overview_pointer_pressed() {
+                state.overview_swallowed_button = Some(button);
+                return;
+            }
+        }
+        ButtonState::Released => {
+            if state.overview_swallowed_button == Some(button) {
+                state.overview_swallowed_button = None;
+                return;
+            }
+        }
+    }
 
     if button == BTN_LEFT && btn_state == ButtonState::Pressed {
         if try_start_move_grab(state) {

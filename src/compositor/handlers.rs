@@ -867,6 +867,8 @@ impl SessionLockHandler for Beewm {
         // keep input. Per-output lock surfaces (and their focus) arrive via
         // `new_surface`.
         self.set_keyboard_focus_target(None);
+        self.close_overview(false);
+        self.overview_hold = None;
         self.locked = true;
         // Confirm to the client that the session is locked. After this the
         // protocol guarantees the session stays locked for this lock's lifetime;

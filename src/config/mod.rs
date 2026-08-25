@@ -118,6 +118,10 @@ pub struct Config {
     pub lock_on_suspend: bool,
     /// Keep the resumed session locked until the lock client authenticates.
     pub lock_on_resume: bool,
+    /// Show the hold-Super window overview. See
+    /// [`crate::compositor::overview`]; disable with `overview_enabled false`
+    /// if you would rather Super never did anything on its own.
+    pub overview_enabled: bool,
     /// Per-output configuration from `output <name> …` directives.
     pub outputs: Vec<OutputConfig>,
     pub autostart_commands: Vec<String>,
@@ -162,6 +166,7 @@ impl Default for Config {
             lock_command: "beelock".to_string(),
             lock_on_suspend: true,
             lock_on_resume: true,
+            overview_enabled: true,
             outputs: Vec::new(),
             autostart_commands: Vec::new(),
             keybinds: Self::default_keybinds_for(num_workspaces),
@@ -447,6 +452,13 @@ impl Config {
         text.push_str(&format!("lock_command {}\n", default.lock_command));
         text.push_str(&format!("lock_on_suspend {}\n", default.lock_on_suspend));
         text.push_str(&format!("lock_on_resume {}\n", default.lock_on_resume));
+        text.push('\n');
+        text.push_str("# Hold Super (with nothing else pressed) to show a grid of every open\n");
+        text.push_str("# window; Tab/arrows or the mouse pick one, releasing Super switches to it.\n");
+        text.push_str(&format!(
+            "overview_enabled {}\n",
+            default.overview_enabled
+        ));
         text.push('\n');
         text.push_str(
             "# Multi-monitor: arrange outputs by connector name (DP-3, eDP-1, HDMI-A-1).\n",

@@ -99,6 +99,10 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.lock_on_resume = parse_bool(value, line_no, directive)?;
             }
+            "overview_enabled" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.overview_enabled = parse_bool(value, line_no, directive)?;
+            }
             // Primary, `key value` form — consistent with the rest of the config.
             "tray_enabled" => {
                 let value = expect_single_argument(parts, line_no, directive)?;

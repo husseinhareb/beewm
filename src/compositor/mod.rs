@@ -11,6 +11,7 @@ mod handlers;
 mod input;
 mod ipc;
 mod layering;
+pub mod overview;
 pub(crate) mod power;
 mod render;
 pub(crate) mod runtime_flags;

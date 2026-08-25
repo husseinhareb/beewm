@@ -49,6 +49,7 @@ use crate::compositor::input::leds::LedDeviceRegistry;
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
 use crate::compositor::power::{PowerEvent, PowerState, ResumeSource};
+use crate::compositor::overview::overview_elements;
 use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
@@ -670,6 +671,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // sets `needs_render` so we keep repainting (gated by `can_render` /
         // VBlank, so no busy loop), and clears back to idle when they finish.
         data.state.tick_animations(Instant::now());
+        data.state.tick_overview(Instant::now());
 
         // A resume left the DRM device unusable (typically EACCES because we
         // didn't hold DRM master yet). Keep re-attempting activation — master
@@ -719,6 +721,10 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         //   default woke calloop ~50 times/sec for nothing).
         let timeout = if data.state.active_grab.is_some() {
             Duration::from_millis(1)
+        } else if data.state.overview_hold.is_some() {
+            // Super is down: poll often enough that the overview grid comes up
+            // on time instead of up to an idle tick late.
+            Duration::from_millis(20)
         } else if data.state.needs_render {
             Duration::from_millis(16)
         } else {
@@ -1376,6 +1382,8 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
         Vec::new()
     };
 
+    let (overview_quads, overview_thumbnails) = overview_elements(state, renderer, &output);
+
     let count_windows = window_elements.len();
     let count_borders = border_elements.len();
     let count_cursor = cursor_elements.len();
@@ -1388,6 +1396,9 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
     if locked {
         elements.extend(lock_elements.into_iter().map(OutputRenderElement::from));
     } else {
+        // The overview grid sits above everything else on screen.
+        elements.extend(overview_thumbnails.into_iter().map(OutputRenderElement::from));
+        elements.extend(overview_quads.into_iter().map(OutputRenderElement::from));
         elements.extend(layers_above.into_iter().map(OutputRenderElement::from));
         elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
         elements.extend(window_elements.into_iter().map(OutputRenderElement::from));

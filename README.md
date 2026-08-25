@@ -9,6 +9,7 @@ A tiling Wayland compositor written in Rust.
 - Optional master-stack layout
 - i3-style numbered workspaces
 - i3-style text configuration
+- Hold-Super window overview (task view) across all workspaces
 
 ## Building
 
@@ -44,6 +45,22 @@ exec waybar
 exec nm-applet
 
 bindsym $mod+Return exec kitty
+```
+
+## Window overview
+
+Hold **Super** on its own for ~200 ms and every open window — across all
+workspaces — is laid out as a grid of live thumbnails sized to the screen
+(10 windows on a 16:9 display come out as 5 columns × 2 rows). While Super is
+held, `Tab`/`Shift+Tab`, the arrow keys or the pointer move the selection;
+releasing Super switches to the selected window (changing workspace if it lives
+on another one) and the grid disappears. `Esc` dismisses it without switching.
+
+Pressing any other key or a mouse button while Super is down cancels it, so
+`$mod+…` keybindings and `$mod+drag` never see the grid. Turn it off with:
+
+```text
+overview_enabled false
 ```
 
 ## Screen sharing & recording

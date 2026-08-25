@@ -281,7 +281,7 @@ impl Beewm {
         }
     }
 
-    fn focus_active_workspace_window(&mut self, idx: usize) {
+    pub(crate) fn focus_active_workspace_window(&mut self, idx: usize) {
         let Some(window) = self.workspaces[self.active_workspace()]
             .windows
             .get(idx)

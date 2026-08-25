@@ -29,6 +29,7 @@ use crate::compositor::feedback::{
 };
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
+use crate::compositor::overview::overview_elements;
 use crate::compositor::render::{
     WindowElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
@@ -394,11 +395,15 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // any animation is active this sets `needs_render`, so the loop keeps
         // repainting at ~refresh rate and settles back to idle once they finish.
         data.state.tick_animations(Instant::now());
+        data.state.tick_overview(Instant::now());
 
         // See run_udev for the rationale: rely on event sources to wake us
         // and treat the timeout purely as an idle ceiling.
         let timeout = if data.state.active_grab.is_some() {
             Duration::from_millis(1)
+        } else if data.state.overview_hold.is_some() {
+            // Super is down: poll often enough that the grid comes up on time.
+            Duration::from_millis(20)
         } else if data.state.needs_render {
             Duration::from_millis(16)
         } else {
@@ -475,6 +480,9 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             1.0,
                         );
 
+                        let (overview_quads, overview_thumbnails) =
+                            overview_elements(&data.state, renderer, output);
+
                         // While locked, render only the lock surface (over a
                         // solid-black clear); never the windows/layers/borders
                         // underneath. See the udev backend for the rationale.
@@ -487,6 +495,14 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             elements
                                 .extend(lock_elements.into_iter().map(WinitRenderElement::from));
                         } else {
+                            // The overview sits above everything else on screen.
+                            elements.extend(
+                                overview_thumbnails
+                                    .into_iter()
+                                    .map(WinitRenderElement::from),
+                            );
+                            elements
+                                .extend(overview_quads.into_iter().map(WinitRenderElement::from));
                             elements.extend(layers_above.into_iter().map(WinitRenderElement::from));
                             elements
                                 .extend(border_elements.into_iter().map(WinitRenderElement::from));

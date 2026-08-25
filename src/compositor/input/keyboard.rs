@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use smithay::backend::input::{Event, InputBackend, KeyState, KeyboardKeyEvent};
 use smithay::backend::session::Session;
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, xkb};
@@ -47,12 +49,27 @@ pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::Keyb
                 // surface. This is what stops `mod+enter` (or any bind) from
                 // opening a terminal behind the lock. VT switching above is
                 // intentionally still allowed; the lock persists across VTs.
-                if !state.locked
-                    && let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle)
-                {
-                    execute_action(state, action);
-                    return FilterResult::Intercept(());
+                if !state.locked {
+                    // The overview runs ahead of the keybinds: it owns Super's
+                    // press/release edges and, while it is on screen, the
+                    // navigation keys.
+                    if state.overview_handle_key(modifiers, keysym, true, Instant::now()) {
+                        return FilterResult::Intercept(());
+                    }
+                    if let Some(action) = match_keybind(state, modifiers, keycode, &keysym_handle) {
+                        execute_action(state, action);
+                        return FilterResult::Intercept(());
+                    }
                 }
+            } else if !state.locked {
+                // Releases are never intercepted — the client has to see every
+                // key go up — but Super going up is what dismisses the grid.
+                state.overview_handle_key(
+                    modifiers,
+                    keysym_handle.modified_sym(),
+                    false,
+                    Instant::now(),
+                );
             }
             FilterResult::Forward
         },
