@@ -736,7 +736,8 @@ mod tests {
         assert_eq!((w, h), (ICON_SIZE, ICON_SIZE));
         assert_eq!(data.len(), (w * h * 4) as usize);
         // Some fully-opaque white pixels make up the glyph, the rest transparent.
-        assert!(data.chunks_exact(4).any(|p| p == [0xff, 0xff, 0xff, 0xff]));
-        assert!(data.chunks_exact(4).any(|p| p[0] == 0x00));
+        let pixels = data.as_chunks::<4>().0;
+        assert!(pixels.contains(&[0xff, 0xff, 0xff, 0xff]));
+        assert!(pixels.iter().any(|p| p[0] == 0x00));
     }
 }
