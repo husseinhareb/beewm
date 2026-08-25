@@ -1,5 +1,7 @@
 # beewm
 
+[![CI](https://github.com/husseinhareb/beewm/actions/workflows/ci.yml/badge.svg)](https://github.com/husseinhareb/beewm/actions/workflows/ci.yml)
+
 A tiling Wayland compositor written in Rust.
 
 ## Features

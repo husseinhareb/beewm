@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a branch makes the run already in flight for it pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Pinned rather than `ubuntu-latest`: the apt package names below (notably
+    # libegl1-mesa-dev) are what this release ships, and it is the image
+    # Smithay itself validates against.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Native libraries the -sys crates link against: libdrm, libseat,
+      # libudev, libinput, gbm, xkbcommon, EGL and wayland-{client,cursor,egl,
+      # server}. Taken from Smithay's own CI, which covers the feature set we
+      # enable. No bindgen anywhere in the tree, so no libclang needed.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libdrm-dev libudev-dev libgbm-dev libxkbcommon-dev \
+            libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev \
+            libsystemd-dev libseat-dev libdisplay-info-dev
+
+      # The crate is edition 2024 and uses let-chains, so it needs a current
+      # stable — newer than the toolchain baked into the runner image.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal -c rustfmt -c clippy --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

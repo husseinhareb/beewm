@@ -48,8 +48,8 @@ use crate::compositor::feedback::{
 use crate::compositor::input::leds::LedDeviceRegistry;
 use crate::compositor::ipc;
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
-use crate::compositor::power::{PowerEvent, PowerState, ResumeSource};
 use crate::compositor::overview::overview_elements;
+use crate::compositor::power::{PowerEvent, PowerState, ResumeSource};
 use crate::compositor::render::{
     OutputRenderElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
@@ -681,9 +681,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // ponytail: no retry cap — if master never returns the panel is dead
         // anyway; the user can VT-switch out. Add a cap if it ever wedges.
         if data.power_state == PowerState::Degraded
-            && data
-                .resume_retry_at
-                .is_none_or(|at| Instant::now() >= at)
+            && data.resume_retry_at.is_none_or(|at| Instant::now() >= at)
         {
             data.resume_retry_at = Some(Instant::now() + RESUME_RETRY_INTERVAL);
             // If our session is inactive, NVIDIA's resume `chvt`-back left the
@@ -1015,9 +1013,7 @@ fn process_backend_requests(data: &mut UdevData) {
                         // a frame brings DPMS back on per DrmCompositor::clear).
                         surface.can_render = true;
                         surface.retry_after = None;
-                    } else if let Some(Err(err)) =
-                        surface.compositor.as_mut().map(|c| c.clear())
-                    {
+                    } else if let Some(Err(err)) = surface.compositor.as_mut().map(|c| c.clear()) {
                         tracing::warn!(
                             target: "beewm::idle",
                             "DPMS off (clear) failed: {:?}", err
@@ -1397,7 +1393,11 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
         elements.extend(lock_elements.into_iter().map(OutputRenderElement::from));
     } else {
         // The overview grid sits above everything else on screen.
-        elements.extend(overview_thumbnails.into_iter().map(OutputRenderElement::from));
+        elements.extend(
+            overview_thumbnails
+                .into_iter()
+                .map(OutputRenderElement::from),
+        );
         elements.extend(overview_quads.into_iter().map(OutputRenderElement::from));
         elements.extend(layers_above.into_iter().map(OutputRenderElement::from));
         elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
@@ -1419,12 +1419,16 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
             "render_frame: begin",
         );
     }
-    let result = surface.compositor.as_mut().unwrap().render_frame::<_, OutputRenderElement>(
-        renderer,
-        &elements,
-        clear_color,
-        FrameFlags::DEFAULT,
-    );
+    let result = surface
+        .compositor
+        .as_mut()
+        .unwrap()
+        .render_frame::<_, OutputRenderElement>(
+            renderer,
+            &elements,
+            clear_color,
+            FrameFlags::DEFAULT,
+        );
     if wedge_trace {
         tracing::warn!(target: "beewm::wedge", ok = result.is_ok(), "render_frame: returned");
     }
@@ -1958,6 +1962,9 @@ struct SurfaceBuildParams<'a> {
 /// — "atomic commits unreliable across suspend/resume"). Building a brand-new
 /// compositor reproduces the boot path, which always does a clean modeset, while
 /// keeping the same `Output` so wl_output clients aren't disturbed.
+// The argument list mirrors what building a `DrmCompositor` needs; bundling it
+// into a struct would only move the same fields somewhere else.
+#[allow(clippy::too_many_arguments)]
 fn rebuild_surface_compositor(
     drm_device: &mut DrmDevice,
     gbm_device: &GbmDevice<DrmDeviceFd>,

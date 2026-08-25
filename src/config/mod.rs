@@ -454,11 +454,10 @@ impl Config {
         text.push_str(&format!("lock_on_resume {}\n", default.lock_on_resume));
         text.push('\n');
         text.push_str("# Hold Super (with nothing else pressed) to show a grid of every open\n");
-        text.push_str("# window; Tab/arrows or the mouse pick one, releasing Super switches to it.\n");
-        text.push_str(&format!(
-            "overview_enabled {}\n",
-            default.overview_enabled
-        ));
+        text.push_str(
+            "# window; Tab/arrows or the mouse pick one, releasing Super switches to it.\n",
+        );
+        text.push_str(&format!("overview_enabled {}\n", default.overview_enabled));
         text.push('\n');
         text.push_str(
             "# Multi-monitor: arrange outputs by connector name (DP-3, eDP-1, HDMI-A-1).\n",

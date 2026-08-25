@@ -140,11 +140,7 @@ pub fn nav_target(selected: usize, count: usize, cols: usize, nav: OverviewNav) 
         OverviewNav::Up => selected.checked_sub(cols).unwrap_or(selected),
         OverviewNav::Down => {
             let next = selected + cols;
-            if next < count {
-                next
-            } else {
-                selected
-            }
+            if next < count { next } else { selected }
         }
     }
 }
@@ -428,12 +424,7 @@ impl Beewm {
         let Some(overview) = self.overview.as_ref() else {
             return;
         };
-        let target = nav_target(
-            overview.selected,
-            overview.items.len(),
-            overview.cols,
-            nav,
-        );
+        let target = nav_target(overview.selected, overview.items.len(), overview.cols, nav);
         self.set_overview_selection(target);
     }
 
