@@ -474,6 +474,19 @@ fn solid(
     )
 }
 
+/// Shrinks a cell by [`CELL_PADDING`] on every side. The card and the thumbnail
+/// both live in here, so the selection quad behind them shows as a frame.
+fn inset(cell: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (cell.loc.x + CELL_PADDING, cell.loc.y + CELL_PADDING).into(),
+        (
+            (cell.size.w - CELL_PADDING * 2).max(1),
+            (cell.size.h - CELL_PADDING * 2).max(1),
+        )
+            .into(),
+    )
+}
+
 /// Build the overview's render elements for `output`, front-to-back within each
 /// returned list: the thumbnails go above the quads, and both go above
 /// everything else on screen.
@@ -502,14 +515,7 @@ where
 
     let mut thumbnails = Vec::new();
     for (item, cell) in overview.items.iter().zip(&overview.cells) {
-        let inner = Rectangle::new(
-            (cell.loc.x + CELL_PADDING, cell.loc.y + CELL_PADDING).into(),
-            (
-                (cell.size.w - CELL_PADDING * 2).max(1),
-                (cell.size.h - CELL_PADDING * 2).max(1),
-            )
-                .into(),
-        );
+        let inner = inset(*cell);
         // `Fit` + centered keeps every window's own aspect ratio and letterboxes
         // it inside the cell; the card behind it fills the rest.
         thumbnails.extend(constrain_space_element::<R, Window, WindowElement<R>>(
@@ -540,7 +546,7 @@ where
         ));
     }
     for (id, cell) in overview.cell_ids.iter().zip(&overview.cells) {
-        quads.push(solid(id.clone(), *cell, scale, CARD));
+        quads.push(solid(id.clone(), inset(*cell), scale, CARD));
     }
     quads.push(solid(
         overview.backdrop_id.clone(),
