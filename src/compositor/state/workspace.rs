@@ -94,6 +94,12 @@ impl Beewm {
             }
         }
 
+        // A *tiled* sticky window must also leave the old workspace's tiling
+        // tree and join the new one's — otherwise it follows you across
+        // workspaces while keeping the geometry of the workspace it was mapped
+        // on, ignoring the layout of the one it is actually shown on.
+        self.migrate_sticky_tiled_windows(current, idx);
+
         self.set_active_workspace(idx);
         self.publish_workspace_state();
 
@@ -128,6 +134,49 @@ impl Beewm {
             self.set_keyboard_focus(Some(focus));
         } else {
             self.set_keyboard_focus(None);
+        }
+    }
+
+    /// Re-home every tiled sticky window from workspace `from` to workspace
+    /// `to`, so it participates in the target workspace's tiling: alone on an
+    /// empty workspace it takes the whole screen, next to one window it splits
+    /// it, and so on. Floating and fullscreen sticky windows keep their own
+    /// geometry and are left alone.
+    fn migrate_sticky_tiled_windows(&mut self, from: usize, to: usize) {
+        let moving: Vec<usize> = self.workspaces[from]
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| {
+                Self::window_root_surface(window)
+                    .map(|root| {
+                        self.sticky_windows.contains(&root)
+                            && !self.is_root_floating(&root)
+                            && !self.is_root_fullscreen(&root)
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Back to front so the remaining indices stay valid as we remove.
+        for idx in moving.into_iter().rev() {
+            let split_target = self.focused_tiled_window_root(to);
+            let Some(window) = self.workspaces[from].remove_window(idx) else {
+                continue;
+            };
+            if let Some(root) = Self::window_root_surface(&window) {
+                self.remove_tiled_window(from, &root);
+            }
+            // Preserve the target workspace's own focus: `add_window` focuses
+            // what it pushes, which would hand the sticky window the keyboard
+            // on every single workspace switch.
+            let focused = self.workspaces[to].focused_idx;
+            self.workspaces[to].add_window(window.clone());
+            if focused.is_some() {
+                self.workspaces[to].focused_idx = focused;
+            }
+            self.insert_tiled_window(to, &window, split_target.as_ref());
         }
     }
 

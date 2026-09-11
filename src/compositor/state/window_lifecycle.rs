@@ -577,13 +577,16 @@ impl Beewm {
         tracing::info!(target: "beewm::floating", id = root.id().protocol_id(), "stuck window to all workspaces");
     }
 
-    /// Raise every mapped sticky window to the top of the stack. Called after a
-    /// workspace switch so they don't end up behind the new workspace's tiles.
+    /// Raise every mapped sticky window to the top of the stack. Called from
+    /// every path that re-stacks windows (workspace switch, and
+    /// `raise_floating_windows`, which every focus/map/drag path already calls)
+    /// so a sticky window is never covered.
     pub(crate) fn raise_sticky_windows(&mut self) {
         let sticky: Vec<WlSurface> = self.sticky_windows.iter().cloned().collect();
         for root in sticky {
             if let Some(window) = self.mapped_window_for_surface(&root) {
-                self.space.raise_element(&window, true);
+                // `activate = false`: only the z-position is being corrected.
+                self.space.raise_element(&window, false);
             }
         }
     }

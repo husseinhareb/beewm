@@ -306,6 +306,8 @@ impl Beewm {
             .unwrap_or(false);
         if !raised_floating {
             self.raise_floating_windows();
+        } else {
+            self.raise_sticky_windows();
         }
         // Sync the X11 z-order. Without this, XWayland still thinks the
         // previously-focused X11 window is on top and routes pointer events

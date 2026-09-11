@@ -478,3 +478,30 @@ fn adjust_split_ratio<T: Clone + Eq>(ratio: &mut f64, adjustment: SplitRatioAdju
     let new_first_span = (current_first_span as i32 + delta).clamp(lower, upper);
     *ratio = sanitize_split_ratio(new_first_span as f64 / total_span as f64);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DwindleTree;
+    use crate::model::window::Geometry;
+
+    /// The contract a sticky window relies on when it is re-homed into another
+    /// workspace's tree with no split target: alone it owns the screen, and
+    /// joining a single existing window halves it.
+    #[test]
+    fn insert_without_a_target_takes_the_screen_then_splits_it() {
+        let screen = Geometry::new(0, 0, 800, 600);
+        let mut tree = DwindleTree::default();
+
+        tree.insert(None, "pip");
+        assert_eq!(tree.geometries(&screen), vec![("pip", screen)]);
+
+        tree.insert(None, "other");
+        assert_eq!(
+            tree.geometries(&screen),
+            vec![
+                ("pip", Geometry::new(0, 0, 400, 600)),
+                ("other", Geometry::new(400, 0, 400, 600)),
+            ]
+        );
+    }
+}

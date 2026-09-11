@@ -181,5 +181,9 @@ impl Beewm {
             // not toggled — only their z-position is corrected.
             self.space.raise_element(&window, false);
         }
+        // Sticky windows (browser Picture-in-Picture) must stay above the
+        // floating stack too. They live in their home workspace's window list,
+        // so the loop above never sees them once you switch away.
+        self.raise_sticky_windows();
     }
 }
