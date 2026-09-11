@@ -19,6 +19,7 @@ mod screencopy;
 pub(crate) mod state;
 pub(crate) mod tray;
 pub mod types;
+mod virtual_input;
 
 pub use backend::{run_udev, run_winit};
 pub use input::leds::{

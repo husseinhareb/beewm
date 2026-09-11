@@ -72,6 +72,11 @@ use super::diagnostics::{CommitTracker, SyncStats};
 use super::event_broadcast::EventBroadcaster;
 use super::input::leds::{KeyboardLeds, KeyboardStatus};
 use super::screencopy::{PendingScreencopyFrame, create_screencopy_global};
+use super::virtual_input::{
+    create_output_manager_global, create_virtual_keyboard_manager_global,
+    create_virtual_pointer_manager_global,
+};
+use smithay::reexports::wayland_protocols_wlr::output_management::v1::server::zwlr_output_manager_v1::ZwlrOutputManagerV1;
 
 use super::cursor::CursorThemeManager;
 use super::tray::{MenuAction, MenuItem, ModeMenu, SharedMenu, TrayHandle, build_menu_items};
@@ -173,6 +178,12 @@ pub struct Beewm {
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub _screencopy_global: GlobalId,
+    pub _virtual_keyboard_manager_global: GlobalId,
+    pub _virtual_pointer_manager_global: GlobalId,
+    pub _output_management_global: GlobalId,
+    /// Bound `zwlr_output_manager_v1` objects, so an output hotplug can push
+    /// each of them a fresh head list instead of leaving it stale.
+    pub(crate) output_managers: Vec<ZwlrOutputManagerV1>,
     pub dmabuf_state: DmabufState,
     pub _dmabuf_global: Option<DmabufGlobal>,
     pub drm_syncobj_state: Option<DrmSyncobjState>,
@@ -389,6 +400,12 @@ impl Beewm {
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
         let screencopy_global = create_screencopy_global::<Self>(&display_handle);
+        // Input-injection globals for remote-control tools such as `wayvnc`.
+        let virtual_keyboard_manager_global =
+            create_virtual_keyboard_manager_global::<Self>(&display_handle);
+        let virtual_pointer_manager_global =
+            create_virtual_pointer_manager_global::<Self>(&display_handle);
+        let output_management_global = create_output_manager_global::<Self>(&display_handle);
         let dmabuf_state = DmabufState::new();
         let presentation_clock = Clock::<Monotonic>::new();
         let presentation_state =
@@ -455,6 +472,10 @@ impl Beewm {
             data_device_state,
             primary_selection_state,
             _screencopy_global: screencopy_global,
+            _virtual_keyboard_manager_global: virtual_keyboard_manager_global,
+            _virtual_pointer_manager_global: virtual_pointer_manager_global,
+            _output_management_global: output_management_global,
+            output_managers: Vec::new(),
             dmabuf_state,
             _dmabuf_global: None,
             drm_syncobj_state: None,

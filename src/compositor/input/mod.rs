@@ -9,6 +9,8 @@ use smithay::wayland::seat::WaylandFocus;
 use super::state::Beewm;
 
 pub use grab::{resize_edges_for_pointer, resized_window_geometry_from_start};
+pub(crate) use keyboard::synthetic_key;
+pub(crate) use pointer::{synthetic_axis, synthetic_button, synthetic_motion_absolute};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;

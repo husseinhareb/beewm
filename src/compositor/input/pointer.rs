@@ -5,7 +5,7 @@ use smithay::backend::input::{
 use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 use smithay::wayland::shell::wlr_layer::{
@@ -299,6 +299,38 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
 
     let output_geo = state.space.output_geometry(&output).unwrap();
     let pos = event.position_transformed(output_geo.size);
+    synthetic_motion_absolute(state, pos, Event::time_msec(&event));
+}
+
+/// Keep `pos` inside `geo`. The far edge is excluded so the point still
+/// hit-tests as being on the output rather than one pixel past it.
+fn clamp_to_output(geo: Rectangle<i32, Logical>, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+    Point::from((
+        pos.x
+            .clamp(geo.loc.x as f64, (geo.loc.x + geo.size.w) as f64 - 1.0),
+        pos.y
+            .clamp(geo.loc.y as f64, (geo.loc.y + geo.size.h) as f64 - 1.0),
+    ))
+}
+
+/// Inject an absolute pointer motion from a source with no backing
+/// `InputBackend` event, e.g. a `wlr-virtual-pointer` client used by VNC or
+/// other remote-control tools. `pos` is already in global compositor logical
+/// coordinates.
+pub(crate) fn synthetic_motion_absolute(state: &mut Beewm, pos: Point<f64, Logical>, time: u32) {
+    state.notify_activity();
+
+    // A source with no backing hardware event (wlr-virtual-pointer relative
+    // motion) can walk the cursor arbitrarily far off-screen, where nothing
+    // hit-tests and there is no way to bring it back. The hardware relative
+    // path clamps for the same reason; do it here so every caller is covered.
+    let pos = match state
+        .output_under_point(pos)
+        .and_then(|output| state.space.output_geometry(&output))
+    {
+        Some(geo) => clamp_to_output(geo, pos),
+        None => pos,
+    };
 
     if pos.x.floor() != state.pointer_location.x.floor()
         || pos.y.floor() != state.pointer_location.y.floor()
@@ -329,7 +361,7 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
         &MotionEvent {
             location: pos,
             serial,
-            time: Event::time_msec(&event),
+            time,
         },
     );
     pointer.frame(state);
@@ -363,11 +395,21 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
     state: &mut Beewm,
     event: I::PointerButtonEvent,
 ) {
+    synthetic_button(
+        state,
+        event.button_code(),
+        event.state(),
+        Event::time_msec(&event),
+    );
+}
+
+/// Inject a button press/release from a source with no backing `InputBackend`
+/// event, e.g. a `wlr-virtual-pointer` client used by VNC or other
+/// remote-control tools.
+pub(crate) fn synthetic_button(state: &mut Beewm, button: u32, btn_state: ButtonState, time: u32) {
     state.notify_activity();
 
     let serial = SERIAL_COUNTER.next_serial();
-    let button = event.button_code();
-    let btn_state = event.state();
 
     // A button going down cancels a *pending* overview, so holding Super to
     // start a `mod+drag` never turns into the grid, and picks the hovered
@@ -474,7 +516,7 @@ pub(super) fn handle_pointer_button<I: InputBackend>(
             button,
             state: btn_state,
             serial,
-            time: Event::time_msec(&event),
+            time,
         },
     );
     pointer.frame(state);
@@ -526,9 +568,58 @@ pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::
     pointer.frame(state);
 }
 
+/// Inject a scroll/axis event from a source with no backing `InputBackend`
+/// event, e.g. a `wlr-virtual-pointer` client used by VNC or other
+/// remote-control tools. `horizontal`/`vertical` are wheel-style deltas.
+pub(crate) fn synthetic_axis(state: &mut Beewm, horizontal: f64, vertical: f64, time: u32) {
+    state.notify_activity();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+
+    let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+    if horizontal != 0.0 {
+        frame = frame.value(Axis::Horizontal, horizontal);
+    }
+    if vertical != 0.0 {
+        frame = frame.value(Axis::Vertical, vertical);
+    }
+
+    pointer.axis(state, frame);
+    pointer.frame(state);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LeftButtonGrabKind, LeftButtonReleaseAction, left_button_release_action};
+    use super::{
+        LeftButtonGrabKind, LeftButtonReleaseAction, clamp_to_output, left_button_release_action,
+    };
+    use smithay::utils::{Point, Rectangle};
+
+    /// A wlr-virtual-pointer client can send an unbounded relative delta. Left
+    /// unclamped the cursor walks off-screen, hit-tests nothing, and there is
+    /// no way to bring it back.
+    #[test]
+    fn out_of_range_motion_is_pulled_back_onto_the_output() {
+        let geo = Rectangle::new((1920, 0).into(), (1920, 1080).into());
+
+        assert_eq!(
+            clamp_to_output(geo, Point::from((-5000.0, 9000.0))),
+            Point::from((1920.0, 1079.0))
+        );
+        assert_eq!(
+            clamp_to_output(geo, Point::from((99999.0, -1.0))),
+            Point::from((3839.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn motion_already_on_the_output_is_untouched() {
+        let geo = Rectangle::new((1920, 0).into(), (1920, 1080).into());
+        let pos = Point::from((2000.5, 300.25));
+
+        assert_eq!(clamp_to_output(geo, pos), pos);
+    }
 
     #[test]
     fn left_release_routes_tiled_swap_grabs_to_swap_completion() {

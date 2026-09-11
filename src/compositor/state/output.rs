@@ -4,6 +4,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
 
+use crate::compositor::virtual_input::refresh_output_heads;
+
 use super::{Beewm, FloatingWindowData};
 
 /// Per-output compositor-side state. Backend/render state (the `DrmCompositor`,
@@ -108,6 +110,7 @@ impl Beewm {
         self.space.map_output(&output, position);
         if let Some(ctx) = self.outputs.iter_mut().find(|ctx| ctx.output == output) {
             ctx.position = position;
+            refresh_output_heads(self);
             return;
         }
         let new_idx = self.outputs.len();
@@ -130,6 +133,7 @@ impl Beewm {
         if self.focused_output >= self.outputs.len() {
             self.focused_output = 0;
         }
+        refresh_output_heads(self);
     }
 
     /// The active (visible) workspace of the focused output. Returns 0 when no
@@ -243,6 +247,7 @@ impl Beewm {
             // Zero-output interval: nothing to render; everything is preserved.
             tracing::warn!("All outputs removed; compositor running headless until one returns");
             self.needs_render = false;
+            refresh_output_heads(self);
             return;
         }
 
@@ -258,6 +263,7 @@ impl Beewm {
             .and_then(|window| window.wl_surface().map(|s| s.into_owned()));
         self.set_keyboard_focus(focus);
         self.needs_render = true;
+        refresh_output_heads(self);
     }
 
     /// Repack all outputs left-to-right in the global Space coordinate space and

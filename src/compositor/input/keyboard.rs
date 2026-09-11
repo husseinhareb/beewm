@@ -10,14 +10,30 @@ use crate::compositor::state::Beewm;
 use crate::config::Action;
 
 pub(super) fn handle_keyboard<I: InputBackend>(state: &mut Beewm, event: I::KeyboardKeyEvent) {
+    synthetic_key(
+        state,
+        event.key_code(),
+        event.state(),
+        Event::time_msec(&event),
+    );
+}
+
+/// Feed a key press/release through the same keybind-aware path as real
+/// hardware keys, for a source with no backing `InputBackend` event — e.g. a
+/// `wlp-virtual-keyboard` client used by VNC or other remote-control tools.
+/// Without this, VNC-injected keys would reach focused clients directly and
+/// never trigger beewm's own bindings (workspace switch, spawn, etc.).
+pub(crate) fn synthetic_key(
+    state: &mut Beewm,
+    keycode: xkb::Keycode,
+    key_state: KeyState,
+    time: u32,
+) {
     // Any key counts as activity: restart the screen-timeout countdown and wake
     // the screen if it was blanked.
     state.notify_activity();
 
     let serial = SERIAL_COUNTER.next_serial();
-    let time = Event::time_msec(&event);
-    let keycode = event.key_code();
-    let key_state = event.state();
 
     let Some(keyboard) = state.seat.get_keyboard() else {
         return;
