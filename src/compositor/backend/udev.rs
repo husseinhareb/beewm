@@ -1626,7 +1626,12 @@ fn record_frame_stats(stats: &mut FrameStats, sample: FrameStatsSample) {
             "frame-stats over {:.2}s",
             secs,
         );
+        // Carry the last primary-plane path across the window reset: without
+        // this, `FrameStats::new()`'s `None` makes the next frame look like a
+        // transition, so the line below prints every second forever.
+        let last_primary_was_scanout = stats.last_primary_was_scanout;
         *stats = FrameStats::new();
+        stats.last_primary_was_scanout = last_primary_was_scanout;
     }
 }
 
