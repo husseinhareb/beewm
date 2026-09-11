@@ -5,9 +5,11 @@ use std::hash::Hash;
 use crate::compositor::types::{ResizeEdges, ResizeHorizontalEdge, ResizeVerticalEdge};
 use crate::model::window::Geometry;
 
-use super::Layout;
 use super::dwindle_tree::{DwindleTree, ResizeEdge};
-use super::master_stack::MasterStack;
+
+/// Fraction of the screen the master window gets when nothing else says
+/// otherwise, and the fallback for a non-finite configured ratio.
+const DEFAULT_MASTER_RATIO: f64 = 0.50;
 
 /// A per-workspace layout manager that owns both the placement algorithm and
 /// any persistent structure (e.g. the dwindle split tree).
@@ -70,12 +72,6 @@ pub trait LayoutManager<Id: Clone + Eq + Hash + 'static>: Debug {
     /// focus cycling so it follows the visible layout instead of the
     /// workspace's window-insertion order.
     fn ordered_roots(&self, workspace: usize) -> Vec<Id>;
-
-    /// Access the positional layout (for index-based fallback in relayout).
-    /// Returns `None` for tree-based layouts that produce keyed geometries.
-    fn positional_layout(&self) -> Option<&dyn Layout> {
-        None
-    }
 }
 
 impl<Id: Clone + Eq + Hash + 'static> Clone for Box<dyn LayoutManager<Id>> {
@@ -399,7 +395,7 @@ fn sanitize_ratio(ratio: f64) -> f64 {
     if ratio.is_finite() {
         ratio.clamp(0.0, 1.0)
     } else {
-        MasterStack::default().master_ratio
+        DEFAULT_MASTER_RATIO
     }
 }
 
@@ -507,4 +503,56 @@ fn master_stack_ordered_geometries<Id>(
     }
 
     geometries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_MASTER_RATIO, master_stack_ordered_geometries};
+    use crate::model::window::Geometry;
+
+    fn stack(screen: &Geometry, count: usize, ratio: f64) -> Vec<Geometry> {
+        let ids: Vec<usize> = (0..count).collect();
+        master_stack_ordered_geometries(screen, &ids, ratio, &vec![1.0; count.saturating_sub(1)])
+    }
+
+    #[test]
+    fn master_stack_splits_master_from_an_evenly_divided_stack() {
+        let screen = Geometry::new(0, 0, 800, 600);
+
+        assert!(stack(&screen, 0, 0.5).is_empty());
+        assert_eq!(stack(&screen, 1, 0.5), vec![screen]);
+        assert_eq!(
+            stack(&screen, 3, 0.5),
+            vec![
+                Geometry::new(0, 0, 400, 600),
+                Geometry::new(400, 0, 400, 300),
+                Geometry::new(400, 300, 400, 300),
+            ]
+        );
+    }
+
+    /// The last stack window absorbs the division remainder, so the stack
+    /// always covers the screen exactly instead of leaving a gap at the bottom.
+    #[test]
+    fn last_stack_window_gets_the_rounding_remainder() {
+        let geometries = stack(&Geometry::new(0, 0, 800, 601), 3, 0.5);
+
+        assert_eq!(geometries[1].height, 300);
+        assert_eq!(geometries[2].height, 301);
+        assert_eq!(geometries[2].y + geometries[2].height as i32, 601);
+    }
+
+    /// A config can hand us any f64. Out-of-range clamps; non-finite falls back
+    /// to the default rather than producing a zero-width or NaN master.
+    #[test]
+    fn out_of_range_and_non_finite_ratios_are_sanitized() {
+        let screen = Geometry::new(0, 0, 800, 600);
+
+        assert_eq!(stack(&screen, 2, 2.0)[0].width, 800);
+        assert_eq!(stack(&screen, 2, -1.0)[0].width, 0);
+        assert_eq!(
+            stack(&screen, 2, f64::NAN)[0].width,
+            (800.0 * DEFAULT_MASTER_RATIO) as u32
+        );
+    }
 }

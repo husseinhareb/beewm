@@ -503,30 +503,6 @@ impl Beewm {
             let split_target = self.focused_tiled_window_root(ws_idx);
             self.layout_manager
                 .preview_insert(ws_idx, split_target.as_ref(), root.clone(), &usable)
-                .or_else(|| {
-                    let tile_count = self.workspaces[ws_idx]
-                        .windows
-                        .iter()
-                        .filter(|window| {
-                            let root = Self::window_root_surface(window);
-                            let is_fullscreen = root
-                                .as_ref()
-                                .map(|root| self.is_root_fullscreen(root))
-                                .unwrap_or(false);
-                            let is_floating = root
-                                .as_ref()
-                                .map(|root| self.is_root_floating(root))
-                                .unwrap_or(false);
-                            !is_fullscreen && !is_floating
-                        })
-                        .count()
-                        + 1;
-                    self.layout_manager
-                        .positional_layout()?
-                        .apply(&usable, tile_count)
-                        .into_iter()
-                        .nth(tile_count - 1)
-                })
         }?;
 
         Some(self.configured_tiled_size(geo))

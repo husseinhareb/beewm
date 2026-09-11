@@ -229,7 +229,9 @@ mod tests {
 
         let buf = Buf::default();
         let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(default_log_filter(false)))
+            .with_env_filter(tracing_subscriber::EnvFilter::new(default_log_filter(
+                false,
+            )))
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
@@ -249,7 +251,10 @@ mod tests {
         });
 
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(!out.contains("TELEMETRY_"), "telemetry leaked through: {out}");
+        assert!(
+            !out.contains("TELEMETRY_"),
+            "telemetry leaked through: {out}"
+        );
         assert!(out.contains("KEEP_input"), "{out}");
         assert!(out.contains("KEEP_wedge"), "{out}");
         assert!(default_log_filter(true).contains("beewm=trace"));
