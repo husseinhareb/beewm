@@ -47,6 +47,7 @@ use smithay::wayland::pointer_constraints::{
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState};
@@ -125,6 +126,12 @@ pub struct OutputModes {
     /// The mode currently driving the output.
     pub current: Option<OutputModeSpec>,
 }
+
+/// `X11Wm::send_selection` bound to the running event loop. The loop's data
+/// type differs per backend (winit/udev), so the handle is captured in a
+/// closure here instead of making `Beewm` generic over it.
+pub type XwmSendSelection =
+    Box<dyn Fn(&mut X11Wm, SelectionTarget, String, std::os::unix::io::OwnedFd)>;
 
 /// The main compositor state.
 pub struct Beewm {
@@ -256,6 +263,12 @@ pub struct Beewm {
     pub pending_windows: Vec<Window>,
     /// Root wl_surface -> mapped window lookup for commit-time surface routing.
     pub window_lookup: HashMap<WlSurface, Window>,
+    /// The window currently carrying `xdg_toplevel.Activated` / X11
+    /// `_NET_WM_STATE_FOCUSED`. Tracked as a window rather than a per-workspace
+    /// index because keyboard focus moves across outputs (and therefore across
+    /// visible workspaces): the window losing focus is not always in the
+    /// workspace the newly focused one belongs to.
+    pub(crate) activated_window: Option<Window>,
     /// Pre-allocated stable IDs for border element fragments.
     /// Reused across frames so the DRM damage tracker sees unchanged geometry.
     pub border_ids: Vec<Id>,
@@ -274,6 +287,9 @@ pub struct Beewm {
     pub animations: AnimationManager,
     /// X11 window manager state for the compositor-managed XWayland instance.
     pub xwm: Option<X11Wm>,
+    /// Clipboard bridge: hands an X client's read request to `X11Wm` together
+    /// with the event loop it needs for the transfer. Set once XWayland is up.
+    pub xwm_send_selection: Option<XwmSendSelection>,
     /// DISPLAY number exported to spawned child processes once XWayland is ready.
     pub xdisplay: Option<u32>,
     /// Tracks popup surfaces and provides grab support.
@@ -506,12 +522,14 @@ impl Beewm {
             focused_output: 0,
             pending_windows: Vec::new(),
             window_lookup: HashMap::new(),
+            activated_window: None,
             border_ids: Vec::new(),
             border_commit_serial: 0,
             needs_render: true,
             session_env_managed: false,
             animations,
             xwm: None,
+            xwm_send_selection: None,
             xdisplay: None,
             popup_manager: PopupManager::default(),
             floating_windows: HashMap::new(),

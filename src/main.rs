@@ -139,6 +139,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting beewm");
 
+    // Automatically reap terminated child processes (spawned terminals,
+    // launchers, autostart programs) so they do not linger as zombies (<defunct>).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        sa.sa_flags = libc::SA_NOCLDWAIT | libc::SA_RESTART;
+        libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
+    }
+
     // Load configuration
     let config = Config::load()?;
     tracing::info!(

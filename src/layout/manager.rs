@@ -172,9 +172,14 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         delta: (i32, i32),
     ) -> bool {
         let mut handled = false;
+        // Bounds-checked like every other method here: an out-of-range
+        // workspace is a no-op, never a panic in the compositor thread.
+        let Some(tree) = self.trees.get_mut(workspace) else {
+            return false;
+        };
 
         if delta.0 != 0 {
-            handled |= self.trees[workspace].resize(
+            handled |= tree.resize(
                 target,
                 match edges.horizontal {
                     ResizeHorizontalEdge::Left => ResizeEdge::Left,
@@ -187,7 +192,7 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         }
 
         if delta.1 != 0 {
-            handled |= self.trees[workspace].resize(
+            handled |= tree.resize(
                 target,
                 match edges.vertical {
                     ResizeVerticalEdge::Top => ResizeEdge::Top,

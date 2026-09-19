@@ -1,8 +1,17 @@
+use std::os::unix::io::OwnedFd;
+
 use smithay::delegate_xwayland_shell;
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::selection::SelectionTarget;
+use smithay::wayland::selection::data_device::{
+    clear_data_device_selection, request_data_device_client_selection, set_data_device_selection,
+};
+use smithay::wayland::selection::primary_selection::{
+    clear_primary_selection, request_primary_client_selection, set_primary_selection,
+};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, WmWindowProperty, WmWindowType, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
@@ -186,13 +195,9 @@ impl Beewm {
             return true;
         }
         // Replace any existing fullscreen on the target workspace (see the
-        // xdg-shell fullscreen_request handler for the active-vs-hidden split).
+        // xdg-shell fullscreen_request handler, which does the same).
         if self.workspaces[ws_idx].fullscreen.is_some() {
-            if ws_idx == self.active_workspace() {
-                self.restore_fullscreen();
-            } else {
-                self.workspaces[ws_idx].fullscreen = None;
-            }
+            self.exit_fullscreen_on_workspace(ws_idx, true);
         }
 
         let _ = window.set_fullscreen(true);
@@ -201,21 +206,33 @@ impl Beewm {
             Some(o) => o,
             None => return true,
         };
-        let output_geo = self.space.output_geometry(&output).unwrap();
-
-        for sibling in &self.workspaces[ws_idx].windows {
-            if *sibling != window_obj {
-                self.space.unmap_elem(sibling);
-            }
-        }
+        // An output with no mode yet has no geometry to fill; the workspace
+        // switch re-presents the window through `show_fullscreen_window`.
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            self.workspaces[ws_idx].fullscreen = Some(window_obj);
+            return true;
+        };
 
         let _ = window.configure(output_geo);
-        self.space
-            .map_element(window_obj.clone(), output_geo.loc, true);
         self.workspaces[ws_idx].fullscreen = Some(window_obj.clone());
 
-        if let Some(wl_surface) = window_obj.wl_surface().map(|s| s.into_owned()) {
-            self.set_keyboard_focus(Some(wl_surface));
+        // Only present it when its workspace is on screen. A background
+        // workspace's windows are deliberately out of the Space, and stealing
+        // the keyboard for one would break workspace isolation.
+        if self.output_showing_workspace(ws_idx).is_some() {
+            for sibling in &self.workspaces[ws_idx].windows {
+                if *sibling != window_obj {
+                    self.space.unmap_elem(sibling);
+                }
+            }
+            self.space
+                .map_element(window_obj.clone(), output_geo.loc, true);
+
+            if ws_idx == self.active_workspace()
+                && let Some(wl_surface) = window_obj.wl_surface().map(|s| s.into_owned())
+            {
+                self.set_keyboard_focus(Some(wl_surface));
+            }
         }
 
         self.needs_render = true;
@@ -306,11 +323,19 @@ impl Beewm {
             .and_then(|window| window.x11_surface())
             .map(|candidate| candidate == surface)
             .unwrap_or(false);
+        let showing_output = self.output_showing_workspace(workspace_idx);
         if was_fullscreen {
             self.workspaces[workspace_idx].fullscreen = None;
-            for sibling in &self.workspaces[workspace_idx].windows {
-                if self.space.element_geometry(sibling).is_none() {
-                    self.space.map_element(sibling.clone(), (0, 0), false);
+            // Only remap the siblings that fullscreen unmapped when this
+            // workspace is actually on screen — see `remove_mapped_toplevel`,
+            // the Wayland twin of this path. Mapping a hidden workspace's
+            // windows at (0, 0) parks them over the visible workspace with no
+            // relayout to move them back.
+            if showing_output.is_some() {
+                for sibling in &self.workspaces[workspace_idx].windows {
+                    if self.space.element_geometry(sibling).is_none() {
+                        self.space.map_element(sibling.clone(), (0, 0), false);
+                    }
                 }
             }
         }
@@ -318,22 +343,22 @@ impl Beewm {
         self.space.unmap_elem(&window);
         self.publish_workspace_state();
 
-        if workspace_idx == self.active_workspace() {
-            if should_restore_focus {
-                let focus = self.workspaces[self.active_workspace()]
-                    .focused_idx
-                    .and_then(|focus_idx| {
-                        self.workspaces[self.active_workspace()]
-                            .windows
-                            .get(focus_idx)
-                    })
-                    .and_then(|window| window.wl_surface().map(|surface| surface.into_owned()));
-                self.set_keyboard_focus(focus);
-            }
-            self.relayout();
-        } else {
-            self.needs_render = true;
+        if workspace_idx == self.active_workspace() && should_restore_focus {
+            let focus = self.workspaces[self.active_workspace()]
+                .focused_idx
+                .and_then(|focus_idx| {
+                    self.workspaces[self.active_workspace()]
+                        .windows
+                        .get(focus_idx)
+                })
+                .and_then(|window| window.wl_surface().map(|surface| surface.into_owned()));
+            self.set_keyboard_focus(focus);
         }
+
+        if showing_output.is_some() {
+            self.relayout();
+        }
+        self.needs_render = true;
 
         if !surface.is_override_redirect() {
             let _ = surface.set_mapped(false);
@@ -663,33 +688,104 @@ impl XwmHandler for Beewm {
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let is_our_fullscreen = self
-            .active_fullscreen()
-            .and_then(|w| w.x11_surface())
-            .map(|s| s == &window)
-            .unwrap_or(false);
+        // Search every workspace, not just the active one: a window that went
+        // fullscreen and then moved (or was fullscreened on a background
+        // workspace) must still be able to leave fullscreen.
+        let Some(ws_idx) = self.workspaces.iter().position(|workspace| {
+            workspace
+                .fullscreen
+                .as_ref()
+                .and_then(|w| w.x11_surface())
+                .map(|s| s == &window)
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
 
-        if is_our_fullscreen {
-            if self.x11_surface_covers_output(&window) {
-                tracing::info!(
-                    target: "beewm::xwayland",
-                    title = %window.title(),
-                    class = %window.class(),
-                    geometry = ?window.geometry(),
-                    "ignoring X11 unfullscreen while surface still covers output",
-                );
-                let _ = window.set_fullscreen(true);
-                self.needs_render = true;
-                return;
+        // Games that drop _NET_WM_STATE_FULLSCREEN while still covering the
+        // whole output are kept fullscreen. That only makes sense while the
+        // window is actually on screen to cover it.
+        if self.output_showing_workspace(ws_idx).is_some()
+            && self.x11_surface_covers_output(&window)
+        {
+            tracing::info!(
+                target: "beewm::xwayland",
+                title = %window.title(),
+                class = %window.class(),
+                geometry = ?window.geometry(),
+                "ignoring X11 unfullscreen while surface still covers output",
+            );
+            let _ = window.set_fullscreen(true);
+            self.needs_render = true;
+            return;
+        }
+
+        // `exit_fullscreen_on_workspace` clears the hint on the X11 surface.
+        self.exit_fullscreen_on_workspace(ws_idx, true);
+    }
+
+    /// Serve every X client, like wlroots does. Gating this on keyboard focus
+    /// buys nothing: any process running as the user can read the clipboard
+    /// through `wl-paste` anyway, and Chromium-based apps ask for TARGETS
+    /// outside the moment they hold focus, so a focus check just loses pastes.
+    fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
+        true
+    }
+
+    /// An X client took the selection: mirror its mime types onto the Wayland
+    /// side so native clients can paste it.
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                set_data_device_selection(&self.display_handle, &self.seat, mime_types, ())
             }
+            SelectionTarget::Primary => {
+                set_primary_selection(&self.display_handle, &self.seat, mime_types, ())
+            }
+        }
+    }
 
-            let _ = window.set_fullscreen(false);
-            self.restore_fullscreen();
+    /// A Wayland client owns the selection and an X client is reading it.
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        // The two helpers return distinct error types, so each arm logs its own.
+        let failure = match selection {
+            SelectionTarget::Clipboard => {
+                request_data_device_client_selection(&self.seat, mime_type, fd)
+                    .err()
+                    .map(|error| error.to_string())
+            }
+            SelectionTarget::Primary => request_primary_client_selection(&self.seat, mime_type, fd)
+                .err()
+                .map(|error| error.to_string()),
+        };
+        if let Some(error) = failure {
+            tracing::warn!(
+                target: "beewm::xwayland",
+                "Failed to send {:?} selection to an X client: {}",
+                selection,
+                error
+            );
+        }
+    }
+
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                clear_data_device_selection(&self.display_handle, &self.seat)
+            }
+            SelectionTarget::Primary => clear_primary_selection(&self.display_handle, &self.seat),
         }
     }
 
     fn disconnected(&mut self, _xwm: XwmId) {
         self.xwm = None;
+        self.xwm_send_selection = None;
         self.xdisplay = None;
     }
 }

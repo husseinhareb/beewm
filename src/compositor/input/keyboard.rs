@@ -156,10 +156,16 @@ fn execute_action(state: &mut Beewm, action: Action) {
             state.move_window_to_output(direction);
         }
         Action::CloseWindow => {
-            if let Some(window) = state.active_workspace_focused_window()
-                && let Some(toplevel) = window.toplevel()
-            {
-                toplevel.send_close();
+            // `toplevel()` is `None` for XWayland windows, so an X11 client has
+            // to be closed through its `X11Surface` (WM_DELETE_WINDOW) instead.
+            if let Some(window) = state.active_workspace_focused_window() {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.send_close();
+                } else if let Some(x11) = window.x11_surface()
+                    && let Err(error) = x11.close()
+                {
+                    tracing::warn!("Failed to close X11 window: {}", error);
+                }
             }
         }
         Action::ToggleFullscreen => {

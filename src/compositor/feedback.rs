@@ -15,9 +15,14 @@ use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use super::state::Beewm;
 
+/// The nominal time between two frames on `output`, from its current mode's
+/// refresh rate (in mHz). Virtual/headless outputs and displays with a broken
+/// EDID can report `refresh <= 0`; falling back to ~60Hz keeps that from
+/// dividing by zero and taking the compositor down.
 pub fn output_frame_interval(output: &Output) -> Duration {
     output
         .current_mode()
+        .filter(|mode| mode.refresh > 0)
         .map(|mode| Duration::from_micros(1_000_000_000 / mode.refresh as u64))
         .unwrap_or(Duration::from_millis(16))
 }

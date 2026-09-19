@@ -1333,7 +1333,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
         .is_some()
         || state.screen_owned_by_x11_window();
 
-    let border_elements = state.border_elements();
+    let border_elements = state.border_elements(&surface.output);
     // Cursor visibility is driven entirely by Wayland client/pointer state, not
     // by fullscreen presentation. `effective_cursor_icon()` returns `None` (so
     // `cursor_elements` is empty) exactly when the focused client hid the cursor
@@ -1344,7 +1344,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
     // promotes it onto the hardware cursor plane; a fullscreen game can still be
     // direct-scanned-out onto the primary plane with the cursor on its own
     // plane, so keeping the element does not block direct scanout.
-    let cursor_elements = state.cursor_elements(renderer);
+    let cursor_elements = state.cursor_elements(renderer, &surface.output);
 
     // Render layer-shell surfaces (waybar, beebar, etc.) at the correct Z-order.
     // Clone output so we can borrow it for layer_map while also using the renderer.

@@ -63,10 +63,13 @@ fn normal_layer_order_keeps_top_surfaces_above_windows() {
 }
 
 #[test]
-fn fullscreen_suppresses_layer_surfaces_for_scanout() {
-    assert!(layers_rendered_above_windows(true).is_empty());
+fn fullscreen_suppresses_layer_surfaces_for_scanout_except_overlay() {
+    // Everything but `Overlay` gets out of a fullscreen surface's way so it can
+    // be promoted onto the primary plane. `Overlay` stays: the protocol orders
+    // it above fullscreen, and it carries lock screens, notifications and OSKs.
+    assert_eq!(layers_rendered_above_windows(true), &[WlrLayer::Overlay]);
+    assert_eq!(layers_hit_tested_before_windows(true), &[WlrLayer::Overlay]);
     assert!(layers_rendered_below_windows(true).is_empty());
-    assert!(layers_hit_tested_before_windows(true).is_empty());
     assert!(layers_hit_tested_after_windows(true).is_empty());
 }
 
@@ -434,6 +437,11 @@ fn master_stack_ordered_roots_match_stack_order() {
 fn layout_manager_out_of_range_workspace_is_noop() {
     // Defensive bounds checks: operating on a workspace index past the end must
     // never panic (panic = "abort" would take down the whole session).
+    let edges = ResizeEdges {
+        horizontal: ResizeHorizontalEdge::Right,
+        vertical: ResizeVerticalEdge::Bottom,
+    };
+
     let mut dwindle = DwindleManager::<u8>::new(2, 0.5);
     dwindle.insert(99, None, 1u8); // out of range — must not panic
     dwindle.remove(99, &1u8);
@@ -444,6 +452,14 @@ fn layout_manager_out_of_range_workspace_is_noop() {
             .geometries(99, &Geometry::new(0, 0, 100, 100), &[])
             .is_empty()
     );
+    assert!(!dwindle.resize(
+        99,
+        &Geometry::new(0, 0, 100, 100),
+        &[1u8],
+        &1u8,
+        edges,
+        (10, 10)
+    ));
 
     let mut master = MasterStackManager::<u8>::new(2, 0.5);
     master.insert(99, None, 1u8);
@@ -455,6 +471,14 @@ fn layout_manager_out_of_range_workspace_is_noop() {
             .geometries(99, &Geometry::new(0, 0, 100, 100), &[])
             .is_empty()
     );
+    assert!(!master.resize(
+        99,
+        &Geometry::new(0, 0, 100, 100),
+        &[1u8],
+        &1u8,
+        edges,
+        (10, 10)
+    ));
 }
 
 #[test]

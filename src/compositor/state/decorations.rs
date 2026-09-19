@@ -2,6 +2,7 @@ use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::desktop::{Window, layer_map_for_output};
+use smithay::output::Output;
 use smithay::utils::{Coordinate, Logical, Physical, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
@@ -91,22 +92,23 @@ impl Beewm {
     /// Returns `true` when a top/overlay layer actually overlaps a border.
     /// Persistent panels usually reserve an exclusive zone and should not hide
     /// borders globally just because they are mapped.
-    pub fn has_layer_surface_overlapping_borders(&self, bw: i32) -> bool {
-        let Some(output) = self.focused_output() else {
-            return false;
-        };
-
+    pub fn has_layer_surface_overlapping_borders(&self, output: &Output, bw: i32) -> bool {
         let windows: Vec<Window> = self
             .space
             .elements()
-            .filter(|w| self.active_fullscreen().map(|fs| fs != *w).unwrap_or(true))
+            .filter(|window| !self.is_window_fullscreen(window))
             .cloned()
             .collect();
         if windows.is_empty() {
             return false;
         }
 
-        let layer_map = layer_map_for_output(&output);
+        // Layer geometry is output-local; window geometry is global. Compare
+        // them in the output's frame.
+        let Some(output_loc) = self.space.output_geometry(output).map(|geo| geo.loc) else {
+            return false;
+        };
+        let layer_map = layer_map_for_output(output);
         for layer in [WlrLayer::Overlay, WlrLayer::Top] {
             for layer_surface in layer_map.layers_on(layer) {
                 let Some(layer_geo) = layer_map.layer_geometry(layer_surface) else {
@@ -115,7 +117,11 @@ impl Beewm {
                 if windows.iter().any(|window| {
                     self.space
                         .element_geometry(window)
-                        .map(|window_geo| window_border_overlaps_layer(window_geo, layer_geo, bw))
+                        .map(|window_geo| {
+                            let local =
+                                Rectangle::new(window_geo.loc - output_loc, window_geo.size);
+                            window_border_overlaps_layer(local, layer_geo, bw)
+                        })
                         .unwrap_or(false)
                 }) {
                     return true;
@@ -125,12 +131,28 @@ impl Beewm {
         false
     }
 
-    /// Build border render elements for all visible windows.
-    pub fn border_elements(&mut self) -> Vec<SolidColorRenderElement> {
+    /// True when `window` is the fullscreen window of *any* workspace, not just
+    /// the focused output's. A fullscreen app on a second monitor is still
+    /// fullscreen while you work on the first one.
+    fn is_window_fullscreen(&self, window: &Window) -> bool {
+        Self::window_root_surface(window)
+            .map(|root| self.is_root_fullscreen(&root))
+            .unwrap_or(false)
+    }
+
+    /// Build border render elements for the windows visible on `output`.
+    ///
+    /// The returned rectangles are physical pixels relative to `output`'s
+    /// top-left, which is the coordinate space a render element is drawn in.
+    pub fn border_elements(&mut self, output: &Output) -> Vec<SolidColorRenderElement> {
         let bw = self.config.border_width as i32;
-        if bw == 0 || self.has_layer_surface_overlapping_borders(bw) {
+        if bw == 0 || self.has_layer_surface_overlapping_borders(output, bw) {
             return Vec::new();
         }
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return Vec::new();
+        };
+        let scale = output.current_scale().fractional_scale();
         // When something is owning the whole screen (real fullscreen or an X11
         // override-redirect game), skip border generation entirely. Borders
         // around a fullscreen-sized window would otherwise sit *on top of*
@@ -155,11 +177,13 @@ impl Beewm {
         };
         let target_root = self.tiled_swap_target.clone();
 
-        // Exclude the fullscreen window — it has no borders.
+        // Exclude fullscreen windows — they have no borders. Checked against
+        // every workspace, so a fullscreen app on another output is not framed
+        // just because the focused output has no fullscreen window.
         let windows: Vec<Window> = self
             .space
             .elements()
-            .filter(|w| self.active_fullscreen().map(|fs| fs != *w).unwrap_or(true))
+            .filter(|window| !self.is_window_fullscreen(window))
             .cloned()
             .collect();
         let mut border_fragments = Vec::new();
@@ -225,12 +249,14 @@ impl Beewm {
             .into_iter()
             .enumerate()
             .map(|(idx, (rect, color))| {
+                // Border rectangles are built in global logical coordinates;
+                // a render element is positioned in physical pixels relative to
+                // the output it is drawn on.
+                let local = Rectangle::new(rect.loc - output_geo.loc, rect.size);
+                let physical: Rectangle<i32, Physical> = local.to_physical_precise_round(scale);
                 SolidColorRenderElement::new(
                     self.border_ids[idx].clone(),
-                    Rectangle::<i32, Physical>::new(
-                        (rect.loc.x, rect.loc.y).into(),
-                        (rect.size.w, rect.size.h).into(),
-                    ),
+                    physical,
                     commit,
                     color,
                     Kind::Unspecified,

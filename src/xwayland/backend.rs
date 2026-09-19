@@ -192,6 +192,98 @@ macro_rules! delegate_backend_xwayland {
                 );
             }
 
+            fn property_notify(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                window: smithay::xwayland::X11Surface,
+                property: smithay::xwayland::xwm::WmWindowProperty,
+            ) {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::property_notify(
+                    &mut self.$field,
+                    xwm,
+                    window,
+                    property,
+                );
+            }
+
+            fn fullscreen_request(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                window: smithay::xwayland::X11Surface,
+            ) {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::fullscreen_request(
+                    &mut self.$field,
+                    xwm,
+                    window,
+                );
+            }
+
+            fn unfullscreen_request(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                window: smithay::xwayland::X11Surface,
+            ) {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::unfullscreen_request(
+                    &mut self.$field,
+                    xwm,
+                    window,
+                );
+            }
+
+            fn allow_selection_access(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+            ) -> bool {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::allow_selection_access(
+                    &mut self.$field,
+                    xwm,
+                    selection,
+                )
+            }
+
+            fn new_selection(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+                mime_types: Vec<String>,
+            ) {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::new_selection(
+                    &mut self.$field,
+                    xwm,
+                    selection,
+                    mime_types,
+                );
+            }
+
+            fn send_selection(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+                mime_type: String,
+                fd: std::os::unix::io::OwnedFd,
+            ) {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::send_selection(
+                    &mut self.$field,
+                    xwm,
+                    selection,
+                    mime_type,
+                    fd,
+                );
+            }
+
+            fn cleared_selection(
+                &mut self,
+                xwm: smithay::xwayland::xwm::XwmId,
+                selection: smithay::wayland::selection::SelectionTarget,
+            ) {
+                <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::cleared_selection(
+                    &mut self.$field,
+                    xwm,
+                    selection,
+                );
+            }
+
             fn disconnected(&mut self, xwm: smithay::xwayland::xwm::XwmId) {
                 <$crate::compositor::state::Beewm as smithay::xwayland::XwmHandler>::disconnected(
                     &mut self.$field,
@@ -236,6 +328,19 @@ pub(crate) fn start_xwayland<D>(
                                 let state = data.xwayland_state();
                                 state.finish_xwayland_start(display_number);
                                 state.xwm = Some(wm);
+                                let handle = loop_handle.clone();
+                                state.xwm_send_selection =
+                                    Some(Box::new(move |xwm, ty, mime_type, fd| {
+                                        if let Err(error) =
+                                            xwm.send_selection(ty, mime_type, fd, handle.clone())
+                                        {
+                                            tracing::warn!(
+                                                "Failed to send {:?} selection to XWayland: {}",
+                                                ty,
+                                                error
+                                            );
+                                        }
+                                    }));
                             }
                             Err(error) => {
                                 tracing::warn!("Failed to attach XWayland WM: {}", error);

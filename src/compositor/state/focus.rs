@@ -10,6 +10,25 @@ use crate::config::FocusDirection;
 
 use super::{Beewm, root_surface};
 
+/// Set or clear the "this window has keyboard focus" state a client renders its
+/// title bar / chrome from: `xdg_toplevel.Activated` for Wayland clients,
+/// `_NET_WM_STATE_FOCUSED` for X11 ones.
+fn set_window_activated(window: &Window, activated: bool) {
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|state| {
+            if activated {
+                state.states.set(xdg_toplevel::State::Activated);
+            } else {
+                state.states.unset(xdg_toplevel::State::Activated);
+            }
+        });
+        toplevel.send_pending_configure();
+    }
+    if let Some(x11) = window.x11_surface() {
+        let _ = x11.set_activated(activated);
+    }
+}
+
 impl Beewm {
     pub fn invalidate_borders(&mut self) {
         self.border_commit_serial = self.border_commit_serial.wrapping_add(1);
@@ -159,35 +178,20 @@ impl Beewm {
         let new_idx =
             focused.and_then(|s| self.window_index_for_surface(self.active_workspace(), s));
 
-        let old_idx = self.workspaces[self.active_workspace()].focused_idx;
-
-        if new_idx != old_idx {
-            if let Some(idx) = old_idx
-                && let Some(window) = self.workspaces[self.active_workspace()].windows.get(idx)
-            {
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.with_pending_state(|s| {
-                        s.states.unset(xdg_toplevel::State::Activated);
-                    });
-                    toplevel.send_pending_configure();
-                }
-                if let Some(x11) = window.x11_surface() {
-                    let _ = x11.set_activated(false);
-                }
+        // Activation follows the *window*, not the active workspace's focused
+        // index. Focus can move to another output — and therefore to another
+        // visible workspace — so the window losing activation may live outside
+        // the workspace we are switching into, and the window gaining it may
+        // already be that workspace's cached `focused_idx`.
+        let new_window = focused.and_then(|s| self.mapped_window_for_surface(s));
+        if self.activated_window != new_window {
+            if let Some(previous) = self.activated_window.take() {
+                set_window_activated(&previous, false);
             }
-            if let Some(idx) = new_idx
-                && let Some(window) = self.workspaces[self.active_workspace()].windows.get(idx)
-            {
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.with_pending_state(|s| {
-                        s.states.set(xdg_toplevel::State::Activated);
-                    });
-                    toplevel.send_pending_configure();
-                }
-                if let Some(x11) = window.x11_surface() {
-                    let _ = x11.set_activated(true);
-                }
+            if let Some(window) = new_window.as_ref() {
+                set_window_activated(window, true);
             }
+            self.activated_window = new_window;
         }
 
         if let Some(idx) = new_idx {

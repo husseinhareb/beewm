@@ -66,13 +66,26 @@ pub(in crate::compositor) fn surface_under(
 
     let fullscreen_active = state.screen_owned_by_window();
 
+    // A `LayerMap` is arranged in *output-local* coordinates (origin at the
+    // output's top-left), while `pos` is global `Space` coordinates. Hit tests
+    // and the surface locations we hand back have to be translated by the
+    // output's origin, or every layer surface on a secondary output is unclickable.
+    let output_loc = state
+        .space
+        .output_geometry(&output)
+        .map(|geo| geo.loc.to_f64())
+        .unwrap_or_default();
     let layer_hit = |layer: WlrLayer| -> Option<(WlSurface, Point<f64, Logical>)> {
+        let local_pos = pos - output_loc;
         let layer_map = layer_map_for_output(&output);
-        let layer_surface = layer_map.layer_under(layer, pos)?.clone();
+        let layer_surface = layer_map.layer_under(layer, local_pos)?.clone();
         let layer_geometry = layer_map.layer_geometry(&layer_surface)?;
-        let local = pos - layer_geometry.loc.to_f64();
+        let local = local_pos - layer_geometry.loc.to_f64();
         let (surface, surface_loc) = layer_surface.surface_under(local, WindowSurfaceType::ALL)?;
-        Some((surface, layer_geometry.loc.to_f64() + surface_loc.to_f64()))
+        Some((
+            surface,
+            output_loc + layer_geometry.loc.to_f64() + surface_loc.to_f64(),
+        ))
     };
 
     for &layer in layers_hit_tested_before_windows(fullscreen_active) {
@@ -150,17 +163,23 @@ pub(super) fn handle_pointer_motion<I: InputBackend>(
     event: I::PointerMotionEvent,
 ) {
     state.notify_activity();
-    let output = match state.focused_output() {
-        Some(o) => o,
-        None => return,
-    };
-
-    let output_geo = state.space.output_geometry(&output).unwrap();
     let delta = event.delta();
 
     let mut new_pos = state.pointer_location + delta;
-    new_pos.x = new_pos.x.clamp(0.0, output_geo.size.w as f64 - 1.0);
-    new_pos.y = new_pos.y.clamp(0.0, output_geo.size.h as f64 - 1.0);
+    // Outputs live side by side in one global coordinate space, so a position
+    // that lands on *any* output is valid — that is how the cursor crosses onto
+    // a second monitor. Only when it lands nowhere (the gap between mismatched
+    // outputs, or past the outermost edge) do we pull it back into the output
+    // it came from, whose geometry starts at that output's own origin.
+    if state.space.output_under(new_pos).next().is_none() {
+        let Some(output) = state.output_under_point(state.pointer_location) else {
+            return;
+        };
+        let Some(output_geo) = state.space.output_geometry(&output) else {
+            return;
+        };
+        new_pos = clamp_to_output(output_geo, new_pos);
+    }
 
     // If the surface currently under the cursor has an active pointer lock, keep the
     // cursor fixed and only deliver relative motion to the game.
@@ -292,13 +311,19 @@ pub(super) fn handle_pointer_motion_absolute<I: InputBackend>(
     event: I::PointerMotionAbsoluteEvent,
 ) {
     state.notify_activity();
-    let output = match state.focused_output() {
-        Some(o) => o,
-        None => return,
+    let Some(output) = state.focused_output() else {
+        return;
+    };
+    // An output that is registered but has no mode yet has no geometry; there is
+    // nothing sensible to map the absolute position onto, so drop the event
+    // rather than panic on the compositor thread.
+    let Some(output_geo) = state.space.output_geometry(&output) else {
+        return;
     };
 
-    let output_geo = state.space.output_geometry(&output).unwrap();
-    let pos = event.position_transformed(output_geo.size);
+    // `position_transformed` is relative to the output it was mapped onto;
+    // `synthetic_motion_absolute` works in global Space coordinates.
+    let pos = output_geo.loc.to_f64() + event.position_transformed(output_geo.size);
     synthetic_motion_absolute(state, pos, Event::time_msec(&event));
 }
 
@@ -524,6 +549,9 @@ pub(crate) fn synthetic_button(state: &mut Beewm, button: u32, btn_state: Button
 
 pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::PointerAxisEvent) {
     state.notify_activity();
+    if state.overview.is_some() {
+        return;
+    }
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };
@@ -573,6 +601,9 @@ pub(super) fn handle_pointer_axis<I: InputBackend>(state: &mut Beewm, event: I::
 /// remote-control tools. `horizontal`/`vertical` are wheel-style deltas.
 pub(crate) fn synthetic_axis(state: &mut Beewm, horizontal: f64, vertical: f64, time: u32) {
     state.notify_activity();
+    if state.overview.is_some() {
+        return;
+    }
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };

@@ -95,6 +95,7 @@ impl Beewm {
             geometry.buffer_region.size.h as u32,
             geometry.shm_stride as u32,
         );
+        frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
         if frame.version() >= 3 {
             frame.buffer_done();
         }
@@ -336,13 +337,10 @@ where
                     pending.geometry.buffer_region.size.h as u32,
                 );
             }
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let secs = now.as_secs();
+            let (secs, nsecs) = monotonic_time();
             pending
                 .frame
-                .ready((secs >> 32) as u32, secs as u32, now.subsec_nanos());
+                .ready((secs >> 32) as u32, secs as u32, nsecs);
             buffer.release();
             tracing::trace!(
                 target = "beewm::screencast",
@@ -383,9 +381,9 @@ where
         &state.animations,
         std::time::Instant::now(),
     );
-    let border_elements = state.border_elements();
+    let border_elements = state.border_elements(output);
     let cursor_elements = if overlay_cursor {
-        state.cursor_elements_for_renderer(renderer)
+        state.cursor_elements_for_renderer(renderer, output)
     } else {
         Vec::new()
     };
@@ -542,8 +540,22 @@ fn readback_region(geometry: &ScreencopyGeometry) -> Rectangle<i32, Buffer> {
     // Smithay's GlesRenderer applies a Y-flip in its projection matrix to account
     // for GL's bottom-to-top convention. As a result, physical screen y=0 (top)
     // maps directly to GL framebuffer row 0. glReadPixels therefore returns rows in
-    // correct top-to-bottom visual order with no additional Y-flip required.
     geometry.buffer_region
+}
+
+fn monotonic_time() -> (u64, u32) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+        (ts.tv_sec as u64, ts.tv_nsec as u32)
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        (now.as_secs(), now.subsec_nanos())
+    }
 }
 
 #[cfg(test)]

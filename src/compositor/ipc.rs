@@ -8,6 +8,9 @@ use smithay::reexports::calloop::channel::{self, Channel, Sender};
 
 use crate::compositor::state::Beewm;
 
+/// How long a connected control client has to send its command line.
+const COMMAND_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const CONTROL_SOCKET_NAME: &str = "beewm-control.sock";
 const CONTROL_SOCKET_FALLBACK: &str = "/tmp/beewm-control.sock";
 const EVENT_SOCKET_NAME: &str = "beewm-events.sock";
@@ -147,6 +150,13 @@ fn accept_event_loop(listener: UnixListener, sender: Sender<UnixStream>, path: P
 }
 
 fn read_command(stream: UnixStream) -> Option<Command> {
+    // The accept loop reads each client inline, so a peer that connects and
+    // then sends nothing would block every later command behind it. Give the
+    // read a deadline instead: a control command is a single short line.
+    if let Err(error) = stream.set_read_timeout(Some(COMMAND_READ_TIMEOUT)) {
+        tracing::warn!("Failed to set control socket read timeout: {}", error);
+    }
+
     let mut line = String::new();
     let mut reader = BufReader::new(stream);
     match reader.read_line(&mut line) {

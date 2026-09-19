@@ -42,9 +42,9 @@ const GAP: i32 = 16;
 /// the selection frame.
 const CELL_PADDING: i32 = 6;
 
-/// Dimmed backdrop drawn over the desktop. Slightly translucent so the session
-/// stays recognisable underneath.
-const BACKDROP: Color32F = Color32F::new(0.04, 0.04, 0.06, 0.88);
+/// Dimmed backdrop drawn over the desktop. Opacity is high enough that bright
+/// text from background windows does not bleed through into empty grid slots.
+const BACKDROP: Color32F = Color32F::new(0.04, 0.04, 0.06, 0.96);
 /// Card drawn behind every thumbnail, so letterboxed and not-yet-drawn cells
 /// still read as a tile.
 const CARD: Color32F = Color32F::new(0.16, 0.16, 0.19, 1.0);
@@ -197,6 +197,8 @@ pub(crate) struct Overview {
     pub cells: Vec<Rectangle<i32, Logical>>,
     pub cols: usize,
     pub selected: usize,
+    /// Cell currently hovered by the pointer, if any.
+    pub hovered: Option<usize>,
     /// The output the grid is drawn on: the focused one when it opened.
     pub output: Output,
     backdrop_id: Id,
@@ -375,6 +377,7 @@ impl Beewm {
             cells,
             cols,
             selected,
+            hovered: Some(selected),
             output,
             backdrop_id: Id::new(),
             selection_id: Id::new(),
@@ -431,30 +434,36 @@ impl Beewm {
     /// Hover-select while the grid is up. Returns `true` when the motion was
     /// consumed, so the pointer never reaches a client behind the grid.
     pub(crate) fn overview_pointer_moved(&mut self, pos: Point<f64, Logical>) -> bool {
-        let Some(overview) = self.overview.as_ref() else {
+        let Some(overview) = self.overview.as_mut() else {
             return false;
         };
         let Some(region) = self.space.output_geometry(&overview.output) else {
             return true;
         };
         let local = pos - region.loc.to_f64();
-        if let Some(idx) = overview
+        let hovered = overview
             .cells
             .iter()
-            .position(|cell| cell.to_f64().contains(local))
-        {
-            self.set_overview_selection(idx);
+            .position(|cell| cell.to_f64().contains(local));
+        overview.hovered = hovered;
+        if let Some(idx) = hovered {
+            if overview.selected != idx {
+                overview.selected = idx;
+                self.needs_render = true;
+            }
         }
         true
     }
 
     /// A pointer button while the grid is up picks the hovered thumbnail.
-    /// Returns `true` when the click was consumed.
+    /// Clicking empty backdrop space outside any cell dismisses the grid
+    /// without activating a new window. Returns `true` when the click was consumed.
     pub(crate) fn overview_pointer_pressed(&mut self) -> bool {
-        if self.overview.is_none() {
+        let Some(overview) = self.overview.as_ref() else {
             return false;
-        }
-        self.close_overview(true);
+        };
+        let activate = overview.hovered.is_some();
+        self.close_overview(activate);
         true
     }
 }

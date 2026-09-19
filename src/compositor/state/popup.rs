@@ -67,8 +67,17 @@ pub(crate) fn is_known_dialog_app_id(app_id: &str) -> bool {
         "polkit-gnome-authentication-agent-1",
         "org.freedesktop.PolicyKit1.Authority",
         "polkit-kde-authentication-agent-1",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-portal-kde",
+        "xdg-desktop-portal-gnome",
+        "xdg-desktop-portal-lxqt",
+        "xdg-desktop-portal-wlr",
+        "io.github.bugaevc.wl-clipboard",
+        "wl-clipboard",
     ];
     KNOWN.iter().any(|known| app_id.eq_ignore_ascii_case(known))
+        || app_id.starts_with("org.freedesktop.impl.portal.")
+        || app_id.starts_with("xdg-desktop-portal-")
 }
 
 pub fn popup_constraint_target(
@@ -262,7 +271,13 @@ impl Beewm {
                 Some((layer, layer_geometry))
             }?;
 
-            let output_geometry = self.space.output_geometry(output)?;
+            // A `LayerMap` is arranged from the output's own origin, so
+            // `layer_geometry` — and the parent geometry derived from it — is
+            // output-local. The output rectangle it gets paired with must be
+            // output-local too: pairing it with the global one shifts the
+            // constraint area by the output's position in the global space,
+            // pushing popups off-screen on every display but the first.
+            let output_geometry = Rectangle::from_size(self.space.output_geometry(output)?.size);
             let surface_origin = layer_geometry.loc - layer.bbox().loc;
             let current_size = layer
                 .layer_surface()
@@ -338,5 +353,27 @@ impl Beewm {
             state.positioner = positioner;
             state.geometry = geometry;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_known_dialog_app_id;
+
+    #[test]
+    fn portal_and_prompter_app_ids_are_recognized_as_dialogs() {
+        assert!(is_known_dialog_app_id("xdg-desktop-portal-gtk"));
+        assert!(is_known_dialog_app_id("xdg-desktop-portal-kde"));
+        assert!(is_known_dialog_app_id(
+            "org.freedesktop.impl.portal.desktop.gtk"
+        ));
+        assert!(is_known_dialog_app_id("gcr-prompter"));
+        assert!(is_known_dialog_app_id("gnome-keyring-prompter"));
+        assert!(is_known_dialog_app_id("io.github.bugaevc.wl-clipboard"));
+        assert!(is_known_dialog_app_id("wl-clipboard"));
+
+        assert!(!is_known_dialog_app_id("firefox"));
+        assert!(!is_known_dialog_app_id("kitty"));
+        assert!(!is_known_dialog_app_id("code"));
     }
 }

@@ -1,3 +1,5 @@
+use std::os::unix::io::OwnedFd;
+
 use smithay::delegate_compositor;
 use smithay::delegate_cursor_shape;
 use smithay::delegate_idle_inhibit;
@@ -54,7 +56,7 @@ use smithay::wayland::selection::data_device::{set_data_device_focus,
 use smithay::wayland::selection::primary_selection::{set_primary_focus,
     PrimarySelectionHandler, PrimarySelectionState,
 };
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, KeyboardInteractivity, WlrLayerShellHandler, WlrLayerShellState,
 };
@@ -404,7 +406,9 @@ impl CompositorHandler for Beewm {
 
         // Handle layer surface commits: arrange the layer map and, after the
         // configure is sent, grant keyboard focus when the surface requests it.
-        let output = self.focused_output();
+        // The layer surface lives on whichever output its client asked for, not
+        // necessarily the focused one.
+        let output = self.output_for_layer_surface(surface);
         if let Some(output) = output {
             // Single borrow: find layer, arrange, read keyboard_interactivity.
             let (is_layer, focus_wl_surface) = {
@@ -548,15 +552,11 @@ impl XdgShellHandler for Beewm {
         if already_fullscreen {
             return;
         }
-        // Replace any existing fullscreen on the target workspace. When it is the
-        // active workspace we restore it properly (remap siblings); for a hidden
-        // workspace nothing is on-screen, so just clear the slot.
+        // Replace any existing fullscreen on the target workspace. Hidden
+        // workspaces have nothing on screen, so this only tells the old client
+        // it is no longer fullscreen and clears the slot.
         if self.workspaces[ws_idx].fullscreen.is_some() {
-            if ws_idx == self.active_workspace() {
-                self.restore_fullscreen();
-            } else {
-                self.workspaces[ws_idx].fullscreen = None;
-            }
+            self.exit_fullscreen_on_workspace(ws_idx, true);
         }
 
         let Some(output) = output
@@ -572,33 +572,48 @@ impl XdgShellHandler for Beewm {
             return;
         };
 
-        for sibling in &self.workspaces[ws_idx].windows {
-            if *sibling != window {
-                self.space.unmap_elem(sibling);
-            }
-        }
-
+        // Configure the client either way — it asked to be fullscreen and is
+        // entitled to the answer — but only *present* it when its workspace is
+        // on screen. A background workspace keeps its windows out of the Space;
+        // mapping one there would park it over the visible workspace, and it is
+        // re-presented by `show_fullscreen_window` when its workspace returns.
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
             state.size = Some(output_geo.size);
         });
         surface.send_configure();
-        self.space.map_element(window.clone(), output_geo.loc, true);
         self.workspaces[ws_idx].fullscreen = Some(window.clone());
-        self.set_keyboard_focus(Some(surface.wl_surface().clone()));
-        self.needs_render = true;
+
+        if self.output_showing_workspace(ws_idx).is_some() {
+            for sibling in &self.workspaces[ws_idx].windows {
+                if *sibling != window {
+                    self.space.unmap_elem(sibling);
+                }
+            }
+            self.space.map_element(window.clone(), output_geo.loc, true);
+            if ws_idx == self.active_workspace() {
+                self.set_keyboard_focus(Some(surface.wl_surface().clone()));
+            }
+            self.needs_render = true;
+        }
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let is_current_fullscreen = self
-            .active_fullscreen()
-            .and_then(|window| window.toplevel())
-            .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
-            .unwrap_or(false);
+        // Look the window up by workspace rather than only checking the active
+        // one: a client on a background workspace can drop out of fullscreen
+        // too, and ignoring it strands it fullscreen forever.
+        let Some(ws_idx) = self.workspaces.iter().position(|workspace| {
+            workspace
+                .fullscreen
+                .as_ref()
+                .and_then(|window| window.toplevel())
+                .map(|toplevel| toplevel.wl_surface() == surface.wl_surface())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
 
-        if is_current_fullscreen {
-            self.restore_fullscreen();
-        }
+        self.exit_fullscreen_on_workspace(ws_idx, true);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -832,9 +847,14 @@ impl WlrLayerShellHandler for Beewm {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
-        if let Some(output) = self.focused_output() {
-            let target = surface.wl_surface().clone();
-            let mut layer_map = layer_map_for_output(&output);
+        // Unmap from the output that actually holds it. Looking only at the
+        // focused output leaks the surface — and the exclusive zone it reserved
+        // — in every other output's `LayerMap`. Matching is by surface identity
+        // rather than a surface-tree walk: this runs while the surface is being
+        // destroyed. `unmap_layer` re-arranges the map, freeing the zone.
+        let target = surface.wl_surface().clone();
+        for output in self.space.outputs() {
+            let mut layer_map = layer_map_for_output(output);
             let layer = layer_map
                 .layers()
                 .find(|l| *l.wl_surface() == target)
@@ -927,6 +947,37 @@ impl SessionLockHandler for Beewm {
 
 impl SelectionHandler for Beewm {
     type SelectionUserData = ();
+
+    /// A Wayland client took the selection: tell XWayland it lost ownership so
+    /// X clients (Electron apps, anything not running natively) can paste it.
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        let Some(xwm) = self.xwm.as_mut() else {
+            return;
+        };
+        if let Err(error) = xwm.new_selection(ty, source.map(|source| source.mime_types())) {
+            tracing::warn!("Failed to set XWayland {:?} selection: {}", ty, error);
+        }
+    }
+
+    /// An X client owns the selection and a Wayland client wants to read it;
+    /// hand the pipe to XWayland, which drives the transfer on the event loop.
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        if let (Some(send), Some(xwm)) = (self.xwm_send_selection.as_ref(), self.xwm.as_mut()) {
+            send(xwm, ty, mime_type, fd);
+        }
+    }
 }
 
 impl ClientDndGrabHandler for Beewm {}

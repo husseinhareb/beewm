@@ -102,6 +102,11 @@ impl CommitWindow {
     }
 }
 
+/// How long a surface may go without committing before its window is dropped
+/// from [`CommitTracker`]. Several roll-over periods, so an idle-but-alive
+/// surface keeps its counters across a slow second.
+const STALE_SURFACE_WINDOW: Duration = Duration::from_secs(10);
+
 /// Tracks commit rate + responsiveness + buffer type per root surface and emits
 /// one `beewm::commit` line per surface per second.
 #[derive(Debug, Default)]
@@ -195,6 +200,13 @@ impl CommitTracker {
                 );
             }
             *win = CommitWindow::new(now);
+            // Surfaces are never explicitly removed from the map — an unmapped
+            // or destroyed surface simply stops committing. Drop the windows
+            // that went quiet so a long session can't accumulate one entry per
+            // surface it ever saw. A surface that comes back just starts a new
+            // window on its next commit.
+            self.windows
+                .retain(|_, window| now.duration_since(window.window_start) < STALE_SURFACE_WINDOW);
         }
     }
 }

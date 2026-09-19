@@ -1,4 +1,4 @@
-use smithay::desktop::Window;
+use smithay::desktop::{Window, WindowSurfaceType, layer_map_for_output};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};
@@ -158,6 +158,16 @@ impl Beewm {
         }
     }
 
+    /// The output currently showing `ws_idx`, if any. A workspace that no
+    /// output is showing is hidden: its windows are unmapped from the `Space`
+    /// and must stay that way until it is shown again.
+    pub(crate) fn output_showing_workspace(&self, ws_idx: usize) -> Option<Output> {
+        self.outputs
+            .iter()
+            .find(|ctx| ctx.active_workspace == ws_idx)
+            .map(|ctx| ctx.output.clone())
+    }
+
     /// The output that currently owns keyboard focus and receives newly-mapped
     /// windows / `switch_workspace`. With a single output this is simply that
     /// output, so every caller below collapses to today's behavior.
@@ -191,6 +201,25 @@ impl Beewm {
             return Some(output);
         }
         self.focused_output()
+    }
+
+    /// The output whose `LayerMap` holds `surface` (or one of its subsurfaces).
+    ///
+    /// A client picks the output for its layer surface at creation time, so a
+    /// bar, dock or notification can live on any output — never assume the
+    /// focused one, or commits and destroys land in the wrong `LayerMap`.
+    pub(crate) fn output_for_layer_surface(&self, surface: &WlSurface) -> Option<Output> {
+        self.space
+            .outputs()
+            .find(|output| {
+                layer_map_for_output(output)
+                    .layer_for_surface(
+                        surface,
+                        WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                    )
+                    .is_some()
+            })
+            .cloned()
     }
 
     /// The output under a point in global `Space` coordinates, else the focused

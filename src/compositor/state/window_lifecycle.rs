@@ -326,12 +326,20 @@ impl Beewm {
             .and_then(Self::window_root_surface)
             .map(|fs_root| fs_root == root)
             .unwrap_or(false);
+        let showing_output = self.output_showing_workspace(ws_idx);
         if was_fullscreen {
             self.workspaces[ws_idx].fullscreen = None;
-            // Remap siblings that were unmapped while fullscreen was active.
-            for sibling in self.workspaces[ws_idx].windows.clone() {
-                if self.space.element_geometry(&sibling).is_none() {
-                    self.space.map_element(sibling, (0, 0), false);
+            // Remap siblings that were unmapped while fullscreen was active —
+            // but only if this workspace is actually on screen. A hidden
+            // workspace keeps its windows out of the `Space`; mapping them at
+            // (0, 0) would drop them on top of whatever the visible workspace
+            // is showing, and the relayout that would reposition them only
+            // runs for workspaces an output is displaying.
+            if showing_output.is_some() {
+                for sibling in self.workspaces[ws_idx].windows.clone() {
+                    if self.space.element_geometry(&sibling).is_none() {
+                        self.space.map_element(sibling, (0, 0), false);
+                    }
                 }
             }
         }
@@ -353,24 +361,28 @@ impl Beewm {
             "removed window from layout",
         );
 
-        if ws_idx == self.active_workspace() {
-            if should_restore_focus {
-                // Prefer the closed/unmapped dialog's parent if it is still
-                // mapped; fall back to the workspace's last-focused window.
-                let parent_focus = parent_surface
-                    .filter(|parent| self.mapped_window_for_surface(parent).is_some());
-                let focus = parent_focus.or_else(|| {
-                    self.workspaces[self.active_workspace()]
-                        .focused_idx
-                        .and_then(|focus_idx| {
-                            self.workspaces[self.active_workspace()]
-                                .windows
-                                .get(focus_idx)
-                        })
-                        .and_then(Self::window_root_surface)
-                });
-                self.set_keyboard_focus(focus);
-            }
+        if ws_idx == self.active_workspace() && should_restore_focus {
+            // Prefer the closed/unmapped dialog's parent if it is still
+            // mapped; fall back to the workspace's last-focused window.
+            let parent_focus =
+                parent_surface.filter(|parent| self.mapped_window_for_surface(parent).is_some());
+            let focus = parent_focus.or_else(|| {
+                self.workspaces[self.active_workspace()]
+                    .focused_idx
+                    .and_then(|focus_idx| {
+                        self.workspaces[self.active_workspace()]
+                            .windows
+                            .get(focus_idx)
+                    })
+                    .and_then(Self::window_root_surface)
+            });
+            self.set_keyboard_focus(focus);
+        }
+
+        // Re-tile whenever the workspace is on screen anywhere, not just when it
+        // is the focused output's: a window closing on a second monitor has to
+        // free its space there too.
+        if showing_output.is_some() {
             self.relayout();
             self.needs_render = true;
         }
@@ -745,7 +757,12 @@ impl Beewm {
             Some(o) => o,
             None => return,
         };
-        let output_geo = self.space.output_geometry(&output).unwrap();
+        // No geometry yet (an output registered before its first mode) means
+        // there is nowhere to float this window to — leave it tiled instead of
+        // panicking the compositor thread.
+        let Some(output_geo) = self.space.output_geometry(&output) else {
+            return;
+        };
         let float_w = output_geo.size.w / 2;
         let float_h = output_geo.size.h / 2;
         let pos = Point::from((
@@ -840,8 +857,20 @@ impl Beewm {
     }
 
     fn exit_fullscreen_internal(&mut self, relayout: bool) -> Option<Window> {
-        let ws = self.active_workspace();
-        let fs_window = self.workspaces[ws].fullscreen.take()?;
+        self.exit_fullscreen_on_workspace(self.active_workspace(), relayout)
+    }
+
+    /// Leave fullscreen on `ws`, whichever output (if any) is showing it.
+    ///
+    /// The client is always told it is no longer fullscreen. Everything that
+    /// touches the `Space` is skipped for a hidden workspace: its windows are
+    /// unmapped by design and must stay that way until it is shown again.
+    pub(crate) fn exit_fullscreen_on_workspace(
+        &mut self,
+        ws: usize,
+        relayout: bool,
+    ) -> Option<Window> {
+        let fs_window = self.workspaces.get_mut(ws)?.fullscreen.take()?;
         let restore_floating = Self::window_root_surface(&fs_window)
             .and_then(|root| self.floating_windows.get(&root).copied());
 
@@ -858,13 +887,16 @@ impl Beewm {
             }
         }
 
+        if self.output_showing_workspace(ws).is_none() {
+            return Some(fs_window);
+        }
+
         if let Some(floating) = restore_floating {
             self.space
                 .map_element(fs_window.clone(), floating.position, true);
         }
 
-        let ws_idx = self.active_workspace();
-        for window in self.workspaces[ws_idx].windows.clone() {
+        for window in self.workspaces[ws].windows.clone() {
             if self.space.element_geometry(&window).is_none() {
                 self.space.map_element(window, (0, 0), false);
             }

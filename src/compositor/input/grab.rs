@@ -48,6 +48,30 @@ fn clamp_window_onscreen(
     ))
 }
 
+/// Push a dragged window's new geometry to an XWayland client.
+///
+/// A Wayland toplevel is configured with a size only — the compositor owns its
+/// position — so the grab paths below reach for `toplevel()`, which is `None`
+/// for an X11 window. An X11 client tracks its own absolute geometry and
+/// XWayland translates pointer events through it, so a grab that moves or
+/// resizes the element without configuring the X window leaves the client
+/// drawing at its old size and reading mistranslated input. Override-redirect
+/// surfaces place themselves and reject configures, hence the guard.
+fn configure_x11_geometry(window: &Window, pos: Point<i32, Logical>, size: Size<i32, Logical>) {
+    let Some(x11) = window.x11_surface() else {
+        return;
+    };
+    let geometry = Rectangle::new(pos, size);
+    // Motion events arrive far faster than the integer position changes, and
+    // every configure is a round of X requests plus a flush.
+    if x11.is_override_redirect() || x11.geometry() == geometry {
+        return;
+    }
+    if let Err(error) = x11.configure(geometry) {
+        tracing::warn!("Failed to configure X11 window during grab: {}", error);
+    }
+}
+
 pub(super) fn handle_active_grab(state: &mut Beewm, pointer: Point<f64, Logical>) -> bool {
     match state.active_grab.clone() {
         Some(ActiveGrab::Move(grab)) => {
@@ -121,6 +145,10 @@ fn apply_window_move_from_start(
         .space
         .map_element(window.clone(), new_window_pos, true);
 
+    if let Some(size) = size {
+        configure_x11_geometry(window, new_window_pos, size);
+    }
+
     if let (Some(root), Some(size)) = (root, size) {
         state
             .floating_windows
@@ -147,6 +175,8 @@ fn apply_resize_grab(state: &mut Beewm, grab: &ResizeGrab, pointer: Point<f64, L
             state.size = Some(Size::from((new_window_size.w, new_window_size.h)));
         });
         toplevel.send_pending_configure();
+    } else {
+        configure_x11_geometry(&grab.window, new_window_pos, new_window_size);
     }
 
     if let Some(ActiveGrab::Resize(active_grab)) = state.active_grab.as_mut() {
@@ -446,6 +476,12 @@ pub(super) fn finish_resize_grab(state: &mut Beewm) -> bool {
             )));
         });
         toplevel.send_configure();
+    } else {
+        configure_x11_geometry(
+            &grab.window,
+            grab.current_window_pos,
+            grab.current_window_size,
+        );
     }
 
     state

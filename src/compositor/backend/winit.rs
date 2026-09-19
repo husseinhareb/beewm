@@ -453,7 +453,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         if data.state.needs_render {
             let output = data.state.focused_output();
             if let Some(ref output) = output {
-                let border_elements = data.state.border_elements();
+                let border_elements = data.state.border_elements(output);
                 let mut submitted = false;
 
                 let render_result = match winit_backend.bind() {

@@ -3,6 +3,7 @@ use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{ImportMem, Renderer};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+use smithay::output::Output;
 use smithay::utils::{Physical, Point};
 
 use super::{ActiveGrab, Beewm};
@@ -30,10 +31,11 @@ impl Beewm {
     }
 
     /// Build a themed software cursor element for a renderer that can import
-    /// shared-memory cursor sprites.
+    /// shared-memory cursor sprites, positioned for `output`.
     pub fn cursor_elements_for_renderer<R>(
         &mut self,
         renderer: &mut R,
+        output: &Output,
     ) -> Vec<MemoryRenderBufferRenderElement<R>>
     where
         R: Renderer + ImportMem,
@@ -42,11 +44,21 @@ impl Beewm {
         let Some(icon) = self.effective_cursor_icon() else {
             return Vec::new();
         };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return Vec::new();
+        };
 
         let sprite = self.cursor_theme.sprite(icon);
+        // `pointer_location` is global logical; a render element (and the DRM
+        // cursor plane it may be promoted to) is placed in physical pixels
+        // relative to this output. The element scales the sprite by the output
+        // scale as well, so the hotspot — in the same units as the sprite — is
+        // subtracted before scaling, not after.
+        let scale = output.current_scale().fractional_scale();
+        let local = self.pointer_location - output_geo.loc.to_f64();
         let location = Point::<f64, Physical>::from((
-            self.pointer_location.x - sprite.hotspot.x as f64,
-            self.pointer_location.y - sprite.hotspot.y as f64,
+            (local.x - sprite.hotspot.x as f64) * scale,
+            (local.y - sprite.hotspot.y as f64) * scale,
         ));
 
         match MemoryRenderBufferRenderElement::from_buffer(
@@ -70,8 +82,9 @@ impl Beewm {
     pub fn cursor_elements(
         &mut self,
         renderer: &mut GlesRenderer,
+        output: &Output,
     ) -> Vec<MemoryRenderBufferRenderElement<GlesRenderer>> {
-        self.cursor_elements_for_renderer(renderer)
+        self.cursor_elements_for_renderer(renderer, output)
     }
 }
 

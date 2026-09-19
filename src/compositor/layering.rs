@@ -2,10 +2,14 @@ use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 const LAYERS_ABOVE_WINDOWS: [WlrLayer; 2] = [WlrLayer::Overlay, WlrLayer::Top];
 const LAYERS_BELOW_WINDOWS: [WlrLayer; 2] = [WlrLayer::Bottom, WlrLayer::Background];
+/// `wlr-layer-shell` puts fullscreen surfaces at the `Top` level, so `Overlay`
+/// stays above them. Suppressing it would hide lock screens, notifications,
+/// OSDs and on-screen keyboards for as long as anything is fullscreen.
+const LAYERS_ABOVE_FULLSCREEN: [WlrLayer; 1] = [WlrLayer::Overlay];
 
 pub fn layers_rendered_above_windows(fullscreen_active: bool) -> &'static [WlrLayer] {
     if fullscreen_active {
-        &[]
+        &LAYERS_ABOVE_FULLSCREEN
     } else {
         &LAYERS_ABOVE_WINDOWS
     }
@@ -21,7 +25,7 @@ pub fn layers_rendered_below_windows(fullscreen_active: bool) -> &'static [WlrLa
 
 pub fn layers_hit_tested_before_windows(fullscreen_active: bool) -> &'static [WlrLayer] {
     if fullscreen_active {
-        &[]
+        &LAYERS_ABOVE_FULLSCREEN
     } else {
         &LAYERS_ABOVE_WINDOWS
     }
