@@ -30,7 +30,10 @@ use crate::compositor::state::Beewm;
 
 pub(crate) fn is_window_fullscreen(window: &Window) -> bool {
     if let Some(toplevel) = window.toplevel() {
-        toplevel.current_state().states.contains(xdg_toplevel::State::Fullscreen)
+        toplevel
+            .current_state()
+            .states
+            .contains(xdg_toplevel::State::Fullscreen)
             || toplevel.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Fullscreen))
     } else if let Some(x11) = window.x11_surface() {
         x11.is_fullscreen()
