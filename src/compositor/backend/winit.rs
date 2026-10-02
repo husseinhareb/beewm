@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::GlesError;
+use smithay::backend::renderer::gles::element::PixelShaderElement;
 use smithay::backend::renderer::glow::{GlowFrame, GlowRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::winit::{self, WinitEvent};
@@ -49,6 +51,8 @@ enum WinitRenderElement {
     Surface(Box<WaylandSurfaceRenderElement<GlowRenderer>>),
     Window(Box<WindowElement<GlowRenderer>>),
     Border(SolidColorRenderElement),
+    Memory(Box<MemoryRenderBufferRenderElement<GlowRenderer>>),
+    Shader(PixelShaderElement),
 }
 
 impl From<WaylandSurfaceRenderElement<GlowRenderer>> for WinitRenderElement {
@@ -69,12 +73,26 @@ impl From<SolidColorRenderElement> for WinitRenderElement {
     }
 }
 
+impl From<MemoryRenderBufferRenderElement<GlowRenderer>> for WinitRenderElement {
+    fn from(value: MemoryRenderBufferRenderElement<GlowRenderer>) -> Self {
+        Self::Memory(Box::new(value))
+    }
+}
+
+impl From<PixelShaderElement> for WinitRenderElement {
+    fn from(value: PixelShaderElement) -> Self {
+        Self::Shader(value)
+    }
+}
+
 impl Element for WinitRenderElement {
     fn id(&self) -> &Id {
         match self {
             Self::Surface(element) => element.id(),
             Self::Window(element) => element.id(),
             Self::Border(element) => element.id(),
+            Self::Memory(element) => element.as_ref().id(),
+            Self::Shader(element) => element.id(),
         }
     }
 
@@ -83,6 +101,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.current_commit(),
             Self::Window(element) => element.current_commit(),
             Self::Border(element) => element.current_commit(),
+            Self::Memory(element) => element.as_ref().current_commit(),
+            Self::Shader(element) => element.current_commit(),
         }
     }
 
@@ -91,6 +111,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.location(scale),
             Self::Window(element) => element.location(scale),
             Self::Border(element) => element.location(scale),
+            Self::Memory(element) => element.as_ref().location(scale),
+            Self::Shader(element) => element.location(scale),
         }
     }
 
@@ -99,6 +121,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.src(),
             Self::Window(element) => element.src(),
             Self::Border(element) => element.src(),
+            Self::Memory(element) => element.as_ref().src(),
+            Self::Shader(element) => element.src(),
         }
     }
 
@@ -107,6 +131,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.transform(),
             Self::Window(element) => element.transform(),
             Self::Border(element) => element.transform(),
+            Self::Memory(element) => element.as_ref().transform(),
+            Self::Shader(element) => element.transform(),
         }
     }
 
@@ -115,6 +141,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.geometry(scale),
             Self::Window(element) => element.geometry(scale),
             Self::Border(element) => element.geometry(scale),
+            Self::Memory(element) => element.as_ref().geometry(scale),
+            Self::Shader(element) => element.geometry(scale),
         }
     }
 
@@ -127,6 +155,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.damage_since(scale, commit),
             Self::Window(element) => element.damage_since(scale, commit),
             Self::Border(element) => element.damage_since(scale, commit),
+            Self::Memory(element) => element.as_ref().damage_since(scale, commit),
+            Self::Shader(element) => element.damage_since(scale, commit),
         }
     }
 
@@ -135,6 +165,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.opaque_regions(scale),
             Self::Window(element) => element.opaque_regions(scale),
             Self::Border(element) => element.opaque_regions(scale),
+            Self::Memory(element) => element.as_ref().opaque_regions(scale),
+            Self::Shader(element) => element.opaque_regions(scale),
         }
     }
 
@@ -143,6 +175,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.alpha(),
             Self::Window(element) => element.alpha(),
             Self::Border(element) => element.alpha(),
+            Self::Memory(element) => element.as_ref().alpha(),
+            Self::Shader(element) => element.alpha(),
         }
     }
 
@@ -151,6 +185,8 @@ impl Element for WinitRenderElement {
             Self::Surface(element) => element.kind(),
             Self::Window(element) => element.kind(),
             Self::Border(element) => element.kind(),
+            Self::Memory(element) => element.as_ref().kind(),
+            Self::Shader(element) => element.kind(),
         }
     }
 }
@@ -189,6 +225,22 @@ impl RenderElement<GlowRenderer> for WinitRenderElement {
                 damage,
                 opaque_regions,
             ),
+            Self::Memory(element) => RenderElement::<GlowRenderer>::draw(
+                element.as_ref(),
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
+            Self::Shader(element) => RenderElement::<GlowRenderer>::draw(
+                element,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
         }
     }
 
@@ -197,6 +249,8 @@ impl RenderElement<GlowRenderer> for WinitRenderElement {
             Self::Surface(element) => element.as_ref().underlying_storage(renderer),
             Self::Window(element) => element.as_ref().underlying_storage(renderer),
             Self::Border(element) => element.underlying_storage(renderer),
+            Self::Memory(element) => element.as_ref().underlying_storage(renderer),
+            Self::Shader(element) => element.underlying_storage(renderer),
         }
     }
 }
@@ -368,7 +422,13 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(output) = data.state.focused_output() {
                     output.change_current_state(Some(mode), None, None, None);
                 }
-                data.state.relayout();
+                // Not a bare `relayout()`: the host window changing size is an
+                // output geometry change. `relayout_output` returns early (and
+                // never sets `needs_render`) when the workspace has no tiled
+                // windows, so an empty or floating-only workspace would not
+                // repaint into the new size at all — and floating windows would
+                // be left off-screen when the host window shrinks.
+                data.state.handle_output_geometry_changed();
             }
             WinitEvent::Input(event) => {
                 crate::compositor::input::handle_input(&mut data.state, event);
@@ -396,6 +456,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // repainting at ~refresh rate and settles back to idle once they finish.
         data.state.tick_animations(Instant::now());
         data.state.tick_overview(Instant::now());
+        data.state.refresh_overview_labels();
 
         // See run_udev for the rationale: rely on event sources to wake us
         // and treat the timeout purely as an idle ceiling.
@@ -458,7 +519,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                 let render_result = match winit_backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
-                        let fullscreen_active = data.state.screen_owned_by_window();
+                        let fullscreen_active = data.state.screen_owned_by_window(output);
                         let window_elements = window_render_elements(
                             renderer,
                             &data.state.space,
@@ -480,8 +541,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             1.0,
                         );
 
-                        let (overview_quads, overview_thumbnails) =
-                            overview_elements(&data.state, renderer, output);
+                        let overview = overview_elements(&data.state, renderer, output);
 
                         // While locked, render only the lock surface (over a
                         // solid-black clear); never the windows/layers/borders
@@ -496,13 +556,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                 .extend(lock_elements.into_iter().map(WinitRenderElement::from));
                         } else {
                             // The overview sits above everything else on screen.
-                            elements.extend(
-                                overview_thumbnails
-                                    .into_iter()
-                                    .map(WinitRenderElement::from),
-                            );
-                            elements
-                                .extend(overview_quads.into_iter().map(WinitRenderElement::from));
+                            elements.extend(overview.into_ordered::<WinitRenderElement>());
                             elements.extend(layers_above.into_iter().map(WinitRenderElement::from));
                             elements
                                 .extend(border_elements.into_iter().map(WinitRenderElement::from));

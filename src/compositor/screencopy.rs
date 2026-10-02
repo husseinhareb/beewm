@@ -25,7 +25,9 @@ use smithay::wayland::shm::with_buffer_contents_mut;
 use tracing::warn;
 
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
-use crate::compositor::render::{WindowElement, layer_render_elements, window_render_elements};
+use crate::compositor::render::{
+    WindowElement, layer_render_elements, lock_render_elements, window_render_elements,
+};
 use crate::compositor::state::Beewm;
 
 render_elements! {
@@ -338,9 +340,7 @@ where
                 );
             }
             let (secs, nsecs) = monotonic_time();
-            pending
-                .frame
-                .ready((secs >> 32) as u32, secs as u32, nsecs);
+            pending.frame.ready((secs >> 32) as u32, secs as u32, nsecs);
             buffer.release();
             tracing::trace!(
                 target = "beewm::screencast",
@@ -372,7 +372,21 @@ where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Texture + Clone + Send + 'static,
 {
-    let fullscreen_active = state.screen_owned_by_window();
+    // A locked session must never be captured. The render path in the backend
+    // already drops everything but the lock surface (see `render_surface`);
+    // screencopy has to make the same cut, or any client that held a
+    // zwlr_screencopy_manager_v1 before the lock keeps recording the desktop
+    // behind the lock screen. Outputs with no live lock surface capture the
+    // black clear color, exactly like they display.
+    if state.locked {
+        let lock_surface = state.lock_surfaces.get(output);
+        return lock_render_elements(renderer, output, lock_surface, 1.0)
+            .into_iter()
+            .map(ScreencopyRenderElement::from)
+            .collect();
+    }
+
+    let fullscreen_active = state.screen_owned_by_window(output);
     let window_elements = window_render_elements(
         renderer,
         &state.space,

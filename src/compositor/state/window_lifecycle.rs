@@ -8,6 +8,7 @@ use smithay::wayland::shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData};
 
 use crate::model::window::Geometry;
 
+use super::output::{ONSCREEN_MARGIN, clamp_into_usable};
 use super::popup::{
     centered_dialog_position, classify_toplevel_floating, should_map_toplevel_floating,
 };
@@ -484,23 +485,20 @@ impl Beewm {
     /// When a cell is large enough the returned gap equals the configured gap.
     /// For tiny cells (deep dwindle trees) the gap shrinks so that a 1-pixel
     /// window with its borders never overflows outside the cell boundary.
-    fn effective_inner_gap(&self, cell_w: u32, cell_h: u32) -> (i32, i32) {
-        let gap = self.config.gap as i32;
-        let bw = self.config.border_width as i32;
-        let gx = gap.min(((cell_w as i32 - 2 * bw - 1) / 2).max(0));
-        let gy = gap.min(((cell_h as i32 - 2 * bw - 1) / 2).max(0));
-        (gx, gy)
+    /// Where the window itself goes inside its layout cell, and how big it is.
+    /// See [`tile_content_rect`].
+    pub(crate) fn tiled_content_rect(
+        &self,
+        geo: Geometry,
+    ) -> Rectangle<i32, smithay::utils::Logical> {
+        tile_content_rect(geo, self.config.gap as i32, self.config.border_width as i32)
     }
 
     pub(crate) fn configured_tiled_size(
         &self,
         geo: Geometry,
     ) -> Size<i32, smithay::utils::Logical> {
-        let (gx, gy) = self.effective_inner_gap(geo.width, geo.height);
-        let bw = self.config.border_width as i32;
-        let w = (geo.width as i32 - gx * 2 - bw * 2).max(1);
-        let h = (geo.height as i32 - gy * 2 - bw * 2).max(1);
-        Size::from((w, h))
+        self.tiled_content_rect(geo).size
     }
 
     pub(crate) fn initial_toplevel_size(
@@ -787,17 +785,48 @@ impl Beewm {
         self.needs_render = true;
     }
 
-    /// Re-place all floating windows of `ws_idx` back into the space at their
-    /// stored positions.
-    fn remap_floating_windows_for(&mut self, ws_idx: usize) {
+    /// Re-map the floating windows of workspace `ws_idx` onto `output`.
+    ///
+    /// A float's stored position is a *global* Space coordinate. A window moved
+    /// to a workspace that lives on another monitor therefore comes back at its
+    /// old monitor's coordinates — logically on the new workspace but drawn on
+    /// the old screen. When the stored position no longer belongs to `output`,
+    /// translate it by the output-origin delta (so the window keeps the spot it
+    /// had relative to its previous monitor) and clamp it on-screen.
+    fn remap_floating_windows_for(&mut self, ws_idx: usize, output: &smithay::output::Output) {
+        let Some(target_geo) = self.space.output_geometry(output) else {
+            return;
+        };
+        let usable = self.floating_usable_rect_for(output);
         for window in self.workspaces[ws_idx].windows.clone() {
             let root = match window.wl_surface().map(|surface| surface.into_owned()) {
                 Some(surface) => root_surface(&surface),
                 None => continue,
             };
-            if let Some(floating) = self.floating_windows.get(&root).copied() {
-                self.space.map_element(window, floating.position, false);
+            let Some(mut floating) = self.floating_windows.get(&root).copied() else {
+                continue;
+            };
+
+            let center =
+                floating.position + Point::from((floating.size.w / 2, floating.size.h / 2));
+            if !target_geo.contains(center) {
+                let source_geo = self
+                    .output_under_point(center.to_f64())
+                    .and_then(|src| self.space.output_geometry(&src));
+                floating.position =
+                    translate_float_onto_output(floating.position, source_geo, target_geo);
+                if let Some(usable) = usable {
+                    floating.position = clamp_into_usable(
+                        floating.position,
+                        floating.size,
+                        usable,
+                        ONSCREEN_MARGIN,
+                    );
+                }
+                self.floating_windows.insert(root, floating);
             }
+
+            self.space.map_element(window, floating.position, false);
         }
     }
 
@@ -828,10 +857,19 @@ impl Beewm {
         let Some(output_geo) = self.space.output_geometry(&output) else {
             return;
         };
-        let ws_idx = self.active_workspace();
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(idx, ws)| ws.windows.contains(window).then_some(idx))
+            .unwrap_or_else(|| self.active_workspace());
+
         for sibling in self.workspaces[ws_idx].windows.clone() {
             if &sibling != window {
                 self.space.unmap_elem(&sibling);
+                if let Some(root) = Self::window_root_surface(&sibling) {
+                    self.animations.forget(&root);
+                }
             }
         }
         if let Some(toplevel) = window.toplevel() {
@@ -848,6 +886,20 @@ impl Beewm {
             self.animations.forget(&root);
         }
         self.space.map_element(window.clone(), output_geo.loc, true);
+
+        if let Some(idx) = self.workspaces[ws_idx]
+            .windows
+            .iter()
+            .position(|w| w == window)
+        {
+            self.workspaces[ws_idx].focused_idx = Some(idx);
+        }
+        if ws_idx == self.active_workspace()
+            && let Some(surface) = window.wl_surface().map(|s| s.into_owned())
+        {
+            self.set_keyboard_focus(Some(surface));
+        }
+
         self.needs_render = true;
     }
 
@@ -947,9 +999,16 @@ impl Beewm {
             return;
         }
 
+        // When a window is fullscreen on this workspace, it owns the whole
+        // screen; siblings were unmapped and must not be retiled or remapped.
+        if let Some(fs_window) = self.workspaces[ws_idx].fullscreen.clone() {
+            self.show_fullscreen_window(&fs_window);
+            return;
+        }
+
         let tiled_windows = self.tiled_windows_in_workspace(ws_idx);
         if tiled_windows.is_empty() {
-            self.remap_floating_windows_for(ws_idx);
+            self.remap_floating_windows_for(ws_idx, output);
             return;
         }
         let tiled_roots: Vec<WlSurface> = tiled_windows
@@ -968,7 +1027,7 @@ impl Beewm {
         // game is never worth risking that. We still keep targets in sync below
         // so re-tiling later does not snap.
         let suppress_anim =
-            self.animations.disable_for_fullscreen() && self.screen_owned_by_window();
+            self.animations.disable_for_fullscreen() && self.screen_owned_by_window(output);
         for window in &tiled_windows {
             let Some(root) = Self::window_root_surface(window) else {
                 continue;
@@ -976,10 +1035,9 @@ impl Beewm {
             let Some(geo) = keyed_geos.get(&root).copied() else {
                 continue;
             };
-            let (gx, gy) = self.effective_inner_gap(geo.width, geo.height);
-            let x = geo.x + gx;
-            let y = geo.y + gy;
-            let size = self.configured_tiled_size(geo);
+            let content = self.tiled_content_rect(geo);
+            let (x, y) = (content.loc.x, content.loc.y);
+            let size = content.size;
 
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|state| {
@@ -1011,6 +1069,138 @@ impl Beewm {
             }
         }
         self.needs_render = true;
-        self.remap_floating_windows_for(ws_idx);
+        self.remap_floating_windows_for(ws_idx, output);
+    }
+}
+
+/// Place a window inside its layout cell, leaving room for the gap *and* the
+/// border, and return the rectangle the window content itself occupies.
+///
+/// Borders are drawn outside the window rectangle (see
+/// [`crate::compositor::state::decorations::expand_by_border`]), so the
+/// content has to be inset by the border width on top of the gap. Offsetting by
+/// the gap alone — while still subtracting the border from the size — shifts
+/// every window up and left by `border` inside its cell, and once the cell is
+/// small enough that the gap clamps to zero the border is drawn *outside* the
+/// cell entirely: along the edge of the workspace, that is off the usable area.
+///
+/// The invariant is that the content grown by `border` on every side stays
+/// within `cell`. It holds for any cell at least `2 * border + 1` across; below
+/// that a border cannot fit at all and the content is pinned to one pixel.
+fn tile_content_rect(
+    cell: Geometry,
+    gap: i32,
+    border: i32,
+) -> Rectangle<i32, smithay::utils::Logical> {
+    let inset = |extent: u32| {
+        let extent = extent as i32;
+        // Give up the gap before the border: a window with no breathing room is
+        // survivable, a border drawn outside its cell is not.
+        let gap = gap.clamp(0, ((extent - 2 * border - 1) / 2).max(0));
+        let size = (extent - 2 * gap - 2 * border).max(1);
+        (gap + border, size)
+    };
+    let (dx, w) = inset(cell.width);
+    let (dy, h) = inset(cell.height);
+    Rectangle::new((cell.x + dx, cell.y + dy).into(), (w, h).into())
+}
+
+/// Move a floating window that is sitting on `source` onto `target`, keeping the
+/// spot it had relative to its old output's top-left. With no source output (the
+/// window is stranded off every screen) it is parked at the target's origin.
+fn translate_float_onto_output(
+    position: Point<i32, Logical>,
+    source: Option<Rectangle<i32, Logical>>,
+    target: Rectangle<i32, Logical>,
+) -> Point<i32, Logical> {
+    match source {
+        Some(source) => position + target.loc - source.loc,
+        None => target.loc,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tile_content_rect, translate_float_onto_output};
+    use crate::model::window::Geometry;
+    use smithay::utils::{Point, Rectangle};
+
+    /// The bug this guards: the border is drawn *outside* the window, so a
+    /// window offset by the gap alone spilled `border` pixels past its cell —
+    /// off the edge of the workspace for the outermost cells.
+    #[test]
+    fn a_tiled_window_and_its_border_stay_inside_their_cell() {
+        for border in [0, 1, 2, 6] {
+            for gap in [0, 1, 4, 20] {
+                for (w, h) in [
+                    (1920u32, 1080u32),
+                    (960, 540),
+                    (40, 30),
+                    (9, 7),
+                    (3, 3),
+                    (1, 1),
+                ] {
+                    let cell = Geometry::new(100, 200, w, h);
+                    let content = tile_content_rect(cell, gap, border);
+                    assert!(
+                        content.size.w >= 1 && content.size.h >= 1,
+                        "{w}x{h} gap={gap} border={border}: {content:?}",
+                    );
+                    // Cells too small to hold a border at all are a lost cause;
+                    // every other cell must contain the window and its border.
+                    if w >= (2 * border + 1) as u32 && h >= (2 * border + 1) as u32 {
+                        let outer = crate::compositor::state::decorations::expand_by_border(
+                            content, border,
+                        );
+                        assert!(
+                            outer.loc.x >= cell.x
+                                && outer.loc.y >= cell.y
+                                && outer.loc.x + outer.size.w <= cell.x + cell.width as i32
+                                && outer.loc.y + outer.size.h <= cell.y + cell.height as i32,
+                            "{w}x{h} gap={gap} border={border}: {outer:?} escapes {cell:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// With room to spare the window is centred in its cell, not pushed into a
+    /// corner: equal margins on both sides.
+    #[test]
+    fn a_tiled_window_sits_evenly_in_its_cell() {
+        let cell = Geometry::new(0, 0, 960, 540);
+        let content = tile_content_rect(cell, 4, 2);
+        let left = content.loc.x - cell.x;
+        let right = (cell.x + cell.width as i32) - (content.loc.x + content.size.w);
+        assert_eq!(left, right, "margins differ: {left} vs {right}");
+        let top = content.loc.y - cell.y;
+        let bottom = (cell.y + cell.height as i32) - (content.loc.y + content.size.h);
+        assert_eq!(top, bottom, "margins differ: {top} vs {bottom}");
+    }
+
+    #[test]
+    fn a_float_keeps_its_offset_when_it_changes_output() {
+        // 1920-wide side-by-side monitors; the float sits 100,200 into the left.
+        let left = Rectangle::new(Point::from((0, 0)), (1920, 1080).into());
+        let right = Rectangle::new(Point::from((1920, 0)), (1920, 1080).into());
+        assert_eq!(
+            translate_float_onto_output(Point::from((100, 200)), Some(left), right),
+            Point::from((2020, 200)),
+        );
+        // ...and back again.
+        assert_eq!(
+            translate_float_onto_output(Point::from((2020, 200)), Some(right), left),
+            Point::from((100, 200)),
+        );
+    }
+
+    #[test]
+    fn a_stranded_float_lands_on_the_target_output() {
+        let target = Rectangle::new(Point::from((1920, 0)), (1920, 1080).into());
+        assert_eq!(
+            translate_float_onto_output(Point::from((-5000, -5000)), None, target),
+            Point::from((1920, 0)),
+        );
     }
 }

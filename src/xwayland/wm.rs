@@ -61,7 +61,9 @@ impl Beewm {
                 self.publish_workspace_state();
                 self.track_window(&window);
 
-                if surface.is_fullscreen() || self.x11_surface_covers_output(&surface) {
+                if surface.is_fullscreen()
+                    || self.x11_surface_covers_output(workspace_idx, &surface)
+                {
                     self.insert_tiled_window(workspace_idx, &window, split_target.as_ref());
                     self.pending_x11_fullscreen
                         .retain(|pending| pending != &surface);
@@ -223,7 +225,13 @@ impl Beewm {
             for sibling in &self.workspaces[ws_idx].windows {
                 if *sibling != window_obj {
                     self.space.unmap_elem(sibling);
+                    if let Some(root) = Self::window_root_surface(sibling) {
+                        self.animations.forget(&root);
+                    }
                 }
+            }
+            if let Some(root) = Self::window_root_surface(&window_obj) {
+                self.animations.forget(&root);
             }
             self.space
                 .map_element(window_obj.clone(), output_geo.loc, true);
@@ -239,8 +247,17 @@ impl Beewm {
         true
     }
 
-    fn x11_surface_covers_output(&self, surface: &X11Surface) -> bool {
-        self.rectangle_covers_output(surface.geometry())
+    /// Whether `surface` covers the output that is currently showing workspace
+    /// `ws_idx`. Resolved per-workspace so a game on a second monitor is
+    /// measured against *that* monitor, not the focused one.
+    fn x11_surface_covers_output(&self, ws_idx: usize, surface: &X11Surface) -> bool {
+        let Some(output) = self
+            .output_showing_workspace(ws_idx)
+            .or_else(|| self.focused_output())
+        else {
+            return false;
+        };
+        self.rectangle_covers_output(&output, surface.geometry())
     }
 
     fn remove_x11_window(&mut self, surface: &X11Surface) {
@@ -706,7 +723,7 @@ impl XwmHandler for Beewm {
         // whole output are kept fullscreen. That only makes sense while the
         // window is actually on screen to cover it.
         if self.output_showing_workspace(ws_idx).is_some()
-            && self.x11_surface_covers_output(&window)
+            && self.x11_surface_covers_output(ws_idx, &window)
         {
             tracing::info!(
                 target: "beewm::xwayland",

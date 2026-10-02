@@ -157,7 +157,7 @@ impl Beewm {
         // override-redirect game), skip border generation entirely. Borders
         // around a fullscreen-sized window would otherwise sit *on top of*
         // its primary-plane content and prevent direct scanout.
-        if self.screen_owned_by_window() {
+        if self.screen_owned_by_window(output) {
             return Vec::new();
         }
 

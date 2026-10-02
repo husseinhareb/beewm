@@ -934,7 +934,39 @@ impl Beewm {
         // anything) so it can't reappear over the session after unlock.
         self.close_overview(false);
         self.overview_hold = None;
+        self.cancel_active_grab();
+
+        if let Some(focused) = self.prev_keyboard_focus.clone() {
+            self.deactivate_pointer_constraint_for(&focused);
+        }
+        if let Some(focused) = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|target| target.wl_surface().map(|surface| surface.into_owned()))
+        {
+            self.deactivate_pointer_constraint_for(&focused);
+        }
+
+        self.compositor_cursor_icon = None;
+        self.refresh_compositor_cursor();
+    }
+
+    /// Abandon any interactive move/resize/swap grab and undo the state it was
+    /// holding (the tiled-swap layout snapshot, the `Resizing` toplevel state).
+    ///
+    /// Called from every path that can pull the dragged window out from under
+    /// the grab — unmap, destroy, workspace switch, session lock. Without this
+    /// the grab keeps running against a window that is no longer in the visible
+    /// workspace, and the next pointer motion re-maps it into the `Space`.
+    pub(crate) fn cancel_active_grab(&mut self) {
         let active_grab = self.active_grab.take();
+        if active_grab.is_none()
+            && self.tiled_swap_layout_snapshot.is_none()
+            && self.tiled_swap_target.is_none()
+        {
+            return;
+        }
         if let Some(super::types::ActiveGrab::TiledSwap(grab)) = &active_grab {
             if let Some(layout_snapshot) = self.tiled_swap_layout_snapshot.take() {
                 self.layout_manager = layout_snapshot;
@@ -974,18 +1006,6 @@ impl Beewm {
             Some(super::types::ActiveGrab::Move(_))
             | Some(super::types::ActiveGrab::TiledSwap(_))
             | None => {}
-        }
-
-        if let Some(focused) = self.prev_keyboard_focus.clone() {
-            self.deactivate_pointer_constraint_for(&focused);
-        }
-        if let Some(focused) = self
-            .seat
-            .get_keyboard()
-            .and_then(|keyboard| keyboard.current_focus())
-            .and_then(|target| target.wl_surface().map(|surface| surface.into_owned()))
-        {
-            self.deactivate_pointer_constraint_for(&focused);
         }
 
         self.compositor_cursor_icon = None;

@@ -137,3 +137,15 @@ pub enum ActiveGrab {
     /// Tiled window resize (Super + RMB drag on tiled window).
     TiledResize(TiledResizeGrab),
 }
+
+impl ActiveGrab {
+    /// The window this grab is dragging.
+    pub fn window(&self) -> &Window {
+        match self {
+            Self::Move(grab) => &grab.window,
+            Self::TiledSwap(grab) => &grab.window,
+            Self::Resize(grab) => &grab.window,
+            Self::TiledResize(grab) => &grab.window,
+        }
+    }
+}

@@ -14,17 +14,30 @@ use smithay::backend::renderer::element::utils::{
     RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::gles::element::PixelShaderElement;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::desktop::space::{ConstrainBehavior, ConstrainReference, constrain_space_element};
 use smithay::desktop::{Space, Window, layer_map_for_output};
 use smithay::output::Output;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::compositor::animation::AnimationManager;
 use crate::compositor::state::Beewm;
+
+pub(crate) fn is_window_fullscreen(window: &Window) -> bool {
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.current_state().states.contains(xdg_toplevel::State::Fullscreen)
+            || toplevel.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Fullscreen))
+    } else if let Some(x11) = window.x11_surface() {
+        x11.is_fullscreen()
+    } else {
+        false
+    }
+}
 
 /// A window surface that has been scaled/relocated/cropped into an animation's
 /// current visual rectangle. This is the niri/cosmic-style transform stack.
@@ -201,12 +214,32 @@ where
     };
     let scale = Scale::from(output.current_scale().fractional_scale());
 
-    // Fast path: when nothing is animating (the common case, including any
-    // fullscreen game) fall back to Smithay's batched space rendering and just
-    // wrap the results. This keeps the hot/idle path byte-for-byte identical to
-    // the pre-animation code so direct scanout and game performance are
-    // unaffected.
-    if !animations.has_active() {
+    // A client is free to ignore the size it was configured with, and some do:
+    // it commits a larger buffer and paints straight over its neighbour's tile.
+    // The compositor cannot make it obey, but it can refuse to draw it outside
+    // the tile it was given. Detecting that is a bbox comparison per window;
+    // only when one actually overflows do we leave the fast path below.
+    let overflowing = |window: &Window| {
+        if is_window_fullscreen(window) {
+            return false;
+        }
+        let Some(root) = Beewm::window_root_surface(window) else {
+            return false;
+        };
+        let Some(tile) = animations.resting_target(&root) else {
+            return false;
+        };
+        let bbox = window.bbox();
+        bbox.size.w > tile.size.w || bbox.size.h > tile.size.h
+    };
+    let any_overflow = space.elements().any(overflowing);
+
+    // Fast path: when nothing is animating and every window fits its tile (the
+    // common case, including any fullscreen game) fall back to Smithay's
+    // batched space rendering and just wrap the results. This keeps the
+    // hot/idle path byte-for-byte identical to the pre-animation code so direct
+    // scanout and game performance are unaffected.
+    if !animations.has_active() && !any_overflow {
         return space
             .render_elements_for_region(renderer, &region, scale, alpha)
             .into_iter()
@@ -249,6 +282,32 @@ where
                     scale,
                     constrain,
                     behavior,
+                ));
+            }
+            // Not animating, but bigger than the tile it was told to be: crop it
+            // there. `CutOff` clips at the constrain size without scaling, so
+            // the window is truncated at its own boundary rather than
+            // squashed — and rather than bleeding over its neighbour.
+            None if overflowing(window) => {
+                let Some(root) = Beewm::window_root_surface(window) else {
+                    continue;
+                };
+                let Some(mut constrain) = animations.resting_target(&root) else {
+                    continue;
+                };
+                constrain.loc -= region.loc;
+                elements.extend(constrain_space_element::<R, Window, WindowElement<R>>(
+                    renderer,
+                    window,
+                    constrain.loc,
+                    alpha,
+                    scale,
+                    constrain,
+                    ConstrainBehavior {
+                        reference: ConstrainReference::Geometry,
+                        behavior: ConstrainScaleBehavior::CutOff,
+                        align: ConstrainAlign::TOP_LEFT,
+                    },
                 ));
             }
             None => {
@@ -337,6 +396,7 @@ pub enum OutputRenderElement {
     Window(Box<WindowElement<GlesRenderer>>),
     Border(SolidColorRenderElement),
     Cursor(Box<MemoryRenderBufferRenderElement<GlesRenderer>>),
+    Shader(PixelShaderElement),
 }
 
 impl From<WaylandSurfaceRenderElement<GlesRenderer>> for OutputRenderElement {
@@ -363,6 +423,12 @@ impl From<MemoryRenderBufferRenderElement<GlesRenderer>> for OutputRenderElement
     }
 }
 
+impl From<PixelShaderElement> for OutputRenderElement {
+    fn from(e: PixelShaderElement) -> Self {
+        Self::Shader(e)
+    }
+}
+
 impl Element for OutputRenderElement {
     fn id(&self) -> &Id {
         match self {
@@ -370,6 +436,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.id(),
             Self::Border(e) => e.id(),
             Self::Cursor(e) => e.id(),
+            Self::Shader(e) => e.id(),
         }
     }
 
@@ -379,6 +446,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.current_commit(),
             Self::Border(e) => e.current_commit(),
             Self::Cursor(e) => e.current_commit(),
+            Self::Shader(e) => e.current_commit(),
         }
     }
 
@@ -388,6 +456,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.location(scale),
             Self::Border(e) => e.location(scale),
             Self::Cursor(e) => e.location(scale),
+            Self::Shader(e) => e.location(scale),
         }
     }
 
@@ -397,6 +466,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.src(),
             Self::Border(e) => e.src(),
             Self::Cursor(e) => e.src(),
+            Self::Shader(e) => e.src(),
         }
     }
 
@@ -406,6 +476,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.transform(),
             Self::Border(e) => e.transform(),
             Self::Cursor(e) => e.transform(),
+            Self::Shader(e) => e.transform(),
         }
     }
 
@@ -415,6 +486,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.geometry(scale),
             Self::Border(e) => e.geometry(scale),
             Self::Cursor(e) => e.geometry(scale),
+            Self::Shader(e) => e.geometry(scale),
         }
     }
 
@@ -428,6 +500,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.damage_since(scale, commit),
             Self::Border(e) => e.damage_since(scale, commit),
             Self::Cursor(e) => e.damage_since(scale, commit),
+            Self::Shader(e) => e.damage_since(scale, commit),
         }
     }
 
@@ -437,6 +510,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.opaque_regions(scale),
             Self::Border(e) => e.opaque_regions(scale),
             Self::Cursor(e) => e.opaque_regions(scale),
+            Self::Shader(e) => e.opaque_regions(scale),
         }
     }
 
@@ -446,6 +520,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.alpha(),
             Self::Border(e) => e.alpha(),
             Self::Cursor(e) => e.alpha(),
+            Self::Shader(e) => e.alpha(),
         }
     }
 
@@ -455,6 +530,7 @@ impl Element for OutputRenderElement {
             Self::Window(e) => e.kind(),
             Self::Border(e) => e.kind(),
             Self::Cursor(e) => e.kind(),
+            Self::Shader(e) => e.kind(),
         }
     }
 }
@@ -496,6 +572,9 @@ impl RenderElement<GlesRenderer> for OutputRenderElement {
                 damage,
                 opaque_regions,
             ),
+            Self::Shader(e) => {
+                RenderElement::<GlesRenderer>::draw(e, frame, src, dst, damage, opaque_regions)
+            }
         }
     }
 
@@ -505,6 +584,7 @@ impl RenderElement<GlesRenderer> for OutputRenderElement {
             Self::Window(e) => e.as_ref().underlying_storage(renderer),
             Self::Border(e) => e.underlying_storage(renderer),
             Self::Cursor(e) => e.as_ref().underlying_storage(renderer),
+            Self::Shader(e) => e.underlying_storage(renderer),
         }
     }
 }

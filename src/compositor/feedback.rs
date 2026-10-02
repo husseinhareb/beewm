@@ -75,6 +75,28 @@ pub fn send_frame_callbacks(
         window.send_frame(output, time, throttle, surface_primary_scanout_output);
     });
 
+    // The space only holds the active workspace, so every other workspace's
+    // clients are getting no frame callbacks and have stopped drawing. That is
+    // exactly what should happen normally — but the overview puts those windows
+    // on screen as live thumbnails, and without a callback a video or animation
+    // sits frozen on whatever frame it last committed.
+    //
+    // They have no primary scanout output either (nothing has been scanning
+    // them out), so the callback is addressed to the overview's own output
+    // rather than looked up per surface. This lasts only while the grid is
+    // held open.
+    if let Some(overview) = state.overview.as_ref()
+        && overview.output == *output
+    {
+        for item in &overview.items {
+            if state.space.elements().any(|window| *window == item.window) {
+                continue;
+            }
+            item.window
+                .send_frame(output, time, throttle, |_, _| Some(output.clone()));
+        }
+    }
+
     let layer_map = layer_map_for_output(output);
     for layer in layer_map.layers() {
         layer.send_frame(output, time, throttle, surface_primary_scanout_output);

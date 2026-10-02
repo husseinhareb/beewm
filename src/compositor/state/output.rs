@@ -34,7 +34,7 @@ pub fn pick_initial_workspace(shown_on_other_outputs: &[usize], num_workspaces: 
 /// Minimum pixels of a floating window kept inside the usable area per axis so
 /// it can always be grabbed again after an output change. Mirrors the
 /// interactive-drag clamp margin in `input::grab`.
-const ONSCREEN_MARGIN: i32 = 48;
+pub(crate) const ONSCREEN_MARGIN: i32 = 48;
 
 /// The result of removing the output at `removed_idx` from a `Vec`-indexed
 /// output registry: the surviving outputs shift down by one, so every stored
@@ -78,7 +78,7 @@ pub fn plan_output_removal(
 }
 
 /// Clamp a window's top-left so at least `margin` px stays inside `usable`.
-fn clamp_into_usable(
+pub(crate) fn clamp_into_usable(
     pos: Point<i32, Logical>,
     size: Size<i32, Logical>,
     usable: Rectangle<i32, Logical>,

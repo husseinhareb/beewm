@@ -65,7 +65,23 @@ impl Beewm {
     }
 
     pub fn untrack_window_for_surface(&mut self, surface: &WlSurface) {
-        self.window_lookup.remove(&root_surface(surface));
+        let root = root_surface(surface);
+        // A window disappearing out from under an interactive grab leaves
+        // `active_grab` holding it: the next pointer motion would re-map the
+        // now-unmapped (or destroyed) window straight back into the `Space`.
+        // Every removal path — xdg unmap, xdg destroy, X11 unmap, X11
+        // override-redirect teardown — funnels through here, so this is the one
+        // place that has to notice.
+        if self
+            .active_grab
+            .as_ref()
+            .and_then(|grab| Self::window_root_surface(grab.window()))
+            .map(|grab_root| grab_root == root)
+            .unwrap_or(false)
+        {
+            self.cancel_active_grab();
+        }
+        self.window_lookup.remove(&root);
     }
 
     pub fn active_workspace_focused_index(&self) -> Option<usize> {

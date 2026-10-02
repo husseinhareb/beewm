@@ -172,3 +172,23 @@ fn single_window_focus_navigation_stays_on_that_window() {
     workspace.focus_prev();
     assert_eq!(workspace.focused_idx, Some(0));
 }
+
+#[test]
+fn fullscreen_with_multiple_windows_preserves_window_list() {
+    let mut workspace = Workspace::default();
+    workspace.add_window(10u32);
+    workspace.add_window(20u32);
+    assert_eq!(workspace.window_count(), 2);
+    assert_eq!(workspace.focused_idx, Some(1));
+
+    // Entering fullscreen on window 20:
+    workspace.fullscreen = Some(20u32);
+    assert_eq!(workspace.fullscreen, Some(20u32));
+    assert_eq!(workspace.window_count(), 2);
+
+    // Leaving fullscreen preserves the sibling windows:
+    let exited = workspace.fullscreen.take();
+    assert_eq!(exited, Some(20u32));
+    assert_eq!(workspace.fullscreen, None);
+    assert_eq!(workspace.windows, vec![10u32, 20u32]);
+}

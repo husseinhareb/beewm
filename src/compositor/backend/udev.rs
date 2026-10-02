@@ -88,6 +88,10 @@ const FRAME_FAILURE_RETRY_MAX: Duration = Duration::from_secs(2);
 /// master returns instead of latching black. Each failed `activate` ioctl can
 /// itself stall ~5s, so the effective cadence is governed by that, not this.
 const RESUME_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Upper bound on how long the event loop sleeps when nothing is pending. Also
+/// the ceiling on every computed timeout: the loop body drives the screen-idle
+/// deadline and the degraded-resume retry, which need this cadence.
+const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// One rendered output: a single CRTC's `DrmCompositor` plus its `Output` and
 /// per-output pacing/feedback bookkeeping. Every surface on a device shares that
@@ -672,6 +676,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // VBlank, so no busy loop), and clears back to idle when they finish.
         data.state.tick_animations(Instant::now());
         data.state.tick_overview(Instant::now());
+        data.state.refresh_overview_labels();
 
         // A resume left the DRM device unusable (typically EACCES because we
         // didn't hold DRM master yet). Keep re-attempting activation — master
@@ -723,10 +728,22 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             // Super is down: poll often enough that the overview grid comes up
             // on time instead of up to an idle tick late.
             Duration::from_millis(20)
+        } else if data.state.blanked {
+            // DPMS-off: `render_frame` is skipped below, so nothing can clear
+            // `needs_render`. A client that keeps committing while the screen is
+            // off (a clock, an animated wallpaper) would otherwise pin the loop
+            // at frame cadence for as long as the monitor stays dark. Input is
+            // what wakes us from here, and that wakes calloop directly.
+            IDLE_TIMEOUT
         } else if data.state.needs_render {
-            Duration::from_millis(16)
+            // Every surface backing off from a frame failure means no vblank is
+            // coming: sleep to the earliest retry deadline instead of ticking at
+            // frame cadence until it expires. Capped at the idle ceiling so the
+            // degraded-resume retry and the screen-timeout deadline keep their
+            // current granularity.
+            frame_retry_timeout(&data).unwrap_or(Duration::from_millis(16))
         } else {
-            Duration::from_millis(100)
+            IDLE_TIMEOUT
         };
         event_loop.dispatch(Some(timeout), &mut data)?;
         // Evaluate the screen-timeout deadline and apply any queued backend work
@@ -1072,6 +1089,11 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
         return;
     }
 
+    // Read before borrowing `gpu` (both live on `data`); needed to restore the
+    // previous mode if the new one fails to come up.
+    let refresh_rate = data.state.config.refresh_rate;
+    let output_configs = data.state.config.outputs.clone();
+
     // All DRM work happens here; we return the data the compositor side needs.
     let rebuilt = {
         let Some(gpu) = data.gpu.as_mut() else {
@@ -1103,22 +1125,29 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
             return;
         };
 
-        // Drop the old surface first so its CRTC is free before we re-create.
-        let reused_output = gpu.surfaces[idx].output.clone();
-        gpu.surfaces.remove(idx);
+        let GpuData {
+            drm_device,
+            gbm_device,
+            drm_fd,
+            renderer_formats,
+            color_formats,
+            cursor_size,
+            surfaces,
+            ..
+        } = gpu;
+        let surface = &mut surfaces[idx];
+        let reused_output = surface.output.clone();
+        let previous_mode = reused_output.current_mode();
 
-        let drm_surface = match gpu.drm_device.create_surface(crtc, drm_mode, &[connector]) {
-            Ok(surface) => surface,
-            Err(error) => {
-                tracing::error!(target: "beewm::tray", "modeset: create_surface failed: {}", error);
-                return;
-            }
-        };
-        let gbm_allocator = GbmAllocator::new(
-            gpu.gbm_device.clone(),
-            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
-        let gbm_exporter = GbmFramebufferExporter::new(gpu.gbm_device.clone(), None);
+        // Drop only the old *compositor*, not the whole `SurfaceData`: it holds
+        // the CRTC's primary-plane claim, which `create_surface` needs freed,
+        // while the entry itself stays in `surfaces` so a failure below can put
+        // the output back instead of deleting it from the render loop for the
+        // rest of the session (it would stay in `space`/`outputs`, permanently
+        // black with no way back short of a restart).
+        surface.compositor = None;
+        surface.can_render = false;
+        surface.pending_presentation_feedback = None;
 
         let output_mode = OutputMode {
             size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
@@ -1132,44 +1161,95 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
         );
         reused_output.set_preferred(output_mode);
 
-        let compositor = match DrmCompositor::new(
-            &reused_output,
-            drm_surface,
-            None,
-            gbm_allocator,
-            gbm_exporter,
-            gpu.color_formats,
-            gpu.renderer_formats.to_vec(),
-            gpu.cursor_size,
-            Some(gpu.gbm_device.clone()),
-        ) {
-            Ok(compositor) => compositor,
+        let built = (|| -> Result<DrmCompositor<_, _, _, _>, Box<dyn std::error::Error>> {
+            let drm_surface = drm_device.create_surface(crtc, drm_mode, &[connector])?;
+            let gbm_allocator = GbmAllocator::new(
+                gbm_device.clone(),
+                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+            );
+            let gbm_exporter = GbmFramebufferExporter::new(gbm_device.clone(), None);
+            Ok(DrmCompositor::new(
+                &reused_output,
+                drm_surface,
+                None,
+                gbm_allocator,
+                gbm_exporter,
+                *color_formats,
+                renderer_formats.to_vec(),
+                *cursor_size,
+                Some(gbm_device.clone()),
+            )?)
+        })();
+
+        match built {
+            Ok(compositor) => {
+                surface.compositor = Some(compositor);
+                surface.can_render = true;
+                surface.retry_after = None;
+                surface.consecutive_frame_failures = 0;
+                surface.frame_stats = FrameStats::new();
+                surface.present_stats = PresentStats::new();
+                tracing::info!(
+                    target: "beewm::tray",
+                    width = output_mode.size.w,
+                    height = output_mode.size.h,
+                    refresh_hz = output_mode.refresh as f64 / 1000.0,
+                    "applied live output mode",
+                );
+            }
             Err(error) => {
-                tracing::error!(target: "beewm::tray", "modeset: DrmCompositor::new failed: {}", error);
+                tracing::error!(
+                    target: "beewm::tray",
+                    %error,
+                    "modeset failed; restoring the previous mode",
+                );
+                // Put the output back the way it was. `rebuild_surface_compositor`
+                // re-resolves the configured mode from the connector, so the
+                // advertised state has to be reverted first for it to match.
+                if let Some(previous) = previous_mode {
+                    reused_output.change_current_state(
+                        Some(previous),
+                        Some(Transform::Normal),
+                        None,
+                        Some(position),
+                    );
+                    reused_output.set_preferred(previous);
+                }
+                match rebuild_surface_compositor(
+                    drm_device,
+                    gbm_device,
+                    drm_fd,
+                    renderer_formats,
+                    *color_formats,
+                    *cursor_size,
+                    surface,
+                    refresh_rate,
+                    &output_configs,
+                ) {
+                    Ok(()) => {
+                        surface.can_render = true;
+                        surface.retry_after = None;
+                        surface.consecutive_frame_failures = 0;
+                    }
+                    Err(error) => {
+                        // Both the new and the old mode failed. Leave the surface
+                        // in place on a retry backoff: `render_frame` skips a
+                        // surface with no compositor, and the resume/retry paths
+                        // keep trying to rebuild it.
+                        tracing::error!(
+                            target: "beewm::tray",
+                            %error,
+                            "could not restore the previous mode either; output is \
+                             dark until the next rebuild",
+                        );
+                        surface.retry_after = Some(Instant::now() + FRAME_FAILURE_RETRY_MAX);
+                    }
+                }
+                data.state.needs_render = true;
                 return;
             }
-        };
+        }
 
-        gpu.surfaces.push(SurfaceData {
-            connector,
-            crtc,
-            output: reused_output.clone(),
-            position,
-            compositor: Some(compositor),
-            can_render: true,
-            retry_after: None,
-            consecutive_frame_failures: 0,
-            pending_presentation_feedback: None,
-            frame_stats: FrameStats::new(),
-            present_stats: PresentStats::new(),
-        });
-        tracing::info!(
-            target: "beewm::tray",
-            width = output_mode.size.w,
-            height = output_mode.size.h,
-            refresh_hz = output_mode.refresh as f64 / 1000.0,
-            "applied live output mode",
-        );
         (reused_output, conn_info)
     };
 
@@ -1220,6 +1300,40 @@ fn render_frame(data: &mut UdevData) {
         // flag set so it renders once its vblank fires.
         state.needs_render = true;
     }
+}
+
+/// How long until the earliest frame-failure retry is due, when *no* surface
+/// can produce a frame before then.
+///
+/// `None` means some surface is renderable now or is waiting on a page flip —
+/// in both cases a real event (the DRM vblank source) wakes the loop, so the
+/// caller keeps its frame-cadence safety net.
+fn frame_retry_timeout(data: &UdevData) -> Option<Duration> {
+    let gpu = data.gpu.as_ref()?;
+    earliest_retry_delay(
+        gpu.surfaces.iter().map(|surface| surface.retry_after),
+        Instant::now(),
+    )
+}
+
+/// Pure core of [`frame_retry_timeout`]: the wait until the earliest deadline,
+/// but only when *every* surface is backing off. Any surface without a future
+/// deadline can produce a frame or is waiting on a page flip, and either way an
+/// event source wakes the loop — so there is nothing to time out for.
+fn earliest_retry_delay<I>(retry_deadlines: I, now: Instant) -> Option<Duration>
+where
+    I: IntoIterator<Item = Option<Instant>>,
+{
+    let mut earliest: Option<Instant> = None;
+    for deadline in retry_deadlines {
+        match deadline {
+            Some(deadline) if deadline > now => {
+                earliest = Some(earliest.map_or(deadline, |current| current.min(deadline)));
+            }
+            _ => return None,
+        }
+    }
+    earliest.map(|deadline| deadline.saturating_duration_since(now).min(IDLE_TIMEOUT))
 }
 
 fn retry_delay_for_frame_failure(failures: u32) -> Duration {
@@ -1323,15 +1437,11 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
     // True when an xdg-shell fullscreen or a fullscreen-sized X11 game covers
     // the output. Both should suppress top-layers so the game can be promoted
     // onto the primary plane by smithay's DrmCompositor.
-    let fullscreen_active = state.screen_owned_by_window();
+    let fullscreen_active = state.screen_owned_by_window(&surface.output);
     // Whether the screen-owning window is an XWayland (X11) surface — many
     // games run through XWayland, and `beewm::frame` surfaces this so the log
     // shows which path is being exercised.
-    let fullscreen_is_x11 = state
-        .active_fullscreen()
-        .and_then(|w| w.x11_surface())
-        .is_some()
-        || state.screen_owned_by_x11_window();
+    let fullscreen_is_x11 = state.screen_owned_by_x11_window(&surface.output);
 
     let border_elements = state.border_elements(&surface.output);
     // Cursor visibility is driven entirely by Wayland client/pointer state, not
@@ -1378,7 +1488,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
         Vec::new()
     };
 
-    let (overview_quads, overview_thumbnails) = overview_elements(state, renderer, &output);
+    let overview = overview_elements(state, renderer, &output);
 
     let count_windows = window_elements.len();
     let count_borders = border_elements.len();
@@ -1393,12 +1503,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
         elements.extend(lock_elements.into_iter().map(OutputRenderElement::from));
     } else {
         // The overview grid sits above everything else on screen.
-        elements.extend(
-            overview_thumbnails
-                .into_iter()
-                .map(OutputRenderElement::from),
-        );
-        elements.extend(overview_quads.into_iter().map(OutputRenderElement::from));
+        elements.extend(overview.into_ordered::<OutputRenderElement>());
         elements.extend(layers_above.into_iter().map(OutputRenderElement::from));
         elements.extend(border_elements.into_iter().map(OutputRenderElement::from));
         elements.extend(window_elements.into_iter().map(OutputRenderElement::from));
@@ -2386,4 +2491,61 @@ fn find_crtc_for_connector(
     }
 
     Err("No unused CRTC available for connector".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IDLE_TIMEOUT, earliest_retry_delay};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn no_surfaces_never_sets_a_retry_timeout() {
+        assert_eq!(earliest_retry_delay([], Instant::now()), None);
+    }
+
+    #[test]
+    fn a_renderable_surface_leaves_the_timeout_to_the_caller() {
+        let now = Instant::now();
+        // One surface is backing off, the other is waiting on its vblank: the
+        // DRM source will wake us, so no deadline-based sleep.
+        assert_eq!(
+            earliest_retry_delay([Some(now + Duration::from_millis(500)), None], now),
+            None
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_is_due_now_not_slept_through() {
+        let now = Instant::now();
+        assert_eq!(
+            earliest_retry_delay([Some(now - Duration::from_millis(1))], now),
+            None
+        );
+    }
+
+    #[test]
+    fn all_backing_off_sleeps_to_the_earliest_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            earliest_retry_delay(
+                [
+                    Some(now + Duration::from_millis(80)),
+                    Some(now + Duration::from_millis(40)),
+                ],
+                now,
+            ),
+            Some(Duration::from_millis(40)),
+        );
+    }
+
+    #[test]
+    fn a_long_backoff_still_wakes_at_the_idle_ceiling() {
+        // The loop body drives the screen-idle deadline and the degraded-resume
+        // retry, so a 2 s backoff must not sleep past the idle cadence.
+        let now = Instant::now();
+        assert_eq!(
+            earliest_retry_delay([Some(now + Duration::from_secs(2))], now),
+            Some(IDLE_TIMEOUT),
+        );
+    }
 }

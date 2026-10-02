@@ -64,7 +64,7 @@ pub(in crate::compositor) fn surface_under(
         return Some((lock.wl_surface().clone(), output_loc));
     }
 
-    let fullscreen_active = state.screen_owned_by_window();
+    let fullscreen_active = state.screen_owned_by_window(&output);
 
     // A `LayerMap` is arranged in *output-local* coordinates (origin at the
     // output's top-left), while `pos` is global `Space` coordinates. Hit tests
@@ -113,6 +113,18 @@ pub(in crate::compositor) fn surface_under(
 }
 
 fn surface_accepts_keyboard_focus(state: &Beewm, surface: &WlSurface) -> bool {
+    // While locked, a lock surface is the only thing the pointer can reach
+    // (see `surface_under`) and it has to be focusable: there is one lock
+    // surface per output and only the last one created holds focus, so
+    // clicking is the user's only way to move the password prompt to the
+    // monitor they are looking at. Nothing else accepts focus while locked.
+    if state.locked {
+        return state
+            .lock_surfaces
+            .values()
+            .any(|lock| lock.alive() && lock.wl_surface() == surface);
+    }
+
     if state.mapped_window_for_surface(surface).is_some() {
         return true;
     }

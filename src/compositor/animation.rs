@@ -343,6 +343,14 @@ impl AnimationManager {
         self.targets.insert(root.clone(), target);
     }
 
+    /// The rectangle `root` is meant to occupy when nothing is animating — the
+    /// tile the layout last assigned it. Unlike [`Self::active_rect`] this is
+    /// set for every tiled window all the time, so the renderer can use it to
+    /// tell a window that has outgrown its tile from one that fits.
+    pub fn resting_target(&self, root: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+        self.targets.get(root).copied()
+    }
+
     /// The visual rectangle for `root` right now, or `None` if it is not being
     /// animated (render/borders should use the real geometry then).
     pub fn active_rect(&self, root: &WlSurface, now: Instant) -> Option<VisualRect> {

@@ -1,4 +1,5 @@
 use smithay::desktop::Window;
+use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
@@ -58,6 +59,10 @@ impl Beewm {
             .filter(|root| !self.is_root_floating(root) && !self.is_root_fullscreen(root))
     }
 
+    /// Smallest tile worth creating, in logical pixels. Below this a window has
+    /// no room for content once its border and gap are taken out.
+    const MIN_TILE: (u32, u32) = (160, 120);
+
     pub(crate) fn tiled_windows_in_workspace(&self, workspace_idx: usize) -> Vec<Window> {
         self.workspaces[workspace_idx]
             .windows
@@ -99,8 +104,54 @@ impl Beewm {
             return;
         }
 
+        let split_target = self.usable_split_target(workspace_idx, split_target);
         self.layout_manager
-            .insert(workspace_idx, split_target, root);
+            .insert(workspace_idx, split_target.as_ref(), root);
+    }
+
+    /// Pick the tile a new window should split.
+    ///
+    /// Every insert halves its target, so repeatedly opening windows onto the
+    /// newest one shrinks it geometrically: the nth window gets 2⁻ⁿ of the
+    /// screen, and by around the twelfth it is a handful of pixels. When the
+    /// window the user is actually on can no longer be halved into two usable
+    /// tiles, the new window goes to the largest tile on the workspace instead.
+    /// That bounds the shrinking — the biggest tile is always at least the
+    /// average — at the cost of the new window not landing next to the focused
+    /// one, which only happens once the focused one is too small to share.
+    ///
+    /// Returns the caller's choice untouched whenever it still has room, which
+    /// is the overwhelmingly common case.
+    fn usable_split_target(
+        &self,
+        workspace_idx: usize,
+        requested: Option<&WlSurface>,
+    ) -> Option<WlSurface> {
+        let usable = self.tiling_usable_geometry()?;
+        let tiled_roots = self.tiled_window_roots_in_workspace(workspace_idx);
+        let geometries = self
+            .layout_manager
+            .geometries(workspace_idx, &usable, &tiled_roots);
+
+        let splittable = |geo: &crate::model::window::Geometry| {
+            // Halving happens on alternating axes, so a tile is only safe to
+            // split if *either* half would still be usable. Checking both axes
+            // keeps a tall-but-narrow tile from being ruled out.
+            (geo.width / 2 >= Self::MIN_TILE.0 && geo.height >= Self::MIN_TILE.1)
+                || (geo.height / 2 >= Self::MIN_TILE.1 && geo.width >= Self::MIN_TILE.0)
+        };
+
+        if let Some(requested) = requested
+            && geometries.get(requested).map(splittable).unwrap_or(false)
+        {
+            return Some(requested.clone());
+        }
+
+        geometries
+            .iter()
+            .max_by_key(|(_, geo)| geo.width as u64 * geo.height as u64)
+            .map(|(root, _)| root.clone())
+            .or_else(|| requested.cloned())
     }
 
     pub(crate) fn remove_tiled_window(&mut self, workspace_idx: usize, surface: &WlSurface) {
@@ -108,11 +159,27 @@ impl Beewm {
             .remove(workspace_idx, &root_surface(surface));
     }
 
-    pub(crate) fn rectangle_covers_output(&self, geo: Rectangle<i32, Logical>) -> bool {
-        let Some(output_geo) = self
-            .focused_output()
-            .and_then(|output| self.space.output_geometry(&output))
-        else {
+    /// The window fullscreened on the workspace `output` is currently showing.
+    ///
+    /// Per-output on purpose: every fullscreen decision below (layer
+    /// suppression, borders, scanout, pointer hit-testing) applies to one
+    /// output's frame, so asking about the *focused* output's workspace would
+    /// let a game on one monitor blank the panels on all the others.
+    pub(crate) fn fullscreen_on_output(&self, output: &Output) -> Option<&Window> {
+        let ws_idx = self
+            .outputs
+            .iter()
+            .find(|ctx| &ctx.output == output)
+            .map(|ctx| ctx.active_workspace)?;
+        self.workspaces[ws_idx].fullscreen.as_ref()
+    }
+
+    pub(crate) fn rectangle_covers_output(
+        &self,
+        output: &Output,
+        geo: Rectangle<i32, Logical>,
+    ) -> bool {
+        let Some(output_geo) = self.space.output_geometry(output) else {
             return false;
         };
 
@@ -122,27 +189,27 @@ impl Beewm {
             && geo.loc.y + geo.size.h >= output_geo.loc.y + output_geo.size.h
     }
 
-    pub(crate) fn x11_window_covers_output(&self, window: &Window) -> bool {
+    pub(crate) fn x11_window_covers_output(&self, output: &Output, window: &Window) -> bool {
         window.x11_surface().is_some()
             && self
                 .space
                 .element_geometry(window)
-                .map(|geo| self.rectangle_covers_output(geo))
+                .map(|geo| self.rectangle_covers_output(output, geo))
                 .unwrap_or(false)
     }
 
-    pub fn screen_owned_by_x11_window(&self) -> bool {
-        self.active_fullscreen()
+    pub fn screen_owned_by_x11_window(&self, output: &Output) -> bool {
+        self.fullscreen_on_output(output)
             .and_then(|window| window.x11_surface())
             .is_some()
             || self
                 .space
                 .elements()
-                .any(|window| self.x11_window_covers_output(window))
+                .any(|window| self.x11_window_covers_output(output, window))
     }
 
-    /// True when something is occupying the whole output and we should treat
-    /// the screen as fullscreen-owned for layer suppression / scanout
+    /// True when something is occupying the whole of `output` and we should
+    /// treat that screen as fullscreen-owned for layer suppression / scanout
     /// purposes. Covers the two paths that block layers:
     /// 1. An app fullscreened via xdg-shell or `_NET_WM_STATE_FULLSCREEN`
     ///    (the usual `fullscreen_window` field).
@@ -150,12 +217,12 @@ impl Beewm {
     ///    do this without keeping `_NET_WM_STATE_FULLSCREEN` set, so using
     ///    only `fullscreen_window` lets borders/layers reappear and prevents
     ///    direct scanout.
-    pub fn screen_owned_by_window(&self) -> bool {
-        if self.active_fullscreen().is_some() {
+    pub fn screen_owned_by_window(&self, output: &Output) -> bool {
+        if self.fullscreen_on_output(output).is_some() {
             return true;
         }
 
-        self.screen_owned_by_x11_window()
+        self.screen_owned_by_x11_window(output)
     }
 
     /// Re-raise every floating window of the active workspace so that they

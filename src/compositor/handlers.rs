@@ -588,7 +588,13 @@ impl XdgShellHandler for Beewm {
             for sibling in &self.workspaces[ws_idx].windows {
                 if *sibling != window {
                     self.space.unmap_elem(sibling);
+                    if let Some(root) = Self::window_root_surface(sibling) {
+                        self.animations.forget(&root);
+                    }
                 }
+            }
+            if let Some(root) = Self::window_root_surface(&window) {
+                self.animations.forget(&root);
             }
             self.space.map_element(window.clone(), output_geo.loc, true);
             if ws_idx == self.active_workspace() {
@@ -866,12 +872,15 @@ impl WlrLayerShellHandler for Beewm {
 
         self.needs_render = true;
 
-        // Restore keyboard focus to the active tiled window, if any.
+        // Restore keyboard focus to the active workspace's focused window, if
+        // any. Resolve through the window's root surface rather than
+        // `toplevel()`: that returns `None` for an X11/XWayland window, so
+        // closing a launcher over a Steam or Wine window used to hand back
+        // `None` and leave the session with no keyboard focus at all.
         let focus = self.workspaces[self.active_workspace()]
             .focused_idx
             .and_then(|i| self.workspaces[self.active_workspace()].windows.get(i))
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
+            .and_then(Self::window_root_surface);
         self.set_keyboard_focus(focus);
     }
 }
@@ -1036,17 +1045,54 @@ impl DrmSyncobjHandler for Beewm {
     }
 }
 
+impl Beewm {
+    /// Whether `surface` currently holds pointer or keyboard focus. Compared on
+    /// root surfaces so a subsurface of the focused window counts as focused.
+    fn surface_holds_focus(&self, surface: &WlSurface) -> bool {
+        let root = root_surface(surface);
+        let pointer_focus = self
+            .seat
+            .get_pointer()
+            .and_then(|pointer| pointer.current_focus())
+            .map(|focus| root_surface(&focus) == root)
+            .unwrap_or(false);
+        let keyboard_focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|target| target.wl_surface().map(|s| root_surface(&s)))
+            .map(|focus_root| focus_root == root)
+            .unwrap_or(false);
+        pointer_focus || keyboard_focus
+    }
+}
+
 impl PointerConstraintsHandler for Beewm {
     fn new_constraint(
         &mut self,
         surface: &WlSurface,
         pointer: &smithay::input::pointer::PointerHandle<Self>,
     ) {
-        // Activate the constraint immediately. Games (e.g. CS2) call lock_pointer and
-        // won't start processing WASD/mouse input until they receive the `locked` event.
-        // The Wayland spec requires activation when the surface has pointer focus; we
-        // satisfy this because games only call lock_pointer when they are focused.
-        // Deactivation happens in focus_changed when the surface loses keyboard focus.
+        // zwp_pointer_constraints_v1 ties activation to the surface having
+        // pointer focus. Enforce that: an unfocused background client that
+        // calls lock_pointer must not be able to pin the pointer and blank the
+        // cursor out from under whatever the user is actually using.
+        //
+        // Keyboard focus counts as well. Games (e.g. CS2) call lock_pointer and
+        // won't start processing WASD/mouse input until they receive the
+        // `locked` event, and a game that locks before the pointer has entered
+        // its surface still has to come up. A surface that is focused but not
+        // yet activated here is picked up by `activate_pointer_constraint_for`
+        // from `focus_changed`; deactivation happens there too.
+        if !self.surface_holds_focus(surface) {
+            tracing::debug!(
+                target: "beewm::input",
+                "ignoring pointer constraint from an unfocused surface; \
+                 it activates if and when the surface gains focus",
+            );
+            return;
+        }
+
         let mut locked_pointer = false;
         with_pointer_constraint(surface, pointer, |constraint| {
             if let Some(c) = constraint {

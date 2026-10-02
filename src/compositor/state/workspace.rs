@@ -67,7 +67,13 @@ impl Beewm {
             .iter()
             .map(|ctx| ctx.active_workspace)
             .collect();
-        match plan_workspace_switch(idx, self.workspaces.len(), self.focused_output, &active) {
+        let plan = plan_workspace_switch(idx, self.workspaces.len(), self.focused_output, &active);
+        if plan != WorkspaceSwitch::NoOp {
+            // A drag can't survive the window leaving the screen: the grab would
+            // keep re-mapping it into whatever workspace is now visible.
+            self.cancel_active_grab();
+        }
+        match plan {
             WorkspaceSwitch::NoOp => {}
             WorkspaceSwitch::FocusOutput(out) => self.focus_output_index(out),
             WorkspaceSwitch::ShowHere => self.show_workspace_on_focused_output(idx),
@@ -246,6 +252,11 @@ impl Beewm {
         if target >= self.workspaces.len() || target == self.active_workspace() {
             return;
         }
+
+        // Same as `switch_workspace`: the window is about to leave the visible
+        // workspace, so any grab on it has to end here rather than keep
+        // dragging it across the workspace boundary.
+        self.cancel_active_grab();
 
         // Exit fullscreen before moving the focused window. The focused window
         // is the active workspace's fullscreen window when one is set, so moving
