@@ -1425,6 +1425,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
         1.0,
         &state.animations,
         Instant::now(),
+        |root| state.is_root_floating(root),
     );
     if wedge_trace {
         tracing::warn!(

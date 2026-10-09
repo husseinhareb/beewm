@@ -76,7 +76,10 @@ use smithay::backend::renderer::{BufferType, buffer_type};
 use super::diagnostics::BufferKind;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use super::state::{Beewm, lookup_client_compositor_state, root_surface};
+use super::state::{
+    Beewm, FloatingWindowData, ONSCREEN_MARGIN, clamp_into_usable, lookup_client_compositor_state,
+    root_surface,
+};
 use super::state::popup::classify_toplevel_floating;
 
 /// Classify the buffer a surface just committed (for the `beewm::dmabuf` /
@@ -229,6 +232,17 @@ impl CompositorHandler for Beewm {
                 .map(|t| t.wl_surface() == surface)
                 .unwrap_or(false)
         }) {
+            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                .unwrap_or(false);
+            if !has_buffer {
+                // The client committed without an attached buffer (standard XDG shell initial
+                // handshake commit before configure is acknowledged and buffer is attached).
+                // Leave the window in pending_windows so it only maps once a real buffer is
+                // presented and all geometry, dialog roles, and min/max sizes are set.
+                self.pending_windows[pos].on_commit();
+                return;
+            }
+
             let window = self.pending_windows.remove(pos);
             let ws_idx = self.active_workspace();
             let split_target = self.focused_tiled_window_root(ws_idx);
@@ -245,6 +259,7 @@ impl CompositorHandler for Beewm {
                 .wl_surface()
                 .map(|s| root_surface(&s))
                 .unwrap_or_else(|| root_surface(surface));
+            self.mapped_with_buffer.insert(window_root.clone());
 
             // Classify *this* window on its own merits. A normal app that merely
             // has a dialog child is never floated here — only the child window's
@@ -392,13 +407,37 @@ impl CompositorHandler for Beewm {
             // milliseconds later, and re-focusing at that point would steal
             // focus from whatever the user clicked on in the meantime.
             let root = root_surface(surface);
-            if self.pending_float_centers.remove(&root)
-                && let Some((_, floating)) = self.centered_floating_data(&window)
-            {
-                self.floating_windows.insert(root, floating);
-                self.relayout();
-                self.space.raise_element(&window, true);
-                self.raise_floating_windows();
+            if self.pending_float_centers.remove(&root) {
+                if let Some((_, floating)) = self.centered_floating_data(&window) {
+                    self.animations.forget(&root);
+                    self.floating_windows.insert(root.clone(), floating);
+                    self.space
+                        .map_element(window.clone(), floating.position, false);
+                    self.relayout();
+                    self.space.raise_element(&window, true);
+                    self.raise_floating_windows();
+                }
+            } else if self.is_root_floating(&root) {
+                let geo_size = window.geometry().size;
+                if geo_size.w > 0
+                    && geo_size.h > 0
+                    && let Some(data) = self.floating_windows.get(&root).copied()
+                    && data.size != geo_size
+                {
+                    let output = self
+                        .output_for_window(&window)
+                        .or_else(|| self.focused_output());
+                    let mut new_pos = data.position;
+                    if let Some(output) = output
+                        && let Some(usable) = self.floating_usable_rect_for(&output)
+                    {
+                        new_pos = clamp_into_usable(new_pos, geo_size, usable, ONSCREEN_MARGIN);
+                    }
+                    let new_data = FloatingWindowData::new(new_pos, geo_size);
+                    self.floating_windows.insert(root.clone(), new_data);
+                    self.space.map_element(window.clone(), new_pos, false);
+                    self.raise_floating_windows();
+                }
             }
 
             self.needs_render = true;
@@ -494,7 +533,11 @@ impl XdgShellHandler for Beewm {
         // Send an initial tiled size up front so terminals can render their
         // first real frame at the target geometry instead of painting a blank
         // placeholder and immediately resizing on first commit.
-        let initial_size = if surface.parent().is_none() {
+        let is_dialog_intent = surface.parent().is_some()
+            || self
+                .pending_should_float
+                .contains(&root_surface(surface.wl_surface()));
+        let initial_size = if !is_dialog_intent {
             self.initial_toplevel_size(surface.wl_surface())
         } else {
             None

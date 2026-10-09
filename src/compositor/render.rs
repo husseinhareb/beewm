@@ -21,6 +21,7 @@ use smithay::desktop::space::{ConstrainBehavior, ConstrainReference, constrain_s
 use smithay::desktop::{Space, Window, layer_map_for_output};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
@@ -207,6 +208,7 @@ pub(crate) fn window_render_elements<R>(
     alpha: f32,
     animations: &AnimationManager,
     now: Instant,
+    is_root_floating: impl Fn(&WlSurface) -> bool,
 ) -> Vec<WindowElement<R>>
 where
     R: Renderer + ImportAll,
@@ -222,6 +224,7 @@ where
     // The compositor cannot make it obey, but it can refuse to draw it outside
     // the tile it was given. Detecting that is a bbox comparison per window;
     // only when one actually overflows do we leave the fast path below.
+    // Floating windows are not bound to a tiling slot and must never be clipped.
     let overflowing = |window: &Window| {
         if is_window_fullscreen(window) {
             return false;
@@ -229,6 +232,9 @@ where
         let Some(root) = Beewm::window_root_surface(window) else {
             return false;
         };
+        if is_root_floating(&root) {
+            return false;
+        }
         let Some(tile) = animations.resting_target(&root) else {
             return false;
         };

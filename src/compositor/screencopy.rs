@@ -394,6 +394,7 @@ where
         1.0,
         &state.animations,
         std::time::Instant::now(),
+        |root| state.is_root_floating(root),
     );
     let border_elements = state.border_elements(output);
     let cursor_elements = if overlay_cursor {

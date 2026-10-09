@@ -527,6 +527,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             1.0,
                             &data.state.animations,
                             Instant::now(),
+                            |root| data.state.is_root_floating(root),
                         );
                         let layers_above = layer_render_elements(
                             renderer,
