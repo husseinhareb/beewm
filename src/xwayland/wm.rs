@@ -384,16 +384,6 @@ impl Beewm {
 }
 
 fn should_map_x11_floating(surface: &X11Surface) -> bool {
-    // A client that explicitly publishes _NET_WM_WINDOW_TYPE_NORMAL is
-    // declaring "I am a regular tileable app window." Honour that even when
-    // other heuristics below might match — many X11 apps (Zed, editors,
-    // browsers) set a WM_NORMAL_HINTS max_size as a "no real max" sentinel
-    // (display dimensions, INT_MAX) which we must not interpret as a dialog
-    // signal.
-    if matches!(surface.window_type(), Some(WmWindowType::Normal)) {
-        return false;
-    }
-
     let by_type = matches!(
         surface.window_type(),
         Some(
@@ -418,17 +408,32 @@ fn should_map_x11_floating(surface: &X11Surface) -> bool {
         .map(|(min, max)| min == max && min.w > 0 && min.h > 0)
         .unwrap_or(false);
 
+    let dialog_title = crate::compositor::state::is_dialog_title(&surface.title());
+
+    // Strong dialog signals (transient_for child, dialog window type, strictly fixed size,
+    // or known dialog title like crash reports or confirmation prompts) MUST always float,
+    // even if the client's _NET_WM_WINDOW_TYPE includes Normal (e.g. Eclipse SWT / DBeaver,
+    // Qt dialogs).
+    if by_type || by_relation || is_fixed || dialog_title {
+        return true;
+    }
+
+    // A client that explicitly publishes _NET_WM_WINDOW_TYPE_NORMAL without any of the
+    // above dialog signals is declaring "I am a regular tileable app window." Honour that
+    // to prevent apps (editors, browsers) with large WM_NORMAL_HINTS max_size caps from floating.
+    if matches!(surface.window_type(), Some(WmWindowType::Normal)) {
+        return false;
+    }
+
     // Bounded max_size *that is plausibly a real cap*, not a "no real max"
     // sentinel. Shares `is_dialog_size_cap` with the Wayland path: catches
     // gnome-keyring (~400x250), polkit prompts (~400x300), file pickers
     // (~800x600) while excluding apps that publish display dimensions or
     // 32767 as their max.
-    let has_dialog_size_cap = surface
+    surface
         .max_size()
         .map(crate::compositor::state::is_dialog_size_cap)
-        .unwrap_or(false);
-
-    by_type || by_relation || is_fixed || has_dialog_size_cap
+        .unwrap_or(false)
 }
 
 impl XWaylandShellHandler for Beewm {
@@ -654,11 +659,27 @@ impl XwmHandler for Beewm {
                 .copied()
                 .map(|data| data.position)
                 .unwrap_or(geometry.loc);
+
+            let output = self
+                .output_for_window(&mapped)
+                .or_else(|| self.focused_output());
+            let mut final_pos = stored_pos;
+            if let Some(output) = output
+                && let Some(usable) = self.floating_usable_rect_for(&output)
+            {
+                final_pos = crate::compositor::state::clamp_into_usable(
+                    final_pos,
+                    geometry.size,
+                    usable,
+                    crate::compositor::state::ONSCREEN_MARGIN,
+                );
+            }
+
             self.floating_windows.insert(
                 root,
-                crate::compositor::types::FloatingWindowData::new(stored_pos, geometry.size),
+                crate::compositor::types::FloatingWindowData::new(final_pos, geometry.size),
             );
-            self.space.map_element(mapped, stored_pos, false);
+            self.space.map_element(mapped, final_pos, false);
             self.raise_floating_windows();
             self.needs_render = true;
         }

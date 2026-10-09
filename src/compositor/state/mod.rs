@@ -87,9 +87,10 @@ pub use self::decorations::{
     window_border_overlaps_layer,
 };
 pub use self::output::OutputCtx;
+pub(crate) use self::output::{ONSCREEN_MARGIN, clamp_into_usable};
 pub use self::popup::{
-    centered_dialog_position, constrain_popup_geometry, is_dialog_size_cap, is_fixed_size,
-    popup_constraint_target,
+    centered_dialog_position, constrain_popup_geometry, is_dialog_size_cap, is_dialog_title,
+    is_fixed_size, popup_constraint_target,
 };
 pub use self::workspace::{FloatToggleTransition, float_toggle_transition};
 

@@ -74,10 +74,55 @@ pub(crate) fn is_known_dialog_app_id(app_id: &str) -> bool {
         "xdg-desktop-portal-wlr",
         "io.github.bugaevc.wl-clipboard",
         "wl-clipboard",
+        "obs-crash-reporter",
+        "crash-reporter",
     ];
     KNOWN.iter().any(|known| app_id.eq_ignore_ascii_case(known))
         || app_id.starts_with("org.freedesktop.impl.portal.")
         || app_id.starts_with("xdg-desktop-portal-")
+}
+
+/// True when a window's title matches common patterns for confirmation dialogs,
+/// crash reporters, prompts, tips, file pickers, or alert boxes that float even
+/// when standalone (no parent window or modal protocol hint).
+pub fn is_dialog_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    lower.starts_with("are you sure")
+        || lower.starts_with("do you want to")
+        || lower.starts_with("confirm")
+        || lower.starts_with("confirmation")
+        || lower.contains("crash report")
+        || lower.contains("crash reporter")
+        || lower.starts_with("tip of the day")
+        || lower == "tip of the day"
+        || lower.starts_with("version update")
+        || lower.starts_with("update available")
+        || lower.starts_with("software update")
+        || lower.starts_with("revert changes")
+        || lower.starts_with("save changes")
+        || lower.starts_with("persist changes")
+        || lower.starts_with("exit ")
+        || lower.starts_with("quit ")
+        || lower.starts_with("open file")
+        || lower.starts_with("open folder")
+        || lower.starts_with("save file")
+        || lower.starts_with("save as")
+        || lower.starts_with("choose file")
+        || lower.starts_with("select folder")
+        || lower.starts_with("file upload")
+        || lower == "open file"
+        || lower == "save file"
+        || lower == "preferences"
+        || lower == "properties"
+        || lower.starts_with("properties of ")
+        || lower.starts_with("properties for ")
+        || lower == "find and replace"
+        || lower.starts_with("about ")
 }
 
 pub fn popup_constraint_target(
@@ -160,6 +205,7 @@ pub(crate) fn classify_toplevel_floating(window: &Window) -> ToplevelFloatClass 
             .as_deref()
             .map(is_known_dialog_app_id)
             .unwrap_or(false);
+        let dialog_title = title.as_deref().map(is_dialog_title).unwrap_or(false);
 
         // Order matters only for the diagnostic reason string; the OR below is
         // what actually decides. Strongest/most-specific signals first.
@@ -171,6 +217,8 @@ pub(crate) fn classify_toplevel_floating(window: &Window) -> ToplevelFloatClass 
             (true, "known-dialog-app-id")
         } else if is_fixed {
             (true, "fixed-size")
+        } else if dialog_title {
+            (true, "dialog-title")
         } else if has_size_cap {
             (true, "bounded-size-cap")
         } else {
@@ -358,7 +406,7 @@ impl Beewm {
 
 #[cfg(test)]
 mod tests {
-    use super::is_known_dialog_app_id;
+    use super::{is_dialog_title, is_known_dialog_app_id};
 
     #[test]
     fn portal_and_prompter_app_ids_are_recognized_as_dialogs() {
@@ -375,5 +423,24 @@ mod tests {
         assert!(!is_known_dialog_app_id("firefox"));
         assert!(!is_known_dialog_app_id("kitty"));
         assert!(!is_known_dialog_app_id("code"));
+    }
+
+    #[test]
+    fn dialog_titles_are_recognized() {
+        assert!(is_dialog_title("OBS Studio Crash Report"));
+        assert!(is_dialog_title("Version update"));
+        assert!(is_dialog_title("Tip of the day"));
+        assert!(is_dialog_title("Revert changes"));
+        assert!(is_dialog_title("Exit DBeaver"));
+        assert!(is_dialog_title("Persist changes"));
+        assert!(is_dialog_title(
+            "Are you sure you want to delete 'document(1).pdf'?"
+        ));
+        assert!(is_dialog_title("Open File"));
+        assert!(is_dialog_title("Preferences"));
+
+        assert!(!is_dialog_title("Mozilla Firefox"));
+        assert!(!is_dialog_title("Alacritty"));
+        assert!(!is_dialog_title("beewm - Visual Studio Code"));
     }
 }

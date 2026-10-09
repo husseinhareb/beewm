@@ -55,48 +55,55 @@ impl Beewm {
         let bbox_size = window.bbox().size;
         let geo_size = window.geometry().size;
 
-        // Pick the most authoritative size hint we have. The stale tile-size
-        // committed before we knew this window was floating tends to match the
-        // full usable area on one or both axes — treating bbox/geo == usable as
-        // "unreliable" prevents centring a tile-sized rectangle (which collapses
-        // to a corner placement). A max_size that meets or exceeds usable is a
-        // "no real max" sentinel (32767, display dimensions) and equally
-        // unreliable; fall through to bbox/geo just like for an unset cap.
-        let pick_axis = |max: i32, bbox: i32, geo: i32, fallback: i32, usable: i32| -> i32 {
-            let candidate = if max > 0 && max < usable {
-                max
-            } else if bbox > 0 && bbox < usable {
-                bbox
-            } else if geo > 0 && geo < usable {
-                geo
-            } else {
-                fallback
+        // Pick the most authoritative size hint we have. Precedence:
+        // 1. Canonical window geometry (xdg_surface.set_window_geometry / X11 geometry)
+        //    if non-zero and within usable bounds.
+        // 2. Bounding box of the surface tree (includes subsurfaces).
+        // 3. Exact fixed-size constraint if min == max.
+        // 4. Minimum declared size if positive.
+        // 5. Fallback default dialog size (1/3 of screen, at least 320x200).
+        //
+        // Note: max_size is an upper bound constraint, NOT the target requested size.
+        // It must clamp the candidate rather than define it, otherwise resizable dialogs
+        // with large caps bloat up to their maximum bounds.
+        let pick_axis =
+            |min: i32, max: i32, bbox: i32, geo: i32, fallback: i32, usable: i32| -> i32 {
+                let mut candidate = if geo > 0 && geo < usable {
+                    geo
+                } else if bbox > 0 && bbox < usable {
+                    bbox
+                } else if min > 0 && min < usable {
+                    min
+                } else {
+                    fallback
+                };
+                if max > 0 {
+                    candidate = candidate.min(max);
+                }
+                if min > 0 {
+                    candidate = candidate.max(min);
+                }
+                candidate.min(usable).max(1)
             };
-            candidate.min(usable).max(1)
-        };
 
         let default_w = ((usable_size.w / 3).max(320)).min(usable_size.w.max(1));
         let default_h = ((usable_size.h / 3).max(200)).min(usable_size.h.max(1));
-        let mut win_w = pick_axis(
+        let win_w = pick_axis(
+            min_size.w,
             max_size.w,
             bbox_size.w,
             geo_size.w,
             default_w,
             usable_size.w,
         );
-        let mut win_h = pick_axis(
+        let win_h = pick_axis(
+            min_size.h,
             max_size.h,
             bbox_size.h,
             geo_size.h,
             default_h,
             usable_size.h,
         );
-        if min_size.w > 0 {
-            win_w = win_w.max(min_size.w).min(usable_size.w.max(1));
-        }
-        if min_size.h > 0 {
-            win_h = win_h.max(min_size.h).min(usable_size.h.max(1));
-        }
 
         // Prefer centring over the parent window (transient/modal dialogs sit on
         // top of the window they belong to, like Hyprland/GNOME/KDE); fall back
@@ -122,13 +129,24 @@ impl Beewm {
 
     /// Geometry of the window this dialog is a child of, if the parent is
     /// currently mapped. Used to centre transient/modal dialogs over their
-    /// parent. Only Wayland `xdg_toplevel.set_parent` relationships are resolved
-    /// here; cross-client prompters (keyring/polkit) have no parent and fall
-    /// back to output-centred placement.
+    /// parent. Wayland `xdg_toplevel.set_parent` and X11 `WM_TRANSIENT_FOR`
+    /// relationships are resolved here; cross-client prompters (keyring/polkit)
+    /// have no parent and fall back to output-centred placement.
     fn parent_window_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
-        let parent = self.toplevel_parent_surface(window)?;
-        let parent_window = self.mapped_window_for_surface(&parent)?;
-        self.space.element_geometry(&parent_window)
+        if let Some(parent) = self.toplevel_parent_surface(window) {
+            let parent_window = self.mapped_window_for_surface(&parent)?;
+            return self.space.element_geometry(&parent_window);
+        }
+        if let Some(x11) = window.x11_surface()
+            && let Some(parent_id) = x11.is_transient_for()
+        {
+            for mapped in self.space.elements() {
+                if mapped.x11_surface().map(|s| s.window_id()) == Some(parent_id) {
+                    return self.space.element_geometry(mapped);
+                }
+            }
+        }
+        None
     }
 
     /// The `xdg_toplevel.set_parent` parent surface of this window, if any.
