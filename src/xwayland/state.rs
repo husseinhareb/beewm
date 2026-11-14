@@ -57,6 +57,10 @@ impl Beewm {
         }
         spawn_startup_commands(&self.config.autostart_commands, &self.child_env);
         self.startup_commands_spawned = true;
+        for message in std::mem::take(&mut self.pending_config_notices) {
+            tracing::error!("config: {}", message);
+            crate::compositor::commands::spawn_config_notification(&message, &self.child_env);
+        }
     }
 
     pub(crate) fn queue_x11_window(&mut self, surface: X11Surface, kind: PendingX11Kind) {

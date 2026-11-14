@@ -77,6 +77,30 @@ pub fn plan_output_removal(
     }
 }
 
+/// Place outputs in the global layout. `outputs` is each output's configured
+/// position (if any) and width, in registry order. Outputs with a configured
+/// position go exactly there; the rest pack left-to-right at y = 0, starting
+/// right of every explicitly placed output. Pure so it can be unit-tested.
+pub fn pack_output_positions(outputs: &[(Option<(i32, i32)>, i32)]) -> Vec<Point<i32, Logical>> {
+    let mut auto_x = outputs
+        .iter()
+        .filter_map(|(pos, width)| pos.map(|(x, _)| x + width.max(&0)))
+        .max()
+        .unwrap_or(0)
+        .max(0);
+    outputs
+        .iter()
+        .map(|(pos, width)| match pos {
+            Some((x, y)) => Point::from((*x, *y)),
+            None => {
+                let position = Point::from((auto_x, 0));
+                auto_x += width.max(&0);
+                position
+            }
+        })
+        .collect()
+}
+
 /// Clamp a window's top-left so at least `margin` px stays inside `usable`.
 pub(crate) fn clamp_into_usable(
     pos: Point<i32, Logical>,
@@ -298,19 +322,34 @@ impl Beewm {
     /// Repack all outputs left-to-right in the global Space coordinate space and
     /// keep each `OutputCtx.position` in sync. Called after add/remove/mode-change.
     pub(crate) fn recompute_output_positions(&mut self) {
-        let mut x = 0;
-        for idx in 0..self.outputs.len() {
+        let layout: Vec<(Option<(i32, i32)>, i32)> = self
+            .outputs
+            .iter()
+            .map(|ctx| {
+                let name = ctx.output.name();
+                let configured = self
+                    .config
+                    .outputs
+                    .iter()
+                    .find(|cfg| cfg.name == name)
+                    .and_then(|cfg| cfg.position);
+                let width = self
+                    .space
+                    .output_geometry(&ctx.output)
+                    .map(|geo| geo.size.w)
+                    .unwrap_or(0);
+                (configured, width)
+            })
+            .collect();
+        let positions = pack_output_positions(&layout);
+        for (idx, position) in positions.into_iter().enumerate() {
             let output = self.outputs[idx].output.clone();
-            let width = self
-                .space
-                .output_geometry(&output)
-                .map(|geo| geo.size.w)
-                .unwrap_or(0);
-            let position = Point::from((x, 0));
             self.outputs[idx].position = position;
             self.space.map_output(&output, position);
-            x += width.max(0);
+            // Keep wl_output / xdg-output's advertised location in sync.
+            output.change_current_state(None, None, None, Some(position));
         }
+        refresh_output_heads(self);
     }
 
     /// Pull every floating window back so a grabbable strip stays inside its
@@ -360,7 +399,25 @@ impl Beewm {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputRemovalPlan, pick_initial_workspace, plan_output_removal};
+    use super::{
+        OutputRemovalPlan, pack_output_positions, pick_initial_workspace, plan_output_removal,
+    };
+    use smithay::utils::Point;
+
+    #[test]
+    fn unconfigured_outputs_pack_left_to_right() {
+        let positions = pack_output_positions(&[(None, 1920), (None, 2560)]);
+        assert_eq!(positions, vec![Point::from((0, 0)), Point::from((1920, 0))]);
+    }
+
+    #[test]
+    fn configured_positions_are_honored_and_auto_outputs_go_right_of_them() {
+        let positions = pack_output_positions(&[(None, 1920), (Some((0, 0)), 2560)]);
+        assert_eq!(positions, vec![Point::from((2560, 0)), Point::from((0, 0))]);
+
+        let stacked = pack_output_positions(&[(Some((0, 0)), 2560), (Some((320, 1440)), 1920)]);
+        assert_eq!(stacked, vec![Point::from((0, 0)), Point::from((320, 1440))]);
+    }
 
     #[test]
     fn first_output_takes_workspace_zero() {

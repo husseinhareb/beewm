@@ -307,6 +307,10 @@ impl Beewm {
             return;
         };
 
+        // Best effort: Xwayland may already have destroyed the wl_surface, in
+        // which case there is nothing left to snapshot and no ghost is drawn.
+        let closing = self.workspaces[workspace_idx].windows[window_idx].clone();
+        self.begin_close_animation(&closing);
         let window = self.workspaces[workspace_idx]
             .remove_window(window_idx)
             .expect("x11 window index should be valid");

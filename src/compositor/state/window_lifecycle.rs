@@ -2,7 +2,7 @@ use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{IsAlive, Logical, Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData};
 
@@ -212,6 +212,49 @@ impl Beewm {
         self.space.element_geometry(window)
     }
 
+    /// Snapshot a tiled window that is about to leave the layout and start its
+    /// close animation. Call it while the window is still mapped and its
+    /// surfaces still hold their buffers (before a null-buffer commit is
+    /// processed). Does nothing for floating or fullscreen windows, windows
+    /// not on screen, or when close animations are off.
+    pub(crate) fn begin_close_animation(&mut self, window: &Window) {
+        let Some(root) = Self::window_root_surface(window) else {
+            return;
+        };
+        if !root.alive() || !self.animations.wants_close(&root) {
+            return;
+        }
+        let Some(context) = self.render_context.clone() else {
+            return;
+        };
+        // Same scope as the open animation: tiled windows the layout placed.
+        if self.animations.resting_target(&root).is_none()
+            || self.is_root_floating(&root)
+            || crate::compositor::render::is_window_fullscreen(window)
+        {
+            return;
+        }
+        if self.space.element_geometry(window).is_none() {
+            return;
+        }
+        if self.animations.disable_for_fullscreen()
+            && self
+                .output_for_window(window)
+                .is_some_and(|output| self.screen_owned_by_window(&output))
+        {
+            return;
+        }
+        let Some(from) = self.visual_geometry(window) else {
+            return;
+        };
+        let origin = Point::from((0, 0)) - window.geometry().loc;
+        let layers = crate::compositor::animation::snapshot_surface_tree(&root, &context, origin);
+        let app_id = Self::window_app_id(window);
+        self.animations
+            .start_close(&root, from, layers, std::time::Instant::now(), &app_id);
+        self.needs_render = true;
+    }
+
     /// Advance all window animations by wall-clock time. Returns `true` while
     /// any animation is still active, so the backend keeps scheduling frames at
     /// the output refresh rate; once everything settles it returns `false` and
@@ -309,6 +352,11 @@ impl Beewm {
             .iter()
             .position(|w| Self::window_root_surface(w).as_ref() == Some(&root))
             .expect("window presence checked above");
+        // Snapshot before anything is torn down. On the destroy path the
+        // surfaces still hold their buffers here; the null-buffer unmap path
+        // already captured its snapshot in `commit`, so this is a no-op then.
+        let closing = self.workspaces[ws_idx].windows[pos].clone();
+        self.begin_close_animation(&closing);
         let window = self.workspaces[ws_idx].remove_window(pos).unwrap();
 
         // Remember the dialog's parent so closing/unmapping it returns focus to
@@ -331,11 +379,10 @@ impl Beewm {
 
         self.untrack_window_for_surface(&root);
         self.mapped_with_buffer.remove(&root);
-        // Drop any in-flight animation/target for this window. A true closing
-        // shrink animation is not implemented (see `compositor::animation`):
-        // it requires a GPU snapshot that outlives the destroyed client buffer.
-        // The surviving windows still animate into the freed space via the
-        // GeometryChange path triggered by the relayout below.
+        // Drop any in-flight animation/target for this window. Its close
+        // animation (if any) runs on the snapshot taken above, which `forget`
+        // leaves alone; the surviving windows animate into the freed space via
+        // the GeometryChange path triggered by the relayout below.
         self.animations.forget(&root);
 
         // Clean up fullscreen state if this was the workspace's fullscreen window.

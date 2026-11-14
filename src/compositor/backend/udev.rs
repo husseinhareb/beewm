@@ -192,6 +192,12 @@ struct UdevData {
     /// The VT beewm runs on, read once at startup. Used to re-assert the VT on a
     /// stuck resume (NVIDIA's resume `chvt`-back doesn't reliably reactivate us).
     session_vt: Option<i32>,
+    /// Connected touchpads, so a config reload can re-apply `tap_to_click` /
+    /// `natural_scroll` to them (libinput settings are per device).
+    touchpads: Vec<LibinputDevice>,
+    /// A config reload changed output modes while DRM was inactive (VT switched
+    /// away); apply them once the session is reactivated.
+    output_reapply_pending: bool,
     /// Owned so we can call flush_clients() anywhere in the main loop.
     display: Display<Beewm>,
 }
@@ -297,6 +303,8 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         resume_retry_at: None,
         // Read while we are the foreground VT, so this is our own VT number.
         session_vt: current_vt(),
+        output_reapply_pending: false,
+        touchpads: Vec::new(),
         display,
     };
 
@@ -470,7 +478,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     data.state.install_tray_action_sender(tray_tx);
 
     // Watch the config file for changes and reload automatically on save.
-    match config_watcher::make_config_watch_fd(&Config::config_path()) {
+    match config_watcher::make_config_watch_fd(&[&Config::config_path(), &Config::state_path()]) {
         Ok((watch_fd, config_filename)) => {
             event_loop
                 .handle()
@@ -537,20 +545,11 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Tap-to-click is a libinput-specific feature; configure it as
-                // devices appear (e.g. touchpad at startup or on hotplug).
+                // devices appear (e.g. touchpad at startup or on hotplug), and
+                // remember the touchpad so a config reload can reconfigure it.
                 let is_touchpad = device.config_tap_finger_count() > 0;
                 if is_touchpad {
-                    // Tap-to-click
-                    let tap = data.state.config.tap_to_click;
-                    let r = device.config_tap_set_enabled(tap);
-                    tracing::info!(
-                        "libinput: tap-to-click {} on '{}' ({:?})",
-                        if tap { "enabled" } else { "disabled" },
-                        device.name(),
-                        r,
-                    );
-
-                    // Two-finger scroll — enable it when the device supports it
+                    // Two-finger scroll: enable it when the device supports it.
                     let supported = device.config_scroll_methods();
                     if supported.contains(&ScrollMethod::TwoFinger) {
                         let r = device.config_scroll_set_method(ScrollMethod::TwoFinger);
@@ -560,24 +559,15 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             r,
                         );
                     }
-
-                    // Natural (reversed) scroll direction
-                    if device.config_scroll_has_natural_scroll() {
-                        let natural = data.state.config.natural_scroll;
-                        let r = device.config_scroll_set_natural_scroll_enabled(natural);
-                        tracing::info!(
-                            "libinput: natural scroll {} on '{}' ({:?})",
-                            if natural { "enabled" } else { "disabled" },
-                            device.name(),
-                            r,
-                        );
-                    }
+                    apply_touchpad_config(&mut device, &data.state.config);
+                    data.touchpads.push(device);
                 }
             }
             InputEvent::DeviceRemoved { device } => {
                 if leds_enabled && device.has_capability(DeviceCapability::Keyboard) {
                     keyboards.remove_device(&device);
                 }
+                data.touchpads.retain(|known| known != &device);
             }
             event => crate::compositor::input::handle_input(&mut data.state, event),
         })?;
@@ -857,6 +847,9 @@ fn handle_resume(data: &mut UdevData, source: ResumeSource) {
         if crate::compositor::runtime_flags::flags().multi_output_enabled {
             rescan_connectors(data);
         }
+        if std::mem::take(&mut data.output_reapply_pending) {
+            reapply_output_config(data);
+        }
         data.power_state = PowerState::Awake;
         data.resume_retry_at = None;
         tracing::info!(target: "beewm::power", "resume completed");
@@ -1044,7 +1037,39 @@ fn process_backend_requests(data: &mut UdevData) {
             BackendRequest::SetOutputMode { output, mode } => {
                 apply_output_mode(data, &output, mode);
             }
+            BackendRequest::ReapplyOutputConfig => {
+                reapply_output_config(data);
+            }
+            BackendRequest::ReapplyInputConfig => {
+                for device in data.touchpads.iter_mut() {
+                    apply_touchpad_config(device, &data.state.config);
+                }
+            }
         }
+    }
+}
+
+/// Apply the config's per-touchpad libinput settings (tap-to-click, natural
+/// scroll) to `device`. Used when a touchpad appears and on config reload.
+fn apply_touchpad_config(device: &mut LibinputDevice, config: &Config) {
+    let tap = config.tap_to_click;
+    let r = device.config_tap_set_enabled(tap);
+    tracing::info!(
+        "libinput: tap-to-click {} on '{}' ({:?})",
+        if tap { "enabled" } else { "disabled" },
+        device.name(),
+        r,
+    );
+
+    if device.config_scroll_has_natural_scroll() {
+        let natural = config.natural_scroll;
+        let r = device.config_scroll_set_natural_scroll_enabled(natural);
+        tracing::info!(
+            "libinput: natural scroll {} on '{}' ({:?})",
+            if natural { "enabled" } else { "disabled" },
+            device.name(),
+            r,
+        );
     }
 }
 
@@ -1075,46 +1100,12 @@ fn output_modes_for(conn_info: &connector::Info, output: &Output) -> OutputModes
     OutputModes { available, current }
 }
 
-/// Apply a live resolution/refresh change to `output` by rebuilding its DRM
-/// surface with the requested mode (reusing the existing `Output` so workspaces
-/// and position are preserved). Gated on `BEEWM_LIVE_MODESET`; the runtime
-/// modeset path is not yet hardware-validated.
+/// Apply a tray-chosen resolution/refresh to `output` and, on success,
+/// persist it to `state.conf` so it survives a restart.
 fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec) {
-    if !crate::compositor::runtime_flags::flags().live_modeset_enabled {
-        tracing::warn!(
-            target: "beewm::tray",
-            "live modeset is gated off; set BEEWM_LIVE_MODESET=1 to change resolution/refresh \
-             from the tray (the runtime modeset path is not yet hardware-validated)",
-        );
-        return;
-    }
-
-    // Read before borrowing `gpu` (both live on `data`); needed to restore the
-    // previous mode if the new one fails to come up.
-    let refresh_rate = data.state.config.refresh_rate;
-    let output_configs = data.state.config.outputs.clone();
-
-    // All DRM work happens here; we return the data the compositor side needs.
-    let rebuilt = {
-        let Some(gpu) = data.gpu.as_mut() else {
-            return;
-        };
-        let Some(idx) = gpu.surfaces.iter().position(|s| &s.output == output) else {
-            tracing::warn!(target: "beewm::tray", "modeset: no surface for the focused output");
-            return;
-        };
-        let connector = gpu.surfaces[idx].connector;
-        let crtc = gpu.surfaces[idx].crtc;
-        let position = gpu.surfaces[idx].position;
-
-        let conn_info = match gpu.drm_fd.get_connector(connector, false) {
-            Ok(info) => info,
-            Err(error) => {
-                tracing::warn!(target: "beewm::tray", "modeset: get_connector failed: {}", error);
-                return;
-            }
-        };
-        let Some(drm_mode) = find_mode_for_spec(&conn_info, spec) else {
+    let applied = modeset_output(data, output, |conn_info| {
+        let mode = find_mode_for_spec(conn_info, spec);
+        if mode.is_none() {
             tracing::warn!(
                 target: "beewm::tray",
                 "modeset: {}x{}{} not available on this output",
@@ -1122,8 +1113,96 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
                 spec.height,
                 spec.refresh.map(|hz| format!("@{hz}")).unwrap_or_default(),
             );
-            return;
+        }
+        mode
+    });
+    if let Some(mode) = applied {
+        data.state
+            .record_runtime_output_mode(output.name().to_string(), mode);
+    }
+}
+
+/// Config hot-reload: re-resolve every driven output's mode from the current
+/// config (`output <name> mode`, else `refresh_rate`, else preferred) exactly as
+/// startup would, and live-modeset the outputs whose mode changed. Outputs
+/// already in the right mode are left untouched (no flicker).
+fn reapply_output_config(data: &mut UdevData) {
+    let Some(gpu) = data.gpu.as_ref() else {
+        return;
+    };
+    if !gpu.drm_device.is_active() {
+        // VT switched away: no KMS access until the session is reactivated.
+        tracing::info!(
+            target: "beewm::tray",
+            "DRM inactive; output mode changes apply on the next activation",
+        );
+        data.output_reapply_pending = true;
+        return;
+    }
+    // `output <name> enable|disable` edits: reconcile the surface set first so
+    // a newly disabled display goes dark and a newly enabled one comes up.
+    if crate::compositor::runtime_flags::flags().multi_output_enabled {
+        rescan_connectors(data);
+    }
+    let Some(gpu) = data.gpu.as_ref() else {
+        return;
+    };
+    let outputs: Vec<Output> = gpu.surfaces.iter().map(|s| s.output.clone()).collect();
+    let refresh_rate = data.state.config.refresh_rate;
+    let output_configs = data.state.config.outputs.clone();
+    for output in outputs {
+        let cfg = config_for_output(&output_configs, &output.name()).cloned();
+        modeset_output(data, &output, |conn_info| {
+            resolve_connector_mode(conn_info, cfg.as_ref(), refresh_rate)
+        });
+    }
+}
+
+/// Whether `output` is already being driven with `mode`.
+fn output_has_mode(output: &Output, mode: &DrmMode) -> bool {
+    output.current_mode().is_some_and(|current| {
+        current.size.w == mode.size().0 as i32
+            && current.size.h == mode.size().1 as i32
+            && current.refresh == (mode.vrefresh() * 1000) as i32
+    })
+}
+
+/// Live-modeset `output` to the mode `pick` chooses from its connector, by
+/// rebuilding its DRM surface (reusing the existing `Output` so workspaces and
+/// position are preserved). Returns the applied mode, or `None` when nothing
+/// changed: no mode picked, already in that mode, or the modeset failed (in
+/// which case the previous mode is restored).
+fn modeset_output(
+    data: &mut UdevData,
+    output: &Output,
+    pick: impl FnOnce(&connector::Info) -> Option<DrmMode>,
+) -> Option<OutputModeSpec> {
+    // Read before borrowing `gpu` (both live on `data`); needed to restore the
+    // previous mode if the new one fails to come up.
+    let refresh_rate = data.state.config.refresh_rate;
+    let output_configs = data.state.config.outputs.clone();
+
+    // All DRM work happens here; we return the data the compositor side needs.
+    let rebuilt = {
+        let gpu = data.gpu.as_mut()?;
+        let Some(idx) = gpu.surfaces.iter().position(|s| &s.output == output) else {
+            tracing::warn!(target: "beewm::tray", "modeset: no surface for {}", output.name());
+            return None;
         };
+        let connector = gpu.surfaces[idx].connector;
+        let crtc = gpu.surfaces[idx].crtc;
+
+        let conn_info = match gpu.drm_fd.get_connector(connector, false) {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(target: "beewm::tray", "modeset: get_connector failed: {}", error);
+                return None;
+            }
+        };
+        let drm_mode = pick(&conn_info)?;
+        if output_has_mode(&gpu.surfaces[idx].output, &drm_mode) {
+            return None;
+        }
 
         let GpuData {
             drm_device,
@@ -1138,6 +1217,10 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
         let surface = &mut surfaces[idx];
         let reused_output = surface.output.clone();
         let previous_mode = reused_output.current_mode();
+        // The exact DRM mode being replaced, so a failed modeset can go back to
+        // it. Re-resolving from config is no good here: on a config reload the
+        // config already names the mode that just failed.
+        let previous_drm_mode = surface.compositor.as_ref().map(|c| c.current_mode());
 
         // Drop only the old *compositor*, not the whole `SurfaceData`: it holds
         // the CRTC's primary-plane claim, which `create_surface` needs freed,
@@ -1153,16 +1236,11 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
             size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
             refresh: (drm_mode.vrefresh() * 1000) as i32,
         };
-        reused_output.change_current_state(
-            Some(output_mode),
-            Some(Transform::Normal),
-            None,
-            Some(position),
-        );
+        reused_output.change_current_state(Some(output_mode), Some(Transform::Normal), None, None);
         reused_output.set_preferred(output_mode);
 
-        let built = (|| -> Result<DrmCompositor<_, _, _, _>, Box<dyn std::error::Error>> {
-            let drm_surface = drm_device.create_surface(crtc, drm_mode, &[connector])?;
+        let mut build = |mode: DrmMode| -> Result<DrmCompositorImpl, Box<dyn std::error::Error>> {
+            let drm_surface = drm_device.create_surface(crtc, mode, &[connector])?;
             let gbm_allocator = GbmAllocator::new(
                 gbm_device.clone(),
                 GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
@@ -1179,9 +1257,9 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
                 *cursor_size,
                 Some(gbm_device.clone()),
             )?)
-        })();
+        };
 
-        match built {
+        match build(drm_mode) {
             Ok(compositor) => {
                 surface.compositor = Some(compositor);
                 surface.can_render = true;
@@ -1194,6 +1272,7 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
                     width = output_mode.size.w,
                     height = output_mode.size.h,
                     refresh_hz = output_mode.refresh as f64 / 1000.0,
+                    output = %reused_output.name(),
                     "applied live output mode",
                 );
             }
@@ -1203,29 +1282,35 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
                     %error,
                     "modeset failed; restoring the previous mode",
                 );
-                // Put the output back the way it was. `rebuild_surface_compositor`
-                // re-resolves the configured mode from the connector, so the
-                // advertised state has to be reverted first for it to match.
+                // Put the output back the way it was: advertised state first,
+                // then the exact previous DRM mode (falling back to whatever the
+                // config resolves to if the old mode is unknown).
                 if let Some(previous) = previous_mode {
                     reused_output.change_current_state(
                         Some(previous),
                         Some(Transform::Normal),
                         None,
-                        Some(position),
+                        None,
                     );
                     reused_output.set_preferred(previous);
                 }
-                match rebuild_surface_compositor(
-                    drm_device,
-                    gbm_device,
-                    drm_fd,
-                    renderer_formats,
-                    *color_formats,
-                    *cursor_size,
-                    surface,
-                    refresh_rate,
-                    &output_configs,
-                ) {
+                let restored = match previous_drm_mode {
+                    Some(previous) => build(previous).map(|compositor| {
+                        surface.compositor = Some(compositor);
+                    }),
+                    None => rebuild_surface_compositor(
+                        drm_device,
+                        gbm_device,
+                        drm_fd,
+                        renderer_formats,
+                        *color_formats,
+                        *cursor_size,
+                        surface,
+                        refresh_rate,
+                        &output_configs,
+                    ),
+                };
+                match restored {
                     Ok(()) => {
                         surface.can_render = true;
                         surface.retry_after = None;
@@ -1246,7 +1331,7 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
                     }
                 }
                 data.state.needs_render = true;
-                return;
+                return None;
             }
         }
 
@@ -1256,14 +1341,11 @@ fn apply_output_mode(data: &mut UdevData, output: &Output, spec: OutputModeSpec)
     let (output, conn_info) = rebuilt;
     let modes = output_modes_for(&conn_info, &output);
     let applied_mode = modes.current;
-    let output_name = output.name().to_string();
     data.state.set_output_modes(output, modes);
-    if let Some(mode) = applied_mode {
-        data.state.record_runtime_output_mode(output_name, mode);
-    }
     data.state.needs_render = true;
     // Reflow tiling/floats against the output's new size.
     data.state.handle_output_geometry_changed();
+    applied_mode
 }
 
 /// Render every renderable surface (each connected output) and queue its frame.
@@ -1418,6 +1500,7 @@ fn render_one_surface(state: &mut Beewm, renderer: &mut GlesRenderer, surface: &
             "render_one_surface: begin (building window elements)",
         );
     }
+    state.render_context = Some(smithay::backend::renderer::Renderer::context_id(renderer));
     let window_elements = window_render_elements(
         renderer,
         &state.space,
@@ -2266,6 +2349,50 @@ fn rescan_connectors(data: &mut UdevData) {
         data.state.remove_output(&output);
     }
 
+    // ── Tear down surfaces the config now disables (`output <name> disable`) ─
+    // Still connected, so blank the CRTC before dropping the surface. Never
+    // disable every display: with no enabled connector left, keep what is lit.
+    let disabled_names = disabled_output_names(&data.state.config.outputs);
+    let any_enabled_connected = data.gpu.as_ref().is_some_and(|gpu| {
+        connected.iter().any(|conn| {
+            gpu.drm_fd
+                .get_connector(*conn, false)
+                .map(|info| !disabled_names.contains(&connector_name(&info)))
+                .unwrap_or(false)
+        })
+    });
+    let to_disable: Vec<Output> = data
+        .gpu
+        .as_ref()
+        .map(|gpu| {
+            gpu.surfaces
+                .iter()
+                .filter(|surface| disabled_names.contains(&surface.output.name()))
+                .map(|surface| surface.output.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !to_disable.is_empty() && !any_enabled_connected {
+        tracing::warn!("Config disables every connected output; keeping current outputs lit");
+    } else {
+        for output in to_disable {
+            tracing::info!("Output {} disabled by config; removing", output.name());
+            if let Some(gpu) = data.gpu.as_mut() {
+                if let Some(surface) = gpu.surfaces.iter_mut().find(|s| s.output == output)
+                    && let Some(Err(err)) = surface.compositor.as_mut().map(|c| c.clear())
+                {
+                    tracing::warn!(
+                        "Clearing disabled output {} failed: {:?}",
+                        output.name(),
+                        err
+                    );
+                }
+                gpu.surfaces.retain(|surface| surface.output != output);
+            }
+            data.state.remove_output(&output);
+        }
+    }
+
     // ── Build surfaces for newly-connected connectors ────────────────────────
     let refresh_rate = data.state.config.refresh_rate;
     let output_configs = data.state.config.outputs.clone();
@@ -2406,6 +2533,15 @@ fn connector_name(info: &connector::Info) -> String {
 /// The config stanza matching a connector name, if any.
 fn config_for_output<'a>(configs: &'a [OutputConfig], name: &str) -> Option<&'a OutputConfig> {
     configs.iter().find(|cfg| cfg.name == name)
+}
+
+/// Connector names the config turns off with `output <name> disable`.
+fn disabled_output_names(configs: &[OutputConfig]) -> Vec<String> {
+    configs
+        .iter()
+        .filter(|cfg| !cfg.enabled)
+        .map(|cfg| cfg.name.clone())
+        .collect()
 }
 
 /// Find the DRM mode matching a configured `WxH[@Hz]` spec, if the connector

@@ -73,11 +73,6 @@ pub struct RuntimeFlags {
     /// config has not set `tray enable`. The two are OR'd, so this is a quick way
     /// to try the tray without editing the config. Set `BEEWM_TRAY=1`.
     pub tray_enabled: bool,
-    /// Opt-in: allow the tray's Resolution/Refresh menu to perform a *live* DRM
-    /// modeset (rebuilds the connector's surface). Off by default because the
-    /// runtime modeset path is not yet hardware-validated; when unset the
-    /// request is logged and skipped. Set `BEEWM_LIVE_MODESET=1`.
-    pub live_modeset_enabled: bool,
     /// Diagnostic: emit fsync'd breadcrumb logs around each DRM operation
     /// (render / queue_frame / vblank) so the last line before a hard GPU wedge
     /// survives an unclean reboot and names the hung call. Set `BEEWM_WEDGE_TRACE=1`.
@@ -103,7 +98,6 @@ impl RuntimeFlags {
             frame_callback_at_vblank: on("BEEWM_FRAME_CALLBACK_AT_VBLANK"),
             multi_output_enabled: on("BEEWM_MULTI_OUTPUT"),
             tray_enabled: on("BEEWM_TRAY"),
-            live_modeset_enabled: on("BEEWM_LIVE_MODESET"),
             wedge_trace: on("BEEWM_WEDGE_TRACE"),
         };
         if flags.focus_ipc_disabled
@@ -141,12 +135,6 @@ impl RuntimeFlags {
         }
         if flags.tray_enabled {
             tracing::warn!("BEEWM_TRAY set: force-enabling the experimental settings tray icon");
-        }
-        if flags.live_modeset_enabled {
-            tracing::warn!(
-                "BEEWM_LIVE_MODESET set: enabling experimental runtime resolution/refresh \
-                 changes from the tray (rebuilds the output surface) — unvalidated on hardware"
-            );
         }
         flags
     }

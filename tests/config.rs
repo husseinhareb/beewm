@@ -153,6 +153,7 @@ fn default_keybinds_include_zero_for_workspace_ten() {
 fn parses_layout_aliases_and_command_synonyms() {
     let config = Config::parse(
         r#"
+        set $mod mod4
         set $term footclient
         layout master-stack
         master_ratio 0.75
@@ -254,6 +255,46 @@ fn rejects_invalid_colors() {
 }
 
 #[test]
+fn rejects_unknown_animation_easing() {
+    let err = Config::parse("animation_easing bouncy\n").unwrap_err();
+    assert!(matches!(err, ConfigError::Parse { line: 1, .. }));
+}
+
+#[test]
+fn accepts_easing_aliases() {
+    let config = Config::parse("animation_easing ease-in-out\n").unwrap();
+    assert_eq!(config.open_animation_easing, "ease-in-out");
+}
+
+#[test]
+fn rejects_unknown_per_kind_easing() {
+    let err = Config::parse("layout_animation_easing bouncy\n").unwrap_err();
+    assert!(matches!(err, ConfigError::Parse { line: 1, .. }));
+}
+
+#[test]
+fn default_easing_differs_per_kind() {
+    let config = Config::default();
+    assert_eq!(config.open_animation_easing, "ease_out");
+    assert_eq!(config.close_animation_easing, "ease_in_out");
+    assert_eq!(config.layout_animation_easing, "ease_in_out");
+}
+
+#[test]
+fn animation_easing_sets_all_three_and_later_lines_override() {
+    let config = Config::parse(
+        r#"
+        animation_easing linear
+        layout_animation_easing ease_in
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.open_animation_easing, "linear");
+    assert_eq!(config.close_animation_easing, "linear");
+    assert_eq!(config.layout_animation_easing, "ease_in");
+}
+
+#[test]
 fn rejects_workspace_bindings_out_of_bounds() {
     let err = Config::parse(
         r#"
@@ -293,7 +334,9 @@ fn writes_default_config_file_when_missing() {
     assert!(written.contains("bindsym $mod+Shift+0 move_to_workspace 10"));
     // Animation defaults are written and round-trip back into the config.
     assert!(written.contains("enable_animations true"));
-    assert!(written.contains("animation_easing ease_out"));
+    assert!(written.contains("open_animation_easing ease_out"));
+    assert!(written.contains("layout_animation_easing ease_in_out"));
+    assert_eq!(config.layout_animation_easing, "ease_in_out");
     assert!(config.enable_animations);
     assert_eq!(config.open_animation_duration_ms, 180);
 
@@ -325,7 +368,9 @@ fn parses_animation_settings() {
     assert_eq!(config.open_animation_duration_ms, 200);
     assert_eq!(config.close_animation_duration_ms, 120);
     assert_eq!(config.layout_animation_duration_ms, 240);
-    assert_eq!(config.animation_easing, "ease_in_out");
+    assert_eq!(config.open_animation_easing, "ease_in_out");
+    assert_eq!(config.close_animation_easing, "ease_in_out");
+    assert_eq!(config.layout_animation_easing, "ease_in_out");
 }
 
 #[test]
@@ -481,4 +526,264 @@ fn lock_settings_default_and_parse() {
     assert_eq!(config.lock_command, "swaylock --daemonize");
     assert!(!config.lock_on_suspend);
     assert!(config.lock_on_resume);
+}
+
+#[test]
+fn config_mode_edit_supersedes_tray_override() {
+    let old = Config::parse("output DP-1 mode 2560x1440@144\n").unwrap();
+    let edited = Config::parse("output DP-1 mode 2560x1440@165\n").unwrap();
+    let superseded = Config::superseded_runtime_modes(&old, &edited, ["DP-1", "HDMI-A-1"]);
+    assert_eq!(superseded, vec!["DP-1".to_string()]);
+}
+
+#[test]
+fn global_refresh_edit_supersedes_only_outputs_without_explicit_mode() {
+    let old = Config::parse("refresh_rate 60\noutput DP-1 mode 2560x1440@144\n").unwrap();
+    let edited = Config::parse("refresh_rate 165\noutput DP-1 mode 2560x1440@144\n").unwrap();
+    let superseded = Config::superseded_runtime_modes(&old, &edited, ["DP-1", "HDMI-A-1"]);
+    assert_eq!(superseded, vec!["HDMI-A-1".to_string()]);
+}
+
+#[test]
+fn unrelated_config_edit_keeps_tray_overrides() {
+    let old = Config::parse("gap 4\noutput DP-1 mode 2560x1440@144\n").unwrap();
+    let edited = Config::parse("gap 8\noutput DP-1 mode 2560x1440@144\n").unwrap();
+    assert!(Config::superseded_runtime_modes(&old, &edited, ["DP-1"]).is_empty());
+}
+
+#[test]
+fn config_edit_drops_only_the_superseded_tray_scalars() {
+    use beewm::config::StateOverrides;
+    let old = Config::parse("gap 4\nscreen_timeout 600\n").unwrap();
+    let edited = Config::parse("gap 10\nscreen_timeout 600\n").unwrap();
+    let mut overrides = StateOverrides {
+        gap: Some(8),
+        screen_timeout: Some(300),
+        output_modes: Vec::new(),
+    };
+    assert!(Config::drop_superseded_overrides(
+        &old,
+        &edited,
+        &mut overrides
+    ));
+    assert_eq!(overrides.gap, None);
+    assert_eq!(overrides.screen_timeout, Some(300));
+    assert_eq!(edited.clone().with_overrides(&overrides).gap, 10);
+
+    // A reload that touches neither key keeps the tray values.
+    assert!(!Config::drop_superseded_overrides(
+        &edited,
+        &edited,
+        &mut overrides
+    ));
+    assert_eq!(overrides.screen_timeout, Some(300));
+}
+
+#[test]
+fn strips_trailing_comments_but_keeps_colors() {
+    let config =
+        Config::parse("gap 8 # pixels\nborder_color_focused #ff0000 # red\nworkspaces 3 #\n")
+            .unwrap();
+    assert_eq!(config.gap, 8);
+    assert_eq!(config.border_color_focused, 0xff0000);
+    assert_eq!(config.num_workspaces, 3);
+}
+
+#[test]
+fn command_lines_reach_the_shell_untouched() {
+    let config = Config::parse(
+        "set $h unused\nexec sh -c 'cd $HOME' # not stripped\nbindsym mod4+x exec echo $USER # hi\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.autostart_commands,
+        vec!["sh -c 'cd $HOME' # not stripped"]
+    );
+    assert_eq!(
+        config.keybinds[0].action,
+        Action::Spawn("echo $USER # hi".into())
+    );
+}
+
+#[test]
+fn variables_match_whole_names_only() {
+    let err = Config::parse("set $mod mod4\nbindsym $mod2+x kill\n").unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::Parse { line: 2, message } if message.contains("$mod2")),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejects_undefined_variables_outside_commands() {
+    let err = Config::parse("gap $gaps\n").unwrap_err();
+    assert!(matches!(err, ConfigError::Parse { line: 1, .. }));
+}
+
+#[test]
+fn variables_can_build_on_earlier_ones() {
+    let config = Config::parse(
+        "set $term foot\nset $float_term $term --app-id float\nbindsym mod4+t exec $float_term\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.keybinds[0].action,
+        Action::Spawn("foot --app-id float".into())
+    );
+}
+
+#[test]
+fn rejects_invalid_variable_names() {
+    assert!(Config::parse("set $my-term foot\n").is_err());
+    assert!(Config::parse("set $ foot\n").is_err());
+}
+
+#[test]
+fn rejects_unknown_modifiers() {
+    let err = Config::parse("bindsym mod4+Ctlr+x kill\n").unwrap_err();
+    assert!(matches!(&err, ConfigError::Parse { message, .. } if message.contains("Ctlr")));
+}
+
+#[test]
+fn rejects_unknown_key_names() {
+    let err = Config::parse("bindsym mod4+Retrun kill\n").unwrap_err();
+    assert!(matches!(&err, ConfigError::Parse { message, .. } if message.contains("Retrun")));
+}
+
+#[test]
+fn rejects_unknown_actions_instead_of_running_them() {
+    let err = Config::parse("bindsym mod4+f fulscreen\n").unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::Parse { message, .. } if message.contains("exec fulscreen"))
+    );
+}
+
+#[test]
+fn rejects_degenerate_split_ratios() {
+    assert!(Config::parse("split_ratio 0.0\n").is_err());
+    assert!(Config::parse("split_ratio 1.0\n").is_err());
+    assert!(Config::parse("split_ratio 0.95\n").is_ok());
+}
+
+#[test]
+fn starter_config_matches_built_in_defaults() {
+    let parsed = Config::parse(&Config::default_text()).unwrap();
+    let normalize = |config: &Config| {
+        config
+            .keybinds
+            .iter()
+            .map(|bind| {
+                let mods: Vec<String> = bind.modifiers.iter().map(|m| m.to_lowercase()).collect();
+                (mods, bind.key.clone(), bind.action.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(normalize(&parsed), normalize(&Config::default()));
+}
+
+#[test]
+fn bare_multi_word_commands_still_run() {
+    let config = Config::parse(
+        "set $mod mod4\nbindsym $mod+s grim -g \"$(slurp)\" \"$HOME/shot.png\" # keep\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.keybinds[0].action,
+        Action::Spawn("grim -g \"$(slurp)\" \"$HOME/shot.png\" # keep".into())
+    );
+}
+
+/// Every name `parse_action` accepts must be listed as built in, or a line
+/// using it would be treated as a shell command (no comment stripping).
+#[test]
+fn builtin_actions_keep_trailing_comments_stripped() {
+    for action in [
+        "focus_next",
+        "focus_output_left",
+        "move_to_output_down",
+        "kill",
+        "toggle_sticky",
+        "exit",
+        "workspace 1",
+        "switch_workspace 1",
+        "move_to_workspace 1",
+    ] {
+        let config = Config::parse(&format!("bindsym mod4+x {action} # note\n"))
+            .unwrap_or_else(|e| panic!("{action}: {e}"));
+        assert!(
+            !matches!(config.keybinds[0].action, Action::Spawn(_)),
+            "{action}"
+        );
+    }
+}
+
+#[test]
+fn rejects_duplicate_bindings_across_aliases_and_case() {
+    let err = Config::parse("bindsym mod4+q kill\nbindsym Super+Q exit\n").unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::Parse { line: 2, message } if message.contains("line 1")),
+        "{err}"
+    );
+    // Same key with different modifiers is fine.
+    assert!(Config::parse("bindsym mod4+q kill\nbindsym mod4+shift+q exit\n").is_ok());
+}
+
+#[test]
+fn parses_keyboard_and_repeat_settings() {
+    let config = Config::parse(
+        "keyboard_layout us,ara\nkeyboard_variant ,mac\nkeyboard_options grp:alt_shift_toggle,caps:escape\nkeyboard_model pc105\nrepeat_delay 300\nrepeat_rate 40\n",
+    )
+    .unwrap();
+    assert_eq!(config.keyboard_layout, "us,ara");
+    assert_eq!(config.keyboard_variant, ",mac");
+    assert_eq!(config.keyboard_options, "grp:alt_shift_toggle,caps:escape");
+    assert_eq!(config.keyboard_model, "pc105");
+    assert_eq!((config.repeat_delay, config.repeat_rate), (300, 40));
+    let xkb = config.xkb_config();
+    assert_eq!(
+        xkb.options.as_deref(),
+        Some("grp:alt_shift_toggle,caps:escape")
+    );
+    assert!(Config::default().xkb_config().options.is_none());
+}
+
+#[test]
+fn rejects_out_of_range_values() {
+    for line in [
+        "gap 5000",
+        "border_width 4294967295",
+        "refresh_rate 0",
+        "repeat_rate 5000",
+        "repeat_delay 60000",
+        "open_animation_duration_ms 600000",
+        "animation_duration_ms 600000",
+        "output DP-1 mode 0x0",
+        "output DP-1 mode 1920x1080@0",
+    ] {
+        assert!(
+            Config::parse(&format!("{line}\n")).is_err(),
+            "{line} should be rejected"
+        );
+    }
+    assert!(Config::parse("gap 1000\nrefresh_rate 240\nrepeat_rate 0\n").is_ok());
+}
+
+#[test]
+fn warns_about_config_writable_by_others() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("beewm-perm-{}", std::process::id()));
+    remove_dir_all_if_exists(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dir.join("config");
+    std::fs::write(&path, "gap 4\n").unwrap();
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(Config::insecure_permissions_warning(&path), None);
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let warning = Config::insecure_permissions_warning(&path).unwrap();
+    assert!(warning.contains("chmod go-w"), "{warning}");
+
+    remove_dir_all_if_exists(&dir);
 }

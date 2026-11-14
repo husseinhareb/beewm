@@ -9,24 +9,25 @@ use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
+use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::utils::{
     ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, RelocateRenderElement,
     RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::element::PixelShaderElement;
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::desktop::space::{ConstrainBehavior, ConstrainReference, constrain_space_element};
 use smithay::desktop::{Space, Window, layer_map_for_output};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
-use crate::compositor::animation::AnimationManager;
+use crate::compositor::animation::{AnimationManager, ClosingWindow};
 use crate::compositor::state::Beewm;
 
 pub(crate) fn is_window_fullscreen(window: &Window) -> bool {
@@ -57,6 +58,9 @@ pub type AnimatedSurface<R> =
 pub enum WindowElement<R: Renderer> {
     Surface(WaylandSurfaceRenderElement<R>),
     Animated(AnimatedSurface<R>),
+    /// A frozen texture of a window that already closed, drawn while its close
+    /// animation plays (see [`ClosingWindow`]).
+    Snapshot(TextureRenderElement<R::TextureId>),
 }
 
 impl<R> From<WaylandSurfaceRenderElement<R>> for WindowElement<R>
@@ -88,6 +92,7 @@ where
         match self {
             Self::Surface(e) => e.id(),
             Self::Animated(e) => e.id(),
+            Self::Snapshot(e) => e.id(),
         }
     }
 
@@ -95,6 +100,7 @@ where
         match self {
             Self::Surface(e) => e.current_commit(),
             Self::Animated(e) => e.current_commit(),
+            Self::Snapshot(e) => e.current_commit(),
         }
     }
 
@@ -102,6 +108,7 @@ where
         match self {
             Self::Surface(e) => e.location(scale),
             Self::Animated(e) => e.location(scale),
+            Self::Snapshot(e) => e.location(scale),
         }
     }
 
@@ -109,6 +116,7 @@ where
         match self {
             Self::Surface(e) => e.src(),
             Self::Animated(e) => e.src(),
+            Self::Snapshot(e) => e.src(),
         }
     }
 
@@ -116,6 +124,7 @@ where
         match self {
             Self::Surface(e) => e.transform(),
             Self::Animated(e) => e.transform(),
+            Self::Snapshot(e) => e.transform(),
         }
     }
 
@@ -123,6 +132,7 @@ where
         match self {
             Self::Surface(e) => e.geometry(scale),
             Self::Animated(e) => e.geometry(scale),
+            Self::Snapshot(e) => e.geometry(scale),
         }
     }
 
@@ -134,6 +144,7 @@ where
         match self {
             Self::Surface(e) => e.damage_since(scale, commit),
             Self::Animated(e) => e.damage_since(scale, commit),
+            Self::Snapshot(e) => e.damage_since(scale, commit),
         }
     }
 
@@ -141,6 +152,7 @@ where
         match self {
             Self::Surface(e) => e.opaque_regions(scale),
             Self::Animated(e) => e.opaque_regions(scale),
+            Self::Snapshot(e) => e.opaque_regions(scale),
         }
     }
 
@@ -148,6 +160,7 @@ where
         match self {
             Self::Surface(e) => e.alpha(),
             Self::Animated(e) => e.alpha(),
+            Self::Snapshot(e) => e.alpha(),
         }
     }
 
@@ -155,6 +168,7 @@ where
         match self {
             Self::Surface(e) => e.kind(),
             Self::Animated(e) => e.kind(),
+            Self::Snapshot(e) => e.kind(),
         }
     }
 }
@@ -175,6 +189,9 @@ where
         match self {
             Self::Surface(e) => e.draw(frame, src, dst, damage, opaque_regions),
             Self::Animated(e) => e.draw(frame, src, dst, damage, opaque_regions),
+            Self::Snapshot(e) => {
+                RenderElement::<R>::draw(e, frame, src, dst, damage, opaque_regions)
+            }
         }
     }
 
@@ -182,6 +199,7 @@ where
         match self {
             Self::Surface(e) => e.underlying_storage(renderer),
             Self::Animated(e) => e.underlying_storage(renderer),
+            Self::Snapshot(e) => RenderElement::<R>::underlying_storage(e, renderer),
         }
     }
 }
@@ -201,6 +219,8 @@ where
 /// * **geometry** animations (layout resize) use `Stretch`, scaling the current
 ///   buffer to fill the interpolated rectangle so there are no gaps while the
 ///   client catches up to its new configured size.
+/// * **close** animations draw the closed window's snapshot textures, clipped
+///   to the shrinking rectangle and faded out, below every live window.
 pub(crate) fn window_render_elements<R>(
     renderer: &mut R,
     space: &Space<Window>,
@@ -211,8 +231,7 @@ pub(crate) fn window_render_elements<R>(
     is_root_floating: impl Fn(&WlSurface) -> bool,
 ) -> Vec<WindowElement<R>>
 where
-    R: Renderer + ImportAll,
-    R::TextureId: Texture + Clone + 'static,
+    R: Renderer<TextureId = GlesTexture> + ImportAll,
 {
     let Some(region) = space.output_geometry(output) else {
         return Vec::new();
@@ -340,7 +359,71 @@ where
         }
     }
 
+    // Closed windows go last, i.e. at the bottom of the window stack: the
+    // surviving tiles animate over the ghost as they grow into its space.
+    for ghost in animations.closing_windows() {
+        elements.extend(
+            closing_window_elements(renderer, ghost, region, scale, alpha, now)
+                .map(WindowElement::Snapshot),
+        );
+    }
+
     elements
+}
+
+/// Render elements for one closing window's snapshot on an output whose
+/// logical region is `region`. Each layer is clipped to the shrinking
+/// rectangle without scaling (the same `CutOff` reveal the open animation
+/// uses, played backwards) and faded with the animation's progress.
+fn closing_window_elements<'a, R>(
+    renderer: &R,
+    ghost: &'a ClosingWindow,
+    region: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    now: Instant,
+) -> impl Iterator<Item = TextureRenderElement<GlesTexture>> + 'a
+where
+    R: Renderer<TextureId = GlesTexture>,
+{
+    let (rect, fade) = ghost.current(now);
+    let on_output = region.overlaps(rect);
+    let context = renderer.context_id();
+    let visible = Rectangle::<i32, Logical>::from_size(rect.size);
+    ghost
+        .layers
+        .iter()
+        .filter(move |_| on_output)
+        .filter_map(move |layer| {
+            let clip = Rectangle::new(layer.offset, layer.size).intersection(visible)?;
+            // Map the clipped part back into the layer's source crop.
+            let sx = layer.src.size.w / f64::from(layer.size.w);
+            let sy = layer.src.size.h / f64::from(layer.size.h);
+            let src = Rectangle::<f64, Logical>::new(
+                (
+                    layer.src.loc.x + f64::from(clip.loc.x - layer.offset.x) * sx,
+                    layer.src.loc.y + f64::from(clip.loc.y - layer.offset.y) * sy,
+                )
+                    .into(),
+                (f64::from(clip.size.w) * sx, f64::from(clip.size.h) * sy).into(),
+            );
+            let location = (rect.loc + clip.loc - region.loc)
+                .to_physical_precise_round::<f64, i32>(scale)
+                .to_f64();
+            Some(TextureRenderElement::from_static_texture(
+                layer.id.clone(),
+                context.clone(),
+                location,
+                layer.texture.clone(),
+                layer.buffer_scale,
+                layer.transform,
+                Some(alpha * fade),
+                Some(src),
+                Some(clip.size),
+                None,
+                Kind::Unspecified,
+            ))
+        })
 }
 
 pub(crate) fn layer_render_elements<R>(

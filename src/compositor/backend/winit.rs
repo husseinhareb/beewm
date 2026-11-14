@@ -339,7 +339,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     // Watch the config file for changes and reload automatically on save.
-    match config_watcher::make_config_watch_fd(&Config::config_path()) {
+    match config_watcher::make_config_watch_fd(&[&Config::config_path(), &Config::state_path()]) {
         Ok((watch_fd, config_filename)) => {
             event_loop
                 .handle()
@@ -492,6 +492,10 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         "resolution/refresh changes aren't supported on the nested winit backend",
                     );
                 }
+                BackendRequest::ReapplyOutputConfig | BackendRequest::ReapplyInputConfig => {
+                    // Output modes come from the host window and the host owns
+                    // the touchpad settings; nothing to apply.
+                }
             }
         }
 
@@ -520,6 +524,8 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let render_result = match winit_backend.bind() {
                     Ok((renderer, mut framebuffer)) => {
                         let fullscreen_active = data.state.screen_owned_by_window(output);
+                        data.state.render_context =
+                            Some(smithay::backend::renderer::Renderer::context_id(renderer));
                         let window_elements = window_render_elements(
                             renderer,
                             &data.state.space,

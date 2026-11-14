@@ -63,7 +63,7 @@ use smithay::xwayland::{X11Wm, XWaylandClientData};
 
 use crate::compositor::animation::AnimationManager;
 use crate::compositor::overview::Overview;
-use crate::config::{Config, Keybind, LayoutKind, OutputModeSpec};
+use crate::config::{Action, Config, Keybind, LayoutKind, OutputModeSpec, StateOverrides};
 use crate::layout::manager::{DwindleManager, LayoutManager, MasterStackManager};
 use crate::model::workspace::Workspace;
 use crate::xwayland::PendingX11Window;
@@ -110,12 +110,19 @@ pub enum BackendRequest {
     /// Power the outputs off (`on = false`, via `DrmCompositor::clear`) or back
     /// on (`on = true`, by resuming rendering). Drives screen-timeout blanking.
     SetDpms { on: bool },
-    /// Switch `output` to `mode` (a live DRM modeset). Gated on
-    /// `BEEWM_LIVE_MODESET`; logged and skipped otherwise.
+    /// Switch `output` to `mode` (a live DRM modeset) on behalf of the tray.
+    /// A successful change is persisted to `state.conf`.
     SetOutputMode {
         output: Output,
         mode: OutputModeSpec,
     },
+    /// Re-resolve every output's mode from the current config (`output … mode`
+    /// and `refresh_rate`) and modeset the ones that differ. Queued by config
+    /// hot-reload; nothing is persisted since the config file already is.
+    ReapplyOutputConfig,
+    /// Re-apply per-device input settings (`tap_to_click`, `natural_scroll`)
+    /// to every connected touchpad after a config reload.
+    ReapplyInputConfig,
 }
 
 /// The mode list reported by the backend for one output, used to populate the
@@ -162,8 +169,13 @@ pub struct Beewm {
     pub idle_inhibitors: HashSet<WlSurface>,
     /// Mode list per output (backend-reported), for the tray's Resolution menu.
     pub output_modes: HashMap<Output, OutputModes>,
-    /// Output modes written by the tray to `state.conf`, keyed by output name.
-    pub runtime_output_modes: HashMap<String, OutputModeSpec>,
+    /// Settings the tray has written to `state.conf` (gap, screen timeout,
+    /// per-output modes). Each overrides its config key until that key is edited.
+    pub state_overrides: StateOverrides,
+    /// The hand-edited config as last loaded, without the `state.conf` overlay.
+    /// Config reload diffs against it to tell a real edit of an output's mode
+    /// apart from a tray override that merely differs from the file.
+    pub base_config: Config,
     pub start_time: std::time::Instant,
     pub display_handle: DisplayHandle,
 
@@ -286,6 +298,12 @@ pub struct Beewm {
     /// Compositor-driven window animations (open / layout-resize). Purely
     /// visual: the logical layout in `space`/`layout_manager` is always exact.
     pub animations: AnimationManager,
+    /// Context id of the renderer that draws windows, refreshed by the backend
+    /// every frame. Close animations need it to find the textures that
+    /// renderer imported for a closing window. `None` until the first frame.
+    pub render_context: Option<
+        smithay::backend::renderer::ContextId<smithay::backend::renderer::gles::GlesTexture>,
+    >,
     /// X11 window manager state for the compositor-managed XWayland instance.
     pub xwm: Option<X11Wm>,
     /// Clipboard bridge: hands an X client's read request to `X11Wm` together
@@ -372,6 +390,9 @@ pub struct Beewm {
     pub(crate) pending_map_focus: Option<WlSurface>,
     /// Startup commands are delayed until both an output exists and XWayland startup has settled.
     pub(crate) startup_commands_spawned: bool,
+    /// Config problems found before the session was up, shown as desktop
+    /// notifications alongside the startup commands.
+    pub(crate) pending_config_notices: Vec<String>,
     pub(crate) outputs_ready_for_startup: bool,
     pub(crate) xwayland_start_pending: bool,
     pub(crate) pending_x11_windows: Vec<PendingX11Window>,
@@ -430,16 +451,22 @@ impl Beewm {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "beewm");
 
-        // Initialize keyboard and pointer on the seat
-        seat.add_keyboard(
-            XkbConfig {
-                layout: &config.keyboard_layout,
-                ..Default::default()
-            },
-            200,
-            25,
-        )
-        .expect("Failed to add keyboard");
+        // Problems found before the session is up; shown once it is.
+        let mut config_notices = Vec::new();
+
+        // Initialize keyboard and pointer on the seat. An unknown layout must
+        // not take the session down: fall back to the XKB default.
+        let repeat_delay = config.repeat_delay as i32;
+        let repeat_rate = config.repeat_rate as i32;
+        if let Err(error) = seat.add_keyboard(config.xkb_config(), repeat_delay, repeat_rate) {
+            config_notices.push(format!(
+                "{} could not be loaded ({:?}); using the default layout",
+                describe_keymap(&config),
+                error
+            ));
+            seat.add_keyboard(XkbConfig::default(), repeat_delay, repeat_rate)
+                .expect("Failed to add keyboard with the default XKB layout");
+        }
         seat.add_pointer();
 
         let num_ws = config.num_workspaces;
@@ -451,7 +478,14 @@ impl Beewm {
         // env flag is set.
         let tray_enabled = Self::resolve_tray_enabled(&config);
         let tray_menu: SharedMenu = Arc::new(Mutex::new(Vec::new()));
-        let runtime_output_modes = Config::runtime_output_modes().into_iter().collect();
+        let state_overrides = Config::read_state_overrides();
+        if let Some(warning) = Config::insecure_permissions_warning(&Config::config_path()) {
+            config_notices.push(warning);
+        }
+        let base_config = Config::load_base().unwrap_or_else(|error| {
+            config_notices.push(format!("{}; using the default config", error));
+            Config::default()
+        });
         let idle_inhibitor_state = IdleInhibitManagerState::new::<Self>(&display_handle);
         let animations = AnimationManager::from_config(&config);
         let cursor_shape_manager_state_ = CursorShapeManagerState::new::<Self>(&display_handle);
@@ -471,7 +505,8 @@ impl Beewm {
             idle_inhibitor_state,
             idle_inhibitors: HashSet::new(),
             output_modes: HashMap::new(),
-            runtime_output_modes,
+            state_overrides,
+            base_config,
             start_time: std::time::Instant::now(),
             display_handle: display_handle.clone(),
             compositor_state,
@@ -529,6 +564,7 @@ impl Beewm {
             needs_render: true,
             session_env_managed: false,
             animations,
+            render_context: None,
             xwm: None,
             xwm_send_selection: None,
             xdisplay: None,
@@ -554,6 +590,7 @@ impl Beewm {
             pending_map_focus: None,
             child_env: ChildEnvironment::default(),
             startup_commands_spawned: false,
+            pending_config_notices: config_notices,
             outputs_ready_for_startup: false,
             xwayland_start_pending: false,
             pending_x11_windows: Vec::new(),
@@ -608,16 +645,43 @@ impl Beewm {
         }
     }
 
+    /// Log a config problem and show it as a desktop notification, or queue it
+    /// until startup commands run if the session is not up yet.
+    pub(crate) fn report_config_problem(&mut self, message: String) {
+        tracing::error!("config: {}", message);
+        if self.startup_commands_spawned {
+            crate::compositor::commands::spawn_config_notification(&message, &self.child_env);
+        } else {
+            self.pending_config_notices.push(message);
+        }
+    }
+
     /// Re-read the config file and apply every hot-reloadable field in place.
     /// Called automatically when the config file is saved.
     pub fn apply_config_reload(&mut self) {
-        let new_config = match Config::load() {
+        let new_base = match Config::load_base() {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Config reload failed, keeping current config: {}", e);
+                self.report_config_problem(format!("{}; keeping the current config", e));
                 return;
             }
         };
+
+        // A key edited in the config (gap, screen_timeout, an output's mode or
+        // refresh_rate) beats an older tray choice for it: drop the superseded
+        // overrides from `state.conf` before layering it, or the edit would be
+        // silently masked. Re-read the file first to honor manual edits to it.
+        self.state_overrides = Config::read_state_overrides();
+        if Config::drop_superseded_overrides(
+            &self.base_config,
+            &new_base,
+            &mut self.state_overrides,
+        ) {
+            tracing::info!("config edit supersedes tray-set values in state.conf");
+            self.persist_runtime_settings();
+        }
+        self.base_config = new_base.clone();
+        let new_config = new_base.with_overrides(&self.state_overrides);
 
         // Border colors are pre-converted to Color32F at init time; keep them in sync.
         if new_config.border_color_focused != self.config.border_color_focused
@@ -656,45 +720,74 @@ impl Beewm {
             self.layout_manager = new_manager;
         }
 
-        // num_workspaces changes require a restart (adding/removing live workspaces
-        // while windows exist is not safe to do mid-session).
-        if new_config.num_workspaces != self.config.num_workspaces {
-            tracing::warn!(
-                "num_workspaces changed ({} → {}); restart beewm to apply",
-                self.config.num_workspaces,
-                new_config.num_workspaces,
-            );
+        // Workspace count: grow in place, or fold dropped workspaces' windows
+        // into the last surviving one.
+        let mut new_config = new_config;
+        if new_config.num_workspaces != self.workspaces.len()
+            && !self.set_workspace_count(new_config.num_workspaces, new_config.split_ratio)
+        {
+            // Refused (fewer workspaces than outputs): keep the live count and
+            // drop bindings that would point past it.
+            let live = self.workspaces.len();
+            new_config.num_workspaces = live;
+            new_config.keybinds.retain(|bind| match bind.action {
+                Action::SwitchWorkspace(idx) | Action::MoveToWorkspace(idx) => idx < live,
+                _ => true,
+            });
+            self.resolved_keybinds = resolve_keybinds(&new_config.keybinds);
         }
 
-        // keyboard_layout: re-apply XKB config so the running session picks it up.
-        if new_config.keyboard_layout != self.config.keyboard_layout
+        // Keymap (layout/variant/options/model): re-apply so the running
+        // session picks it up. On failure the previous keymap stays active.
+        if new_config.keymap_differs(&self.config)
+            && let Some(keyboard) = self.seat.get_keyboard()
+            && let Err(e) = keyboard.set_xkb_config(self, new_config.xkb_config())
+        {
+            self.report_config_problem(format!(
+                "{} could not be loaded ({:?})",
+                describe_keymap(&new_config),
+                e
+            ));
+        }
+        if (new_config.repeat_delay, new_config.repeat_rate)
+            != (self.config.repeat_delay, self.config.repeat_rate)
             && let Some(keyboard) = self.seat.get_keyboard()
         {
-            let result = keyboard.set_xkb_config(
-                self,
-                XkbConfig {
-                    layout: &new_config.keyboard_layout,
-                    ..Default::default()
-                },
+            keyboard.change_repeat_info(
+                new_config.repeat_rate as i32,
+                new_config.repeat_delay as i32,
             );
-            if let Err(e) = result {
-                tracing::warn!(
-                    "Failed to apply keyboard_layout '{}': {:?}",
-                    new_config.keyboard_layout,
-                    e
-                );
-            }
         }
 
         // Settings tray: re-resolve enabled (config OR BEEWM_TRAY), then
         // `sync_tray` below starts/stops the StatusNotifierItem thread.
         self.tray_enabled = Self::resolve_tray_enabled(&new_config);
 
+        // Output modes: let the backend re-resolve each output's mode and
+        // modeset only the ones whose resolved mode actually changed.
+        let output_modes_changed = new_config.outputs != self.config.outputs
+            || new_config.refresh_rate != self.config.refresh_rate;
+        let output_positions_changed = new_config
+            .outputs
+            .iter()
+            .map(|o| (&o.name, o.position))
+            .ne(self.config.outputs.iter().map(|o| (&o.name, o.position)));
+        // Touchpad settings live on each libinput device; the backend
+        // re-applies them to every connected touchpad.
+        let input_changed = new_config.tap_to_click != self.config.tap_to_click
+            || new_config.natural_scroll != self.config.natural_scroll;
+
         // autostart_commands are intentionally not re-executed on reload.
-        // tap_to_click / natural_scroll take effect for devices added after
-        // this reload; already-connected devices keep their current setting.
 
         self.config = new_config;
+        if output_modes_changed {
+            self.backend_requests
+                .push_back(BackendRequest::ReapplyOutputConfig);
+        }
+        if input_changed {
+            self.backend_requests
+                .push_back(BackendRequest::ReapplyInputConfig);
+        }
         self.animations.update_from_config(&self.config);
         self.refresh_tray_menu();
         self.sync_tray();
@@ -706,9 +799,15 @@ impl Beewm {
             self.config.split_ratio,
         );
 
-        // relayout() repositions all windows on the active workspace and sets
-        // needs_render = true so the new gap/border values are picked up.
-        self.relayout();
+        if output_positions_changed {
+            // Re-place outputs per the new `output … position` lines, pull
+            // floats back on-screen and relayout every output.
+            self.handle_output_geometry_changed();
+        } else {
+            // relayout() repositions all windows on the active workspace and sets
+            // needs_render = true so the new gap/border values are picked up.
+            self.relayout();
+        }
     }
 
     /// Rebuild the shared settings-menu tree from current state and publish it
@@ -767,17 +866,16 @@ impl Beewm {
     /// Persist tray-settable values so they survive a restart (written to the
     /// `state.conf` overlay, not the user's hand-edited config).
     fn persist_runtime_settings(&self) {
-        let output_modes: Vec<_> = self
-            .runtime_output_modes
-            .iter()
-            .map(|(name, mode)| (name.clone(), *mode))
-            .collect();
-        Config::write_state_overrides(self.config.gap, self.config.screen_timeout, &output_modes);
+        Config::write_state_overrides(&self.state_overrides);
     }
 
     /// Remember a successfully applied tray output-mode change and persist it.
     pub(crate) fn record_runtime_output_mode(&mut self, output_name: String, mode: OutputModeSpec) {
-        self.runtime_output_modes.insert(output_name.clone(), mode);
+        let modes = &mut self.state_overrides.output_modes;
+        match modes.iter_mut().find(|(name, _)| *name == output_name) {
+            Some((_, existing)) => *existing = mode,
+            None => modes.push((output_name.clone(), mode)),
+        }
         self.config.set_output_mode_override(output_name, mode);
         self.persist_runtime_settings();
     }
@@ -789,6 +887,7 @@ impl Beewm {
             MenuAction::SetGap(gap) => {
                 tracing::info!(target: "beewm::tray", gap, "set gap from tray");
                 self.config.gap = gap;
+                self.state_overrides.gap = Some(gap);
                 self.relayout();
                 self.persist_runtime_settings();
                 self.refresh_tray_menu();
@@ -800,6 +899,7 @@ impl Beewm {
             MenuAction::SetScreenTimeout(secs) => {
                 tracing::info!(target: "beewm::tray", secs, "set screen timeout from tray");
                 self.config.screen_timeout = secs;
+                self.state_overrides.screen_timeout = Some(secs);
                 // Restart the countdown from now (and wake if currently blanked).
                 self.notify_activity();
                 self.persist_runtime_settings();
@@ -1328,6 +1428,22 @@ pub fn write_state_file_atomically(path: &Path, contents: &str) -> std::io::Resu
     }
 
     Ok(())
+}
+
+/// The keymap settings, for error messages (`keyboard_layout 'xx'`, plus any
+/// variant/options/model that were set).
+fn describe_keymap(config: &Config) -> String {
+    let mut parts = vec![format!("keyboard_layout '{}'", config.keyboard_layout)];
+    for (name, value) in [
+        ("keyboard_variant", &config.keyboard_variant),
+        ("keyboard_options", &config.keyboard_options),
+        ("keyboard_model", &config.keyboard_model),
+    ] {
+        if !value.is_empty() {
+            parts.push(format!("{name} '{value}'"));
+        }
+    }
+    parts.join(" with ")
 }
 
 fn build_layout_manager(

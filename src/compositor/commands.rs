@@ -164,6 +164,23 @@ pub fn spawn_shell_command(cmd: &str, child_env: &ChildEnvironment) -> std::io::
     command.spawn().map(|_| ())
 }
 
+/// Best-effort desktop notification about a config problem. Silently does
+/// nothing when `notify-send` or a notification daemon is missing; the problem
+/// is always in the log as well.
+pub fn spawn_config_notification(message: &str, child_env: &ChildEnvironment) {
+    let mut command = Command::new("notify-send");
+    command.args([
+        "--app-name=beewm",
+        "--urgency=critical",
+        "beewm config error",
+        message,
+    ]);
+    configure_child(&mut command, child_env);
+    if let Err(error) = command.spawn() {
+        tracing::debug!("notify-send unavailable: {}", error);
+    }
+}
+
 /// Push the live session environment into the D-Bus activation environment and
 /// the systemd user manager, so D-Bus/systemd-activated services started later
 /// (xdg-desktop-portal, xdg-desktop-portal-wlr, pipewire, wireplumber) inherit

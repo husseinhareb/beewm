@@ -38,16 +38,21 @@ split.
 
 Configuration is loaded from `~/.config/beewm/config`.
 If the file does not exist, beewm writes a starter config automatically.
-
-Startup commands can be declared with top-level `exec`, `exec_once`, or `autostart`
-directives. Each command is launched once when beewm starts.
+Changes apply as soon as the file is saved, and a broken config never stops the
+session from starting: beewm falls back to the defaults and shows the error.
 
 ```text
-exec waybar
-exec nm-applet
+set $mod mod4
+gap 8
+keyboard_layout us,ara
+keyboard_options grp:alt_shift_toggle
 
+exec waybar
 bindsym $mod+Return exec kitty
 ```
+
+See [`docs/configuration.md`](docs/configuration.md) for every option, its
+default, the binding syntax and actions, and the environment variables.
 
 ## Window overview
 

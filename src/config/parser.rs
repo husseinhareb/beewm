@@ -1,10 +1,48 @@
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
+
+use smithay::input::keyboard::xkb;
 
 use super::{
     Action, Config, ConfigError, FocusDirection, Keybind, LayoutKind, OutputConfig, OutputModeSpec,
 };
+
+/// Built-in binding actions; must match `parse_action`. Any other action word
+/// starts a command.
+const BUILTIN_ACTIONS: &[&str] = &[
+    "focus_next",
+    "focus_prev",
+    "focus_left",
+    "focus_right",
+    "focus_up",
+    "focus_down",
+    "focus_output_left",
+    "focus_output_right",
+    "focus_output_up",
+    "focus_output_down",
+    "move_to_output_left",
+    "move_to_output_right",
+    "move_to_output_up",
+    "move_to_output_down",
+    "close_window",
+    "kill",
+    "fullscreen",
+    "toggle_fullscreen",
+    "float",
+    "toggle_float",
+    "sticky",
+    "toggle_sticky",
+    "quit",
+    "exit",
+    "workspace",
+    "switch_workspace",
+    "move_to_workspace",
+];
+
+/// Modifier names a binding may use; must match `resolve_keybinds`.
+const KNOWN_MODIFIERS: &[&str] = &[
+    "super", "mod4", "logo", "shift", "ctrl", "control", "alt", "mod1",
+];
 
 pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
     let defaults = Config::default();
@@ -14,6 +52,7 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
     };
     let mut variables = HashMap::<String, String>::new();
     let mut custom_keybinds = false;
+    let mut bound_combos = HashMap::<(Vec<&'static str>, u32), usize>::new();
 
     for (index, raw_line) in contents.lines().enumerate() {
         let line_no = index + 1;
@@ -22,12 +61,37 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
             continue;
         }
 
+        // Command text is handed to the shell, which treats `#` and `$VAR`
+        // itself; everything else gets trailing comments stripped and must not
+        // reference an undefined variable.
+        let command_line = is_command_line(trimmed);
+        let trimmed = if command_line {
+            trimmed
+        } else {
+            strip_inline_comment(trimmed)
+        };
+
         if let Some(rest) = trimmed.strip_prefix("set ") {
             parse_variable(rest, line_no, &mut variables)?;
             continue;
         }
 
         let line = substitute_variables(trimmed, &variables);
+        let checked = if is_binding(&line) {
+            // Only a binding's key combination is checked here: a command is the
+            // shell's business, and built-in actions validate their own arguments.
+            line.split_whitespace().nth(1).unwrap_or("")
+        } else if command_line {
+            ""
+        } else {
+            line.as_str()
+        };
+        if let Some(name) = first_unexpanded_variable(checked) {
+            return Err(ConfigError::Parse {
+                line: line_no,
+                message: format!("undefined variable '{}'", name),
+            });
+        }
         let mut parts = line.split_whitespace();
         let directive = parts.next().unwrap();
 
@@ -78,6 +142,26 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
             "keyboard_layout" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.keyboard_layout = value.to_string();
+            }
+            "keyboard_variant" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.keyboard_variant = value.to_string();
+            }
+            "keyboard_options" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.keyboard_options = value.to_string();
+            }
+            "keyboard_model" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.keyboard_model = value.to_string();
+            }
+            "repeat_delay" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.repeat_delay = parse_number(value, line_no, directive)?;
+            }
+            "repeat_rate" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.repeat_rate = parse_number(value, line_no, directive)?;
             }
             "refresh_rate" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
@@ -181,9 +265,32 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 config.close_animation_duration_ms = ms;
                 config.layout_animation_duration_ms = ms;
             }
-            "animation_easing" => {
+            "animation_easing"
+            | "open_animation_easing"
+            | "close_animation_easing"
+            | "layout_animation_easing" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
-                config.animation_easing = value.to_string();
+                if crate::compositor::animation::Easing::parse(value).is_none() {
+                    return Err(ConfigError::Parse {
+                        line: line_no,
+                        message: format!(
+                            "unknown {} '{}': expected linear | ease_in | ease_out | ease_in_out",
+                            directive, value
+                        ),
+                    });
+                }
+                let value = value.to_string();
+                match directive {
+                    "open_animation_easing" => config.open_animation_easing = value,
+                    "close_animation_easing" => config.close_animation_easing = value,
+                    "layout_animation_easing" => config.layout_animation_easing = value,
+                    // Convenience: set all three curves at once.
+                    _ => {
+                        config.open_animation_easing = value.clone();
+                        config.close_animation_easing = value.clone();
+                        config.layout_animation_easing = value;
+                    }
+                }
             }
             "exec" | "exec_once" | "autostart" => {
                 config
@@ -196,7 +303,20 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                     custom_keybinds = true;
                 }
                 let rest = line[directive.len()..].trim();
-                config.keybinds.push(parse_keybind(rest, line_no)?);
+                let bind = parse_keybind(rest, line_no)?;
+                // The key handler fires the first match, so a repeat would be
+                // dead. Report it rather than silently ignoring one of them.
+                if let Some(first) = bound_combos.insert(combo_identity(&bind), line_no) {
+                    return Err(ConfigError::Parse {
+                        line: line_no,
+                        message: format!(
+                            "{} is already bound on line {}",
+                            rest.split_whitespace().next().unwrap_or(rest),
+                            first
+                        ),
+                    });
+                }
+                config.keybinds.push(bind);
             }
             "output" => {
                 let output = parse_output_config(parts, line_no)?;
@@ -295,6 +415,12 @@ fn parse_mode_spec(value: &str, line_no: usize) -> Result<OutputModeSpec, Config
     let height = h
         .parse::<i32>()
         .map_err(|_| err(format!("invalid height in mode '{}'", value)))?;
+    if width <= 0 || height <= 0 || refresh == Some(0) {
+        return Err(err(format!(
+            "mode '{}' needs a positive size and refresh rate",
+            value
+        )));
+    }
     Ok(OutputModeSpec {
         width,
         height,
@@ -332,10 +458,16 @@ fn parse_variable(
     let name = rest[..split_at].trim();
     let value = rest[split_at..].trim();
 
-    if !name.starts_with('$') {
+    let valid_name = name
+        .strip_prefix('$')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(is_variable_char));
+    if !valid_name {
         return Err(ConfigError::Parse {
             line: line_no,
-            message: "variable names must start with '$'".into(),
+            message: format!(
+                "invalid variable name '{}': use '$' followed by letters, digits or '_'",
+                name
+            ),
         });
     }
     if value.is_empty() {
@@ -345,20 +477,97 @@ fn parse_variable(
         });
     }
 
-    variables.insert(name.to_string(), value.to_string());
+    // Values may build on earlier variables (`set $alt_term $term --class x`).
+    let value = substitute_variables(value, variables);
+    variables.insert(name.to_string(), value);
     Ok(())
 }
 
+fn is_variable_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Length of the variable name starting right after a `$`.
+fn variable_name_len(after_dollar: &str) -> usize {
+    after_dollar
+        .find(|c: char| !is_variable_char(c))
+        .unwrap_or(after_dollar.len())
+}
+
+/// Replace each whole `$name` that is defined. Matching whole names (not
+/// substrings) keeps `$h` from rewriting `$HOME`, and leaves an undefined
+/// `$mod2` intact so it can be reported instead of becoming `mod42`.
 fn substitute_variables(line: &str, variables: &HashMap<String, String>) -> String {
-    let mut output = line.to_string();
-    let mut ordered = variables.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|(name, _)| Reverse(name.len()));
-
-    for (name, value) in ordered {
-        output = output.replace(name.as_str(), value);
+    let mut output = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find('$') {
+        output.push_str(&rest[..pos]);
+        let end = pos + 1 + variable_name_len(&rest[pos + 1..]);
+        let name = &rest[pos..end];
+        output.push_str(variables.get(name).map(String::as_str).unwrap_or(name));
+        rest = &rest[end..];
     }
-
+    output.push_str(rest);
     output
+}
+
+/// The first `$name` left after substitution, i.e. an undefined variable.
+fn first_unexpanded_variable(text: &str) -> Option<&str> {
+    let pos = text.find('$')?;
+    let end = pos + 1 + variable_name_len(&text[pos + 1..]);
+    Some(&text[pos..end])
+}
+
+/// A binding's key combination with modifier aliases and key case folded, so
+/// `Mod4+Q` and `super+q` compare equal.
+fn combo_identity(bind: &Keybind) -> (Vec<&'static str>, u32) {
+    let mut modifiers: Vec<&'static str> = bind
+        .modifiers
+        .iter()
+        .map(|modifier| match modifier.to_ascii_lowercase().as_str() {
+            "super" | "mod4" | "logo" => "logo",
+            "ctrl" | "control" => "ctrl",
+            "alt" | "mod1" => "alt",
+            _ => "shift",
+        })
+        .collect();
+    modifiers.sort_unstable();
+    modifiers.dedup();
+    let key = xkb::keysym_from_name(&bind.key.to_ascii_lowercase(), xkb::KEYSYM_CASE_INSENSITIVE);
+    (modifiers, key.raw())
+}
+
+/// Whether the line's text is (or ends in) a shell command, which must reach
+/// the shell untouched.
+fn is_command_line(line: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    match tokens.next() {
+        Some("exec" | "exec_once" | "autostart" | "lock_command") => true,
+        // `exec`/`spawn`, or a bare command (anything that is not a built-in).
+        Some("bind" | "bindsym") => tokens
+            .nth(1)
+            .is_some_and(|action| !BUILTIN_ACTIONS.contains(&action)),
+        _ => false,
+    }
+}
+
+fn is_binding(line: &str) -> bool {
+    matches!(line.split_whitespace().next(), Some("bind" | "bindsym"))
+}
+
+/// Drop a trailing `# comment`. The `#` must follow whitespace and be followed
+/// by whitespace or the end of the line, so colors like `#5588ff` survive.
+fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if byte != b'#' || idx == 0 || !bytes[idx - 1].is_ascii_whitespace() {
+            continue;
+        }
+        if bytes.get(idx + 1).is_none_or(u8::is_ascii_whitespace) {
+            return line[..idx].trim_end();
+        }
+    }
+    line
 }
 
 fn expect_single_argument<'a>(
@@ -451,6 +660,27 @@ fn parse_keybind(rest: &str, line_no: usize) -> Result<Keybind, ConfigError> {
     }
 
     let key = combo_parts.pop().unwrap().to_string();
+    for modifier in &combo_parts {
+        if !KNOWN_MODIFIERS.contains(&modifier.to_ascii_lowercase().as_str()) {
+            return Err(ConfigError::Parse {
+                line: line_no,
+                message: format!(
+                    "unknown modifier '{}': expected super/mod4/logo, shift, ctrl/control or alt/mod1",
+                    modifier
+                ),
+            });
+        }
+    }
+    if xkb::keysym_from_name(&key, xkb::KEYSYM_CASE_INSENSITIVE).raw() == xkb::keysyms::KEY_NoSymbol
+    {
+        return Err(ConfigError::Parse {
+            line: line_no,
+            message: format!(
+                "unknown key '{}' (use an XKB keysym name such as Return or F1)",
+                key
+            ),
+        });
+    }
     let modifiers = combo_parts.into_iter().map(ToString::to_string).collect();
     let action = parse_action(action_text, line_no)?;
 
@@ -512,6 +742,16 @@ fn parse_action(action_text: &str, line_no: usize) -> Result<Action, ConfigError
             }
             Ok(Action::MoveToWorkspace(workspace))
         }
+        // A lone unknown word is almost always a misspelled action
+        // (`fulscreen`), so reject it rather than trying to run it. Anything
+        // longer is a bare command, kept for compatibility (prefer `exec`).
+        other if !action_text.contains(char::is_whitespace) => Err(ConfigError::Parse {
+            line: line_no,
+            message: format!(
+                "unknown action '{}': to run a program write 'exec {}'",
+                other, action_text
+            ),
+        }),
         _ => Ok(Action::Spawn(action_text.to_string())),
     }
 }

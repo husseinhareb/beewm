@@ -8,7 +8,7 @@ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, ImportAll, ImportMem, Offscreen, Renderer, Texture,
+    Bind, Color32F, ExportMem, Frame, ImportAll, ImportMem, Offscreen, Renderer,
 };
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
@@ -254,7 +254,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, (), Beewm> for Beewm {
 pub(crate) fn process_pending_screencopies<R>(state: &mut Beewm, renderer: &mut R, output: &Output)
 where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
-    R::TextureId: Texture + Clone + Send + 'static,
+    R: Renderer<TextureId = GlesTexture>,
     R::Error: std::fmt::Debug,
 {
     // Fail and drop any frames whose output is no longer mapped (unplugged
@@ -294,7 +294,7 @@ where
 fn process_screencopy_frame<R>(state: &mut Beewm, renderer: &mut R, pending: PendingScreencopyFrame)
 where
     R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
-    R::TextureId: Texture + Clone + Send + 'static,
+    R: Renderer<TextureId = GlesTexture>,
     R::Error: std::fmt::Debug,
 {
     let Some(buffer) = pending.buffer.clone() else {
@@ -370,7 +370,7 @@ fn screencopy_render_elements<R>(
 ) -> Vec<ScreencopyRenderElement<R>>
 where
     R: Renderer + ImportAll + ImportMem,
-    R::TextureId: Texture + Clone + Send + 'static,
+    R: Renderer<TextureId = GlesTexture>,
 {
     // A locked session must never be captured. The render path in the backend
     // already drops everything but the lock surface (see `render_surface`);

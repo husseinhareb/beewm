@@ -85,6 +85,21 @@ use super::state::popup::classify_toplevel_floating;
 /// Classify the buffer a surface just committed (for the `beewm::dmabuf` /
 /// `beewm::commit` traces). Reads `current()` because beewm's `commit()` runs
 /// after smithay has already promoted the pending state.
+/// True when this commit detaches the surface's buffer (`attach(null)`). Only
+/// meaningful before `on_commit_buffer_handler` consumes the assignment.
+fn commits_null_buffer(surface: &WlSurface) -> bool {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        matches!(
+            states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                .current()
+                .buffer,
+            Some(smithay::wayland::compositor::BufferAssignment::Removed)
+        )
+    })
+}
+
 fn committed_buffer_kind(surface: &WlSurface) -> BufferKind {
     with_states(surface, |states| {
         match states
@@ -206,6 +221,16 @@ impl CompositorHandler for Beewm {
         }
 
         self.popup_manager.commit(surface);
+
+        // A mapped toplevel committing a null buffer is about to be unmapped.
+        // `on_commit_buffer_handler` below drops the textures the renderer
+        // imported for it, so the close animation has to snapshot them now.
+        if self.mapped_with_buffer.contains(surface)
+            && commits_null_buffer(surface)
+            && let Some(window) = self.mapped_window_for_surface(surface)
+        {
+            self.begin_close_animation(&window);
+        }
 
         // Process buffer attachment for the surface tree — required for
         // the renderer to see committed wl_buffer contents.

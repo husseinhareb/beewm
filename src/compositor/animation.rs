@@ -21,12 +21,13 @@
 //!   previous visual rectangle to the new tile. Rendered with `Stretch` so the
 //!   client buffer is scaled into the interpolated rectangle (no gaps while the
 //!   client catches up to the new configured size).
-//! * [`WindowAnimationKind::Close`] — reserved. A true closing animation needs
-//!   a GPU snapshot of the surface that outlives the destroyed client buffer,
-//!   which Smithay does not provide out of the box; see the module docs in
-//!   `render.rs` and the README of this change for the limitation. We still get
-//!   the "remaining windows expand into the freed space" half of the effect for
-//!   free via `GeometryChange` on the surviving windows.
+//! * [`WindowAnimationKind::Close`] — a closing tiled window shrinks back
+//!   toward its top-left corner and fades out. The client's buffers are about
+//!   to go away, so at close time we keep clones of the GPU textures Smithay
+//!   already imported for its surface tree (see [`snapshot_surface_tree`]) and
+//!   render those as a "ghost" ([`ClosingWindow`]) until the animation ends.
+//!   The ghost sits at the bottom of the window stack, so the surviving
+//!   windows' `GeometryChange` animations grow over it into the freed space.
 //!
 //! Everything here is keyed by the *root* `WlSurface` of a window so the state
 //! survives buffer commits and is trivially pruned when the surface dies.
@@ -34,8 +35,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use smithay::backend::renderer::ContextId;
+use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::gles::GlesTexture;
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{IsAlive, Logical, Rectangle};
+use smithay::utils::{IsAlive, Logical, Point, Rectangle, Size, Transform};
+use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
 
 use crate::config::Config;
 
@@ -154,6 +160,102 @@ impl WindowAnimation {
     }
 }
 
+/// One surface (the root or a subsurface) of a closing window, frozen at the
+/// moment the window went away.
+#[derive(Debug, Clone)]
+pub struct SnapshotLayer {
+    /// Stable render element id, so the damage tracker sees one element
+    /// changing over the animation rather than a new one every frame.
+    pub id: Id,
+    pub texture: GlesTexture,
+    /// Where this surface sits relative to the window's geometry origin (the
+    /// top-left of the content rectangle the layout placed).
+    pub offset: Point<i32, Logical>,
+    /// Viewport source crop, in the buffer's logical coordinates.
+    pub src: Rectangle<f64, Logical>,
+    /// Logical size the surface is drawn at.
+    pub size: Size<i32, Logical>,
+    pub buffer_scale: i32,
+    pub transform: Transform,
+}
+
+/// A window that has already left the layout but is still being drawn while
+/// its close animation runs. Layers are ordered front to back.
+#[derive(Debug, Clone)]
+pub struct ClosingWindow {
+    pub anim: WindowAnimation,
+    pub layers: Vec<SnapshotLayer>,
+}
+
+impl ClosingWindow {
+    /// The clip rectangle and opacity at `now`. Opacity follows the same eased
+    /// progress as the shrink, so the ghost is gone by the time it is tiny.
+    pub fn current(&self, now: Instant) -> (Rectangle<i32, Logical>, f32) {
+        let t = self.anim.easing.apply(self.anim.progress(now));
+        (lerp_rect(self.anim.from, self.anim.to, t), (1.0 - t) as f32)
+    }
+}
+
+/// Clone the textures the renderer identified by `context` has imported for
+/// every mapped surface in `root`'s tree. `origin` is where the root surface
+/// sits relative to the window's geometry origin (normally
+/// `-window.geometry().loc`).
+///
+/// Must run while the surfaces still hold their buffers: a null-buffer commit
+/// clears the imported textures in `on_commit_buffer_handler`. A surface the
+/// renderer never drew has no texture and is skipped, so the result can be
+/// empty. The clones keep the GPU textures alive after the client releases
+/// its buffers.
+pub fn snapshot_surface_tree(
+    root: &WlSurface,
+    context: &ContextId<GlesTexture>,
+    origin: Point<i32, Logical>,
+) -> Vec<SnapshotLayer> {
+    let mut layers = Vec::new();
+    // Same traversal and ordering as Smithay's
+    // `render_elements_from_surface_tree`, so the layers stack identically.
+    with_surface_tree_downward(
+        root,
+        origin,
+        |_, states, location| {
+            let view = states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .and_then(|data| data.lock().unwrap().view());
+            match view {
+                Some(view) => TraversalAction::DoChildren(*location + view.offset),
+                None => TraversalAction::SkipChildren,
+            }
+        },
+        |_, states, location| {
+            let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
+                return;
+            };
+            let data = data.lock().unwrap();
+            let Some(view) = data.view() else {
+                return;
+            };
+            let Some(texture) = data.texture::<GlesTexture>(context.clone()) else {
+                return;
+            };
+            if view.dst.w <= 0 || view.dst.h <= 0 {
+                return;
+            }
+            layers.push(SnapshotLayer {
+                id: Id::new(),
+                texture: texture.clone(),
+                offset: *location + view.offset,
+                src: view.src,
+                size: view.dst,
+                buffer_scale: data.buffer_scale(),
+                transform: data.buffer_transform(),
+            });
+        },
+        |_, _, _| true,
+    );
+    layers
+}
+
 /// The visual rectangle a window should currently be rendered into, plus how to
 /// fill it (reveal/clip vs. scale).
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +279,9 @@ pub struct AnimationManager {
     close_easing: Easing,
     layout_easing: Easing,
     anims: HashMap<WlSurface, WindowAnimation>,
+    /// Ghosts of closed windows still playing their close animation. Keyed by
+    /// the (possibly already dead) root so one window never gets two ghosts.
+    closing: HashMap<WlSurface, ClosingWindow>,
     /// Last target (resting) rectangle laid out for each tracked root. Used to
     /// tell "brand new window" from "geometry changed" in [`Self::reconcile`].
     targets: HashMap<WlSurface, Rectangle<i32, Logical>>,
@@ -199,6 +304,7 @@ impl AnimationManager {
             close_easing: Easing::EaseInOutCubic,
             layout_easing: Easing::EaseInOutCubic,
             anims: HashMap::new(),
+            closing: HashMap::new(),
             targets: HashMap::new(),
         };
         manager.update_from_config(config);
@@ -217,9 +323,15 @@ impl AnimationManager {
         self.open_duration = Duration::from_millis(config.open_animation_duration_ms);
         self.close_duration = Duration::from_millis(config.close_animation_duration_ms);
         self.layout_duration = Duration::from_millis(config.layout_animation_duration_ms);
-        if let Some(easing) = Easing::parse(&config.animation_easing) {
+        // The parser rejects unknown curve names, so `None` only happens for a
+        // hand-built `Config`; keep the current curve then.
+        if let Some(easing) = Easing::parse(&config.open_animation_easing) {
             self.open_easing = easing;
+        }
+        if let Some(easing) = Easing::parse(&config.close_animation_easing) {
             self.close_easing = easing;
+        }
+        if let Some(easing) = Easing::parse(&config.layout_animation_easing) {
             self.layout_easing = easing;
         }
     }
@@ -362,7 +474,63 @@ impl AnimationManager {
     }
 
     pub fn has_active(&self) -> bool {
-        !self.anims.is_empty()
+        !self.anims.is_empty() || !self.closing.is_empty()
+    }
+
+    /// Whether a close animation should be captured for `root` right now.
+    /// Cheap, so callers check it before doing the snapshot work.
+    pub fn wants_close(&self, root: &WlSurface) -> bool {
+        self.enabled
+            && self.close_enabled
+            && !self.close_duration.is_zero()
+            && !self.closing.contains_key(root)
+    }
+
+    /// Start a close animation for a window that is leaving the layout. `from`
+    /// is the rectangle it is currently drawn into; it shrinks toward that
+    /// rectangle's top-left. `layers` comes from [`snapshot_surface_tree`].
+    pub fn start_close(
+        &mut self,
+        root: &WlSurface,
+        from: Rectangle<i32, Logical>,
+        layers: Vec<SnapshotLayer>,
+        now: Instant,
+        app_id: &str,
+    ) {
+        if layers.is_empty() || !self.wants_close(root) {
+            return;
+        }
+        let to = open_start_rect(from);
+        tracing::debug!(
+            target = "beewm::animation",
+            id = root_id(root),
+            app_id,
+            ?from,
+            ?to,
+            layers = layers.len(),
+            duration_ms = self.close_duration.as_millis() as u64,
+            "starting window close animation",
+        );
+        self.closing.insert(
+            root.clone(),
+            ClosingWindow {
+                anim: WindowAnimation {
+                    kind: WindowAnimationKind::Close,
+                    from,
+                    to,
+                    started_at: now,
+                    duration: self.close_duration,
+                    easing: self.close_easing,
+                },
+                layers,
+            },
+        );
+    }
+
+    /// Ghosts of closed windows that are still animating, in no particular
+    /// order.
+    pub fn closing_windows(&self) -> impl Iterator<Item = &ClosingWindow> {
+        self.closing.values()
     }
 
     /// Drop animation + resting-target state for a root (window closed/unmapped
@@ -397,8 +565,10 @@ impl AnimationManager {
             }
             true
         });
+        // Ghosts outlive their surface on purpose; only time ends them.
+        self.closing.retain(|_, ghost| !ghost.anim.is_finished(now));
         self.targets.retain(|root, _| root.alive());
-        !self.anims.is_empty()
+        self.has_active()
     }
 }
 
@@ -530,6 +700,32 @@ mod tests {
             let r = anim.current_rect(now + Duration::from_millis(ms));
             assert_eq!(r.loc, from.loc);
         }
+    }
+
+    #[test]
+    fn closing_ghost_fades_out_as_it_shrinks() {
+        let from = rect(100, 50, 800, 600);
+        let now = Instant::now();
+        let ghost = ClosingWindow {
+            anim: WindowAnimation {
+                kind: WindowAnimationKind::Close,
+                from,
+                to: open_start_rect(from),
+                started_at: now,
+                duration: Duration::from_millis(150),
+                easing: Easing::Linear,
+            },
+            layers: Vec::new(),
+        };
+        let (start, start_alpha) = ghost.current(now);
+        assert_eq!(start, from);
+        assert_eq!(start_alpha, 1.0);
+        let (mid, mid_alpha) = ghost.current(now + Duration::from_millis(75));
+        assert_eq!(mid.loc, from.loc);
+        assert!(mid.size.w < from.size.w);
+        assert!((mid_alpha - 0.5).abs() < 1e-6);
+        let (_, end_alpha) = ghost.current(now + Duration::from_millis(150));
+        assert_eq!(end_alpha, 0.0);
     }
 
     #[test]

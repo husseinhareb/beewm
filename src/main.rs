@@ -149,7 +149,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load configuration
-    let config = Config::load()?;
+    // A broken config must never keep the session from starting: fall back to
+    // the defaults (which include a terminal binding to fix the file with).
+    // The compositor re-reads the file and shows the error once it is up.
+    let config = Config::load().unwrap_or_else(|error| {
+        tracing::error!("{}; starting with the default config", error);
+        Config::default().with_state_overrides()
+    });
     tracing::info!(
         "Config loaded: {} workspaces, border_width={}, gap={}, tray_enabled={}",
         config.num_workspaces,

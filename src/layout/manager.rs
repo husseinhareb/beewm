@@ -72,6 +72,11 @@ pub trait LayoutManager<Id: Clone + Eq + Hash + 'static>: Debug {
     /// focus cycling so it follows the visible layout instead of the
     /// workspace's window-insertion order.
     fn ordered_roots(&self, workspace: usize) -> Vec<Id>;
+
+    /// Grow or shrink the number of workspaces. Existing workspaces keep their
+    /// layout; new ones start empty with `split_ratio`. Callers move windows off
+    /// workspaces being dropped before shrinking.
+    fn set_workspace_count(&mut self, count: usize, split_ratio: f64);
 }
 
 impl<Id: Clone + Eq + Hash + 'static> Clone for Box<dyn LayoutManager<Id>> {
@@ -153,6 +158,11 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for DwindleManag
         for tree in &mut self.trees {
             tree.set_default_split_ratio(ratio);
         }
+    }
+
+    fn set_workspace_count(&mut self, count: usize, split_ratio: f64) {
+        self.trees
+            .resize_with(count, || DwindleTree::with_split_ratio(split_ratio));
     }
 
     fn ordered_roots(&self, workspace: usize) -> Vec<Id> {
@@ -312,6 +322,15 @@ impl<Id: Clone + Eq + Hash + Debug + 'static> LayoutManager<Id> for MasterStackM
         for ws in &mut self.workspaces {
             ws.master_ratio = sanitized;
         }
+    }
+
+    fn set_workspace_count(&mut self, count: usize, split_ratio: f64) {
+        let master_ratio = sanitize_ratio(split_ratio);
+        self.workspaces.resize_with(count, || MasterStackWorkspace {
+            order: Vec::new(),
+            master_ratio,
+            stack_weights: Vec::new(),
+        });
     }
 
     fn ordered_roots(&self, workspace: usize) -> Vec<Id> {
@@ -512,8 +531,40 @@ fn master_stack_ordered_geometries<Id>(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MASTER_RATIO, master_stack_ordered_geometries};
+    use super::{
+        DEFAULT_MASTER_RATIO, DwindleManager, LayoutManager, MasterStackManager,
+        master_stack_ordered_geometries,
+    };
     use crate::model::window::Geometry;
+
+    /// Growing keeps existing workspaces' windows and makes the new ones
+    /// usable; shrinking drops only the trailing workspaces.
+    fn check_workspace_resize(mut manager: Box<dyn LayoutManager<u32>>) {
+        manager.insert(0, None, 1);
+        manager.insert(1, None, 2);
+
+        manager.set_workspace_count(4, 0.5);
+        assert_eq!(manager.ordered_roots(0), vec![1]);
+        assert_eq!(manager.ordered_roots(1), vec![2]);
+        manager.insert(3, None, 3);
+        assert_eq!(manager.ordered_roots(3), vec![3]);
+
+        manager.remove(3, &3);
+        manager.set_workspace_count(2, 0.5);
+        assert_eq!(manager.ordered_roots(0), vec![1]);
+        assert_eq!(manager.ordered_roots(1), vec![2]);
+        assert!(manager.ordered_roots(3).is_empty());
+    }
+
+    #[test]
+    fn dwindle_workspace_count_can_change() {
+        check_workspace_resize(Box::new(DwindleManager::new(2, 0.5)));
+    }
+
+    #[test]
+    fn master_stack_workspace_count_can_change() {
+        check_workspace_resize(Box::new(MasterStackManager::new(2, 0.5)));
+    }
 
     fn stack(screen: &Geometry, count: usize, ratio: f64) -> Vec<Geometry> {
         let ids: Vec<usize> = (0..count).collect();

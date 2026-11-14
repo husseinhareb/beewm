@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_WORKSPACE_KEYS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
 const DEFAULT_KEYBOARD_LAYOUT: &str = "us";
+/// Upper bound for `gap` / `border_width`, far past any sane value but small
+/// enough that the compositor's `i32` geometry math never wraps.
+const MAX_PIXELS: u32 = 1000;
+const MAX_REFRESH_HZ: u32 = 1000;
+const MAX_REPEAT_RATE: u32 = 1000;
+/// Upper bound for animation durations and `repeat_delay`, in milliseconds.
+const MAX_ANIMATION_OR_REPEAT_MS: u32 = 10_000;
 
 /// A keybinding definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +109,16 @@ pub struct Config {
     pub tap_to_click: bool,
     pub natural_scroll: bool,
     pub keyboard_layout: String,
+    /// XKB variants, one per layout (comma separated); empty for the default.
+    pub keyboard_variant: String,
+    /// XKB options such as `caps:escape,grp:alt_shift_toggle`; empty for none.
+    pub keyboard_options: String,
+    /// XKB keyboard model; empty for the XKB default.
+    pub keyboard_model: String,
+    /// Milliseconds a key is held before it starts repeating.
+    pub repeat_delay: u32,
+    /// Key repeats per second while held; `0` disables repeat.
+    pub repeat_rate: u32,
     pub refresh_rate: Option<u32>,
     /// Publish the settings tray icon as a StatusNotifierItem on the session bus.
     /// On by default; disable with
@@ -132,7 +149,7 @@ pub struct Config {
     pub enable_animations: bool,
     /// Animate newly mapped tiled windows (expand from top-left).
     pub window_open_animation: bool,
-    /// Reserved closing animation toggle (see animation module limitations).
+    /// Animate closing tiled windows (shrink toward top-left and fade out).
     pub window_close_animation: bool,
     /// Animate tiled windows when the layout reassigns their geometry.
     pub layout_animation: bool,
@@ -141,8 +158,11 @@ pub struct Config {
     pub open_animation_duration_ms: u64,
     pub close_animation_duration_ms: u64,
     pub layout_animation_duration_ms: u64,
-    /// Easing curve name: linear | ease_in | ease_out | ease_in_out.
-    pub animation_easing: String,
+    /// Easing curve names (linear | ease_in | ease_out | ease_in_out), one per
+    /// animation kind. `animation_easing` in the config file sets all three.
+    pub open_animation_easing: String,
+    pub close_animation_easing: String,
+    pub layout_animation_easing: String,
 }
 
 impl Default for Config {
@@ -160,6 +180,11 @@ impl Default for Config {
             tap_to_click: true,
             natural_scroll: false,
             keyboard_layout: DEFAULT_KEYBOARD_LAYOUT.to_string(),
+            keyboard_variant: String::new(),
+            keyboard_options: String::new(),
+            keyboard_model: String::new(),
+            repeat_delay: 200,
+            repeat_rate: 25,
             refresh_rate: None,
             tray_enabled: true,
             screen_timeout: 600,
@@ -178,7 +203,9 @@ impl Default for Config {
             open_animation_duration_ms: 180,
             close_animation_duration_ms: 150,
             layout_animation_duration_ms: 200,
-            animation_easing: "ease_out".to_string(),
+            open_animation_easing: "ease_out".to_string(),
+            close_animation_easing: "ease_in_out".to_string(),
+            layout_animation_easing: "ease_in_out".to_string(),
         }
     }
 }
@@ -308,10 +335,93 @@ impl Config {
     /// If it does not exist, write a starter config first. Runtime settings
     /// changed from the tray (`state.conf`) are layered on top.
     pub fn load() -> Result<Self, ConfigError> {
-        let path = Self::config_path();
-        let mut config = Self::load_from_path(&path)?;
-        config.apply_state_overrides();
-        Ok(config)
+        Ok(Self::load_base()?.with_state_overrides())
+    }
+
+    /// Load only the hand-edited config file, without the `state.conf` overlay.
+    pub fn load_base() -> Result<Self, ConfigError> {
+        Self::load_from_path(&Self::config_path())
+    }
+
+    /// This config with the `state.conf` overlay applied on top.
+    pub fn with_state_overrides(self) -> Self {
+        self.with_overrides(&Self::read_state_overrides())
+    }
+
+    /// This config with `overrides` applied on top.
+    pub fn with_overrides(mut self, overrides: &StateOverrides) -> Self {
+        if let Some(gap) = overrides.gap {
+            self.gap = gap;
+        }
+        if let Some(secs) = overrides.screen_timeout {
+            self.screen_timeout = secs;
+        }
+        for (name, mode) in &overrides.output_modes {
+            self.set_output_mode_override(name.clone(), *mode);
+        }
+        self
+    }
+
+    /// The `output <name> mode` spec configured for `name`, if any.
+    pub fn output_mode_for(&self, name: &str) -> Option<OutputModeSpec> {
+        self.outputs
+            .iter()
+            .find(|output| output.name == name)
+            .and_then(|output| output.mode)
+    }
+
+    /// Drop the overrides in `overrides` that a config edit (`old_base` to
+    /// `new_base`) has superseded. The hand-edited config is the source of
+    /// truth: editing a key in it beats an older tray choice for that key.
+    /// Returns whether anything was dropped.
+    pub fn drop_superseded_overrides(
+        old_base: &Config,
+        new_base: &Config,
+        overrides: &mut StateOverrides,
+    ) -> bool {
+        let mut changed = false;
+        if old_base.gap != new_base.gap && overrides.gap.take().is_some() {
+            changed = true;
+        }
+        if old_base.screen_timeout != new_base.screen_timeout
+            && overrides.screen_timeout.take().is_some()
+        {
+            changed = true;
+        }
+        let superseded = Self::superseded_runtime_modes(
+            old_base,
+            new_base,
+            overrides.output_modes.iter().map(|(name, _)| name.as_str()),
+        );
+        if !superseded.is_empty() {
+            overrides
+                .output_modes
+                .retain(|(name, _)| !superseded.contains(name));
+            changed = true;
+        }
+        changed
+    }
+
+    /// Which of the runtime (tray) mode overrides in `runtime_names` a config
+    /// edit has superseded. The hand-edited config is the source of truth: when
+    /// the mode it asks for changes between `old_base` and `new_base` (the
+    /// output's own `mode`, or the global `refresh_rate` for an output without
+    /// one), the stale tray choice must give way so the edit takes effect.
+    pub fn superseded_runtime_modes<'a>(
+        old_base: &Config,
+        new_base: &Config,
+        runtime_names: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<String> {
+        runtime_names
+            .into_iter()
+            .filter(|name| {
+                let old_spec = old_base.output_mode_for(name);
+                let new_spec = new_base.output_mode_for(name);
+                old_spec != new_spec
+                    || (new_spec.is_none() && old_base.refresh_rate != new_base.refresh_rate)
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// Path of the machine-managed runtime-settings overlay written by the tray.
@@ -325,28 +435,11 @@ impl Config {
         path
     }
 
-    /// Overlay the small set of tray-settable keys from `state.conf`, if present.
-    fn apply_state_overrides(&mut self) {
-        let Ok(contents) = std::fs::read_to_string(Self::state_path()) else {
-            return;
-        };
-        let overrides = parse_state_overrides(&contents);
-        if let Some(gap) = overrides.gap {
-            self.gap = gap;
-        }
-        if let Some(secs) = overrides.screen_timeout {
-            self.screen_timeout = secs;
-        }
-        for (name, mode) in overrides.output_modes {
-            self.set_output_mode_override(name, mode);
-        }
-    }
-
-    pub fn runtime_output_modes() -> Vec<(String, OutputModeSpec)> {
-        let Ok(contents) = std::fs::read_to_string(Self::state_path()) else {
-            return Vec::new();
-        };
-        parse_state_overrides(&contents).output_modes
+    /// The tray-written overrides currently in `state.conf` (empty if absent).
+    pub fn read_state_overrides() -> StateOverrides {
+        std::fs::read_to_string(Self::state_path())
+            .map(|contents| parse_state_overrides(&contents))
+            .unwrap_or_default()
     }
 
     pub fn set_output_mode_override(&mut self, name: String, mode: OutputModeSpec) {
@@ -364,22 +457,23 @@ impl Config {
 
     /// Persist the tray-settable runtime values to `state.conf` (best-effort).
     /// Called when the tray changes a setting so it survives a restart.
-    pub fn write_state_overrides(
-        gap: u32,
-        screen_timeout: u32,
-        output_modes: &[(String, OutputModeSpec)],
-    ) {
+    pub fn write_state_overrides(overrides: &StateOverrides) {
         let path = Self::state_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut contents = format!(
-            "# beewm runtime settings — written by the settings tray.\n\
-             # Overrides the matching keys in your main config; delete to revert.\n\
-             gap {gap}\n\
-             screen_timeout {screen_timeout}\n",
+        let mut contents = String::from(
+            "# beewm runtime settings, written by the settings tray.\n\
+             # Overrides the matching keys in your main config until you edit\n\
+             # that key there; delete this file to revert.\n",
         );
-        let mut output_modes = output_modes.to_vec();
+        if let Some(gap) = overrides.gap {
+            contents.push_str(&format!("gap {gap}\n"));
+        }
+        if let Some(secs) = overrides.screen_timeout {
+            contents.push_str(&format!("screen_timeout {secs}\n"));
+        }
+        let mut output_modes = overrides.output_modes.clone();
         output_modes.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         for (name, mode) in output_modes {
             let refresh = mode.refresh.map(|hz| format!("@{hz}")).unwrap_or_default();
@@ -441,6 +535,10 @@ impl Config {
         text.push_str(&format!("tap_to_click {}\n", default.tap_to_click));
         text.push_str(&format!("natural_scroll {}\n", default.natural_scroll));
         text.push_str(&format!("keyboard_layout {}\n", default.keyboard_layout));
+        text.push_str("# keyboard_variant intl\n");
+        text.push_str("# keyboard_options caps:escape,grp:alt_shift_toggle\n");
+        text.push_str(&format!("repeat_delay {}\n", default.repeat_delay));
+        text.push_str(&format!("repeat_rate {}\n", default.repeat_rate));
         text.push_str("# refresh_rate 165   # set display refresh rate in Hz (default: use monitor preferred)\n");
         text.push('\n');
         text.push_str("# Settings tray: publishes a StatusNotifierItem for your tray host.\n");
@@ -497,10 +595,19 @@ impl Config {
             "layout_animation_duration_ms {}\n",
             default.layout_animation_duration_ms
         ));
-        text.push_str("# animation_easing: linear | ease_in | ease_out | ease_in_out\n");
+        text.push_str("# Easing: linear | ease_in | ease_out | ease_in_out\n");
+        text.push_str("# (animation_easing <curve> sets all three at once)\n");
         text.push_str(&format!(
-            "animation_easing {}\n\n",
-            default.animation_easing
+            "open_animation_easing {}\n",
+            default.open_animation_easing
+        ));
+        text.push_str(&format!(
+            "close_animation_easing {}\n",
+            default.close_animation_easing
+        ));
+        text.push_str(&format!(
+            "layout_animation_easing {}\n\n",
+            default.layout_animation_easing
         ));
         text.push_str("# Start commands once when beewm launches.\n");
         text.push_str("# exec waybar\n");
@@ -515,6 +622,7 @@ impl Config {
         text.push_str("bindsym $mod+Shift+e exit\n");
         text.push_str("bindsym $mod+f fullscreen\n");
         text.push_str("bindsym $mod+v float\n");
+        text.push_str("bindsym $mod+s sticky\n");
         for (index, key) in DEFAULT_WORKSPACE_KEYS
             .iter()
             .copied()
@@ -545,6 +653,54 @@ impl Config {
         path
     }
 
+    /// The XKB keymap names this config asks for.
+    pub fn xkb_config(&self) -> smithay::input::keyboard::XkbConfig<'_> {
+        smithay::input::keyboard::XkbConfig {
+            rules: "",
+            model: &self.keyboard_model,
+            layout: &self.keyboard_layout,
+            variant: &self.keyboard_variant,
+            options: (!self.keyboard_options.is_empty()).then(|| self.keyboard_options.clone()),
+        }
+    }
+
+    /// Whether any XKB keymap setting differs from `other`.
+    pub fn keymap_differs(&self, other: &Config) -> bool {
+        self.keyboard_layout != other.keyboard_layout
+            || self.keyboard_variant != other.keyboard_variant
+            || self.keyboard_options != other.keyboard_options
+            || self.keyboard_model != other.keyboard_model
+    }
+
+    /// A warning when the config file (or the directory holding it) can be
+    /// modified by other users. The config runs commands as you (`exec`,
+    /// bindings), so that would let them run code in your session.
+    pub fn insecure_permissions_warning(path: &Path) -> Option<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let resolved = std::fs::canonicalize(path).ok()?;
+        let mut writable = Vec::new();
+        for candidate in [Some(resolved.as_path()), resolved.parent()]
+            .into_iter()
+            .flatten()
+        {
+            let Ok(metadata) = std::fs::metadata(candidate) else {
+                continue;
+            };
+            if metadata.permissions().mode() & 0o022 != 0 {
+                writable.push(candidate.display().to_string());
+            }
+        }
+        if writable.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} can be modified by other users, who could then run commands in your session; \
+             fix with: chmod go-w {}",
+            writable.join(" and "),
+            writable.join(" "),
+        ))
+    }
+
     fn validate(self) -> Result<Self, ConfigError> {
         if self.num_workspaces == 0 {
             return Err(ConfigError::Parse {
@@ -553,10 +709,54 @@ impl Config {
             });
         }
 
-        if !self.split_ratio.is_finite() || !(0.0..=1.0).contains(&self.split_ratio) {
+        let out_of_range = |message: String| Err(ConfigError::Parse { line: 0, message });
+        if self.gap > MAX_PIXELS {
+            return out_of_range(format!("gap must be at most {MAX_PIXELS}"));
+        }
+        if self.border_width > MAX_PIXELS {
+            return out_of_range(format!("border_width must be at most {MAX_PIXELS}"));
+        }
+        if let Some(hz) = self.refresh_rate
+            && !(1..=MAX_REFRESH_HZ).contains(&hz)
+        {
+            return out_of_range(format!(
+                "refresh_rate must be between 1 and {MAX_REFRESH_HZ}"
+            ));
+        }
+        if self.repeat_delay > MAX_ANIMATION_OR_REPEAT_MS {
+            return out_of_range(format!(
+                "repeat_delay must be at most {MAX_ANIMATION_OR_REPEAT_MS}"
+            ));
+        }
+        if self.repeat_rate > MAX_REPEAT_RATE {
+            return out_of_range(format!("repeat_rate must be at most {MAX_REPEAT_RATE}"));
+        }
+        for (name, ms) in [
+            (
+                "open_animation_duration_ms",
+                self.open_animation_duration_ms,
+            ),
+            (
+                "close_animation_duration_ms",
+                self.close_animation_duration_ms,
+            ),
+            (
+                "layout_animation_duration_ms",
+                self.layout_animation_duration_ms,
+            ),
+        ] {
+            if ms > u64::from(MAX_ANIMATION_OR_REPEAT_MS) {
+                return out_of_range(format!(
+                    "{name} must be at most {MAX_ANIMATION_OR_REPEAT_MS}"
+                ));
+            }
+        }
+
+        // The extremes would give one side of every split zero width.
+        if !self.split_ratio.is_finite() || !(0.05..=0.95).contains(&self.split_ratio) {
             return Err(ConfigError::Parse {
                 line: 0,
-                message: "split_ratio must be a finite value between 0.0 and 1.0".into(),
+                message: "split_ratio must be between 0.05 and 0.95".into(),
             });
         }
 
@@ -583,11 +783,13 @@ impl Config {
 }
 
 /// The subset of settings the tray can persist to `state.conf`.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct StateOverrides {
-    gap: Option<u32>,
-    screen_timeout: Option<u32>,
-    output_modes: Vec<(String, OutputModeSpec)>,
+/// Each key is optional: only values the tray actually set are written, so
+/// everything else keeps following the hand-edited config.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateOverrides {
+    pub gap: Option<u32>,
+    pub screen_timeout: Option<u32>,
+    pub output_modes: Vec<(String, OutputModeSpec)>,
 }
 
 /// Parse the tiny `state.conf` overlay (a few `key value` lines). Unknown keys

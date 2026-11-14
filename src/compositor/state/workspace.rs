@@ -4,6 +4,7 @@ use crate::config::FocusDirection;
 
 use super::Beewm;
 use super::focus::best_directional_focus_candidate;
+use crate::model::workspace::Workspace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloatToggleTransition {
@@ -244,6 +245,114 @@ impl Beewm {
             })
             .collect();
         best_directional_focus_candidate(current, candidates, direction)
+    }
+
+    /// Change the number of workspaces live (config reload of `workspaces`).
+    ///
+    /// Growing appends empty workspaces. Shrinking first moves any output
+    /// showing a dropped workspace onto a free surviving one, then moves every
+    /// window from the dropped workspaces onto the last surviving workspace.
+    /// Refuses to go below the number of outputs, since each output must show
+    /// its own workspace. Returns whether the count was applied.
+    pub(crate) fn set_workspace_count(&mut self, count: usize, split_ratio: f64) -> bool {
+        let old = self.workspaces.len();
+        if count == old {
+            return true;
+        }
+        if count == 0 || count < self.outputs.len() {
+            tracing::warn!(
+                "workspaces {} is fewer than the {} connected outputs; keeping {}",
+                count,
+                self.outputs.len(),
+                old,
+            );
+            return false;
+        }
+        self.cancel_active_grab();
+
+        if count < old {
+            // Re-point outputs that show a dropped workspace. Reuses the normal
+            // switch path so sticky windows, fullscreen and mapping all behave
+            // exactly like a user-initiated workspace switch.
+            let original_focus = self.focused_output;
+            for out in 0..self.outputs.len() {
+                if self.outputs[out].active_workspace < count {
+                    continue;
+                }
+                let shown: Vec<usize> = self
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx != out)
+                    .map(|(_, ctx)| ctx.active_workspace)
+                    .collect();
+                let replacement = super::output::pick_initial_workspace(&shown, count);
+                self.focused_output = out;
+                self.show_workspace_on_focused_output(replacement);
+            }
+            self.focused_output = original_focus;
+
+            // Every dropped workspace is now hidden. Fold its windows into the
+            // last surviving workspace.
+            let target = count - 1;
+            let map_into_view = self.output_showing_workspace(target).is_some()
+                && self.workspaces[target].fullscreen.is_none();
+            for ws in count..old {
+                self.exit_fullscreen_on_workspace(ws, false);
+                let windows = std::mem::take(&mut self.workspaces[ws].windows);
+                for window in windows {
+                    let root = Self::window_root_surface(&window);
+                    if let Some(root) = root.as_ref() {
+                        self.remove_tiled_window(ws, root);
+                    }
+                    // Keep the target's own focus rather than handing it to
+                    // whatever window was folded in last.
+                    let focused = self.workspaces[target].focused_idx;
+                    let split_target = self.focused_tiled_window_root(target);
+                    self.workspaces[target].add_window(window.clone());
+                    if focused.is_some() {
+                        self.workspaces[target].focused_idx = focused;
+                    }
+                    self.insert_tiled_window(target, &window, split_target.as_ref());
+                    if map_into_view && self.space.element_geometry(&window).is_none() {
+                        let position = root
+                            .and_then(|root| self.floating_windows.get(&root).map(|f| f.position))
+                            .unwrap_or_else(|| (0, 0).into());
+                        self.space.map_element(window, position, false);
+                    }
+                }
+            }
+            self.workspaces.truncate(count);
+            tracing::info!(
+                "Workspaces reduced {} -> {}; windows moved to workspace {}",
+                old,
+                count,
+                count,
+            );
+        } else {
+            self.workspaces.resize_with(count, Workspace::new);
+            tracing::info!("Workspaces increased {} -> {}", old, count);
+        }
+
+        self.layout_manager.set_workspace_count(count, split_ratio);
+        self.publish_workspace_state();
+        self.relayout();
+        self.raise_sticky_windows();
+
+        // Showing replacement workspaces may have moved keyboard focus to
+        // another output; return it to the focused output's window.
+        let ws = self.active_workspace();
+        let focus = self.workspaces[ws]
+            .fullscreen
+            .clone()
+            .or_else(|| {
+                self.workspaces[ws]
+                    .focused_idx
+                    .and_then(|idx| self.workspaces[ws].windows.get(idx).cloned())
+            })
+            .and_then(|window| window.wl_surface().map(|surface| surface.into_owned()));
+        self.set_keyboard_focus(focus);
+        true
     }
 
     /// Move the focused window to another workspace (which may be homed on a
