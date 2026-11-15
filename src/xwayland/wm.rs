@@ -64,6 +64,11 @@ impl Beewm {
                 if surface.is_fullscreen()
                     || self.x11_surface_covers_output(workspace_idx, &surface)
                 {
+                    let asked =
+                        surface.is_fullscreen() || self.pending_x11_fullscreen.contains(&surface);
+                    if !asked && !self.x11_auto_fullscreen.contains(&surface) {
+                        self.x11_auto_fullscreen.push(surface.clone());
+                    }
                     self.insert_tiled_window(workspace_idx, &window, split_target.as_ref());
                     self.pending_x11_fullscreen
                         .retain(|pending| pending != &surface);
@@ -247,6 +252,27 @@ impl Beewm {
         true
     }
 
+    /// The tile the layout assigned a mapped X11 window, which the client does
+    /// not get to change. `None` for floating, fullscreen and unmanaged
+    /// windows, whose requests are honoured: fullscreen in particular, since a
+    /// game switching to a lower resolution must be able to resize to the
+    /// emulated mode for Xwayland to scale it up.
+    fn layout_owned_x11_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.windows.contains(window))?;
+        let root = Self::window_root_surface(window)?;
+        if self.is_root_floating(&root)
+            || self.workspaces[ws_idx].fullscreen.as_ref() == Some(window)
+        {
+            return None;
+        }
+        // `relayout` records the exact rectangle it configured as the resting
+        // animation target, so this is the tile even mid-animation.
+        self.animations.resting_target(&root)
+    }
+
     /// Whether `surface` covers the output that is currently showing workspace
     /// `ws_idx`. Resolved per-workspace so a game on a second monitor is
     /// measured against *that* monitor, not the focused one.
@@ -264,6 +290,7 @@ impl Beewm {
         let _ = self.take_pending_x11_window(surface);
         self.pending_x11_fullscreen
             .retain(|pending| pending != surface);
+        self.x11_auto_fullscreen.retain(|auto| auto != surface);
 
         let Some((workspace_idx, window_idx)) =
             self.workspaces
@@ -582,6 +609,33 @@ impl XwmHandler for Beewm {
             .and_then(Self::window_root_surface)
             .and_then(|root| self.floating_windows.get(&root).copied());
 
+        // A tiled window's geometry belongs to the layout. Granting the request
+        // (VLC resizes itself to the video's native size when playback starts)
+        // leaves the X window bigger than its tile, and the renderer then crops
+        // it to the tile: half the video and the controls disappear. Deny it
+        // the ICCCM way: configure the window to the geometry it already has,
+        // which also sends the synthetic ConfigureNotify that tells the client
+        // its real size.
+        if let Some(mapped) = mapped.as_ref()
+            && floating.is_none()
+            && let Some(owned) = self.layout_owned_x11_geometry(mapped)
+        {
+            tracing::debug!(
+                target: "beewm::xwayland",
+                title = %window.title(),
+                ?x,
+                ?y,
+                ?w,
+                ?h,
+                tile = ?owned,
+                "denied X11 configure request for tiled window",
+            );
+            if let Err(error) = window.configure(owned) {
+                tracing::warn!("Failed to re-assert X11 window geometry: {}", error);
+            }
+            return;
+        }
+
         let mut geometry = mapped
             .as_ref()
             .and_then(|window| self.space.element_geometry(window))
@@ -657,33 +711,25 @@ impl XwmHandler for Beewm {
             // (which may include a client-side request we already rejected
             // in configure_request) — re-anchoring here would let the
             // dialog snap back to its preferred origin.
-            let stored_pos = self
-                .floating_windows
-                .get(&root)
-                .copied()
-                .map(|data| data.position)
-                .unwrap_or(geometry.loc);
-
-            let output = self
-                .output_for_window(&mapped)
-                .or_else(|| self.focused_output());
-            let mut final_pos = stored_pos;
-            if let Some(output) = output
-                && let Some(usable) = self.floating_usable_rect_for(&output)
-            {
-                final_pos = crate::compositor::state::clamp_into_usable(
-                    final_pos,
-                    geometry.size,
-                    usable,
-                    crate::compositor::state::ONSCREEN_MARGIN,
-                );
-            }
-
-            self.floating_windows.insert(
-                root,
-                crate::compositor::types::FloatingWindowData::new(final_pos, geometry.size),
+            let current = self.floating_windows.get(&root).copied().unwrap_or(
+                crate::compositor::types::FloatingWindowData::new(geometry.loc, geometry.size),
             );
-            self.space.map_element(mapped, final_pos, false);
+            let mut data = if current.size == geometry.size {
+                current
+            } else {
+                self.resized_floating_data(&mapped, &root, current, geometry.size)
+            };
+            // The X window's size is what it is; only the position is ours.
+            data.size = geometry.size;
+            let final_pos = data.position;
+
+            self.floating_windows.insert(root, data);
+            self.space.map_element(mapped.clone(), final_pos, false);
+            if final_pos != current.position {
+                // We just re-centered it: tell the X server too, so input and
+                // override-redirect menus line up with what is drawn.
+                let _ = window.configure(Rectangle::new(final_pos, geometry.size));
+            }
             self.raise_floating_windows();
             self.needs_render = true;
         }
@@ -709,6 +755,9 @@ impl XwmHandler for Beewm {
             has_wl_surface = window.wl_surface().is_some(),
             "X11 fullscreen_request",
         );
+        // It asked: from now on it also gets to leave fullscreen when it asks.
+        self.x11_auto_fullscreen
+            .retain(|surface| surface != &window);
         if !self.apply_x11_fullscreen(&window) {
             // Window not yet in a workspace — typical for games that emit
             // _NET_WM_STATE_FULLSCREEN in the same dispatch batch as their
@@ -746,8 +795,14 @@ impl XwmHandler for Beewm {
 
         // Games that drop _NET_WM_STATE_FULLSCREEN while still covering the
         // whole output are kept fullscreen. That only makes sense while the
-        // window is actually on screen to cover it.
-        if self.output_showing_workspace(ws_idx).is_some()
+        // window is actually on screen to cover it, and only for windows *we*
+        // fullscreened because they mapped covering the output. A window that
+        // asked for fullscreen itself (VLC, mpv, a browser video) always covers
+        // the output while fullscreen, since we sized it to; ignoring its
+        // unfullscreen would trap it there.
+        let auto_fullscreened = self.x11_auto_fullscreen.contains(&window);
+        if auto_fullscreened
+            && self.output_showing_workspace(ws_idx).is_some()
             && self.x11_surface_covers_output(ws_idx, &window)
         {
             tracing::info!(
@@ -763,6 +818,8 @@ impl XwmHandler for Beewm {
         }
 
         // `exit_fullscreen_on_workspace` clears the hint on the X11 surface.
+        self.x11_auto_fullscreen
+            .retain(|surface| surface != &window);
         self.exit_fullscreen_on_workspace(ws_idx, true);
     }
 

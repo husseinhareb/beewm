@@ -528,6 +528,32 @@ impl AnimationManager {
         );
     }
 
+    /// Animate a window that just left the tiling layout (e.g. toggled to
+    /// floating) from `from` to its new rectangle `to`. Its resting target is
+    /// dropped because the layout no longer owns it.
+    pub fn start_untiled_transition(
+        &mut self,
+        root: &WlSurface,
+        from: Rectangle<i32, Logical>,
+        to: Rectangle<i32, Logical>,
+        now: Instant,
+        app_id: &str,
+    ) {
+        self.targets.remove(root);
+        if !self.enabled || !self.layout_enabled || from == to {
+            self.anims.remove(root);
+            return;
+        }
+        self.start(
+            root,
+            WindowAnimationKind::GeometryChange,
+            from,
+            to,
+            now,
+            app_id,
+        );
+    }
+
     /// Record a resting target for `root` without starting any animation, and
     /// cancel any in-flight one. Used when animations are situationally
     /// suppressed (e.g. a fullscreen game owns the screen) so that re-enabling

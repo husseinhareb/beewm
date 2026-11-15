@@ -1,4 +1,6 @@
-use beewm::compositor::overview::{OverviewNav, cell_rects, fit, grid_columns, nav_target};
+use beewm::compositor::overview::{
+    OverviewNav, cell_rects, fit, grid_columns, nav_spatial, place_in_panel,
+};
 use smithay::utils::{Logical, Rectangle};
 
 fn screen(w: i32, h: i32) -> Rectangle<i32, Logical> {
@@ -94,41 +96,91 @@ fn a_partial_last_row_is_centered() {
     );
 }
 
-#[test]
-fn tab_wraps_around_the_grid_and_arrows_stop_at_the_edges() {
-    // 10 cells, 5 columns.
-    assert_eq!(nav_target(9, 10, 5, OverviewNav::Next), 0);
-    assert_eq!(nav_target(0, 10, 5, OverviewNav::Prev), 9);
-    assert_eq!(nav_target(0, 10, 5, OverviewNav::Left), 0);
-    assert_eq!(nav_target(1, 10, 5, OverviewNav::Left), 0);
-    assert_eq!(nav_target(4, 10, 5, OverviewNav::Right), 4);
-    assert_eq!(nav_target(3, 10, 5, OverviewNav::Right), 4);
-    assert_eq!(nav_target(2, 10, 5, OverviewNav::Up), 2);
-    assert_eq!(nav_target(7, 10, 5, OverviewNav::Up), 2);
-    assert_eq!(nav_target(2, 10, 5, OverviewNav::Down), 7);
-    assert_eq!(nav_target(7, 10, 5, OverviewNav::Down), 7);
+fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new((x, y).into(), (w, h).into())
 }
 
 #[test]
-fn navigation_stays_in_range_on_a_partial_last_row() {
-    // 7 cells, 3 columns: the last row holds 6 only.
-    for nav in [
-        OverviewNav::Next,
-        OverviewNav::Prev,
-        OverviewNav::Left,
-        OverviewNav::Right,
-        OverviewNav::Up,
-        OverviewNav::Down,
+fn windows_keep_their_workspace_arrangement_inside_the_panel() {
+    let screen = rect(0, 0, 1920, 1080);
+    let panel = rect(100, 50, 480, 270); // quarter scale
+    // Left and right halves with a 20px gap between them.
+    let left = place_in_panel(panel, screen, rect(0, 0, 950, 1080), 0);
+    let right = place_in_panel(panel, screen, rect(970, 0, 950, 1080), 0);
+    assert_eq!(left, rect(100, 50, 238, 270));
+    assert_eq!(right.loc.y, left.loc.y);
+    assert_eq!(right.size.h, left.size.h);
+    assert!(right.loc.x > left.loc.x + left.size.w, "halves stay apart");
+    assert_eq!(
+        right.loc.x + right.size.w,
+        100 + 480,
+        "flush with the right edge"
+    );
+
+    // The inset pulls every side in by the same amount.
+    let inset = place_in_panel(panel, screen, rect(0, 0, 950, 1080), 3);
+    assert_eq!(inset, rect(103, 53, 232, 264));
+
+    // A screen that is not at the origin (second monitor) maps the same way.
+    let second = rect(1920, 0, 1920, 1080);
+    assert_eq!(
+        place_in_panel(panel, second, rect(1920, 0, 950, 1080), 0),
+        left
+    );
+
+    // A window hanging off the screen is clamped to the panel, and a tiny one
+    // with a big inset still comes out at least a pixel.
+    let off = place_in_panel(panel, screen, rect(1800, 900, 600, 600), 0);
+    assert!(off.loc.x + off.size.w <= 580 && off.loc.y + off.size.h <= 320);
+    let tiny = place_in_panel(panel, screen, rect(10, 10, 4, 4), 3);
+    assert!(tiny.size.w >= 1 && tiny.size.h >= 1);
+}
+
+#[test]
+fn inset_cards_keep_their_window_proportions() {
+    // The bug this guards: a short, wide window (a half-height tile) lost the
+    // same inset on both axes, came out proportionally wider than the window,
+    // and the window drawn inside left a thick band of outline down each side.
+    let screen = rect(0, 0, 1920, 1030);
+    let panel = rect(0, 0, 580, 311);
+    for window in [
+        rect(966, 571, 944, 499),
+        rect(10, 60, 944, 1010),
+        rect(0, 0, 1900, 200),
     ] {
-        for selected in 0..7 {
-            assert!(nav_target(selected, 7, 3, nav) < 7);
-        }
+        let card = place_in_panel(panel, screen, window, 3);
+        let scaled_h = card.size.w as f64 * window.size.h as f64 / window.size.w as f64;
+        assert!(
+            (scaled_h - card.size.h as f64).abs() <= 1.0,
+            "{window:?} -> {card:?} is out of proportion",
+        );
     }
-    // Down from the last column of the middle row has nowhere to go.
-    assert_eq!(nav_target(5, 7, 3, OverviewNav::Down), 5);
-    assert_eq!(nav_target(3, 7, 3, OverviewNav::Down), 6);
-    // Empty grid must not panic or index out of bounds.
-    assert_eq!(nav_target(0, 0, 0, OverviewNav::Next), 0);
+}
+
+#[test]
+fn arrows_move_to_the_nearest_window_in_that_direction() {
+    // Two workspaces side by side: [A | B] and [C over D].
+    let cards = [
+        rect(0, 0, 100, 200),    // 0 A
+        rect(110, 0, 100, 200),  // 1 B
+        rect(300, 0, 200, 95),   // 2 C
+        rect(300, 105, 200, 95), // 3 D
+    ];
+    assert_eq!(nav_spatial(&cards, 0, OverviewNav::Right), 1);
+    assert_eq!(nav_spatial(&cards, 1, OverviewNav::Right), 2);
+    assert_eq!(nav_spatial(&cards, 2, OverviewNav::Down), 3);
+    assert_eq!(nav_spatial(&cards, 3, OverviewNav::Up), 2);
+    assert_eq!(nav_spatial(&cards, 3, OverviewNav::Left), 1);
+    // Nothing further that way: stay put.
+    assert_eq!(nav_spatial(&cards, 0, OverviewNav::Left), 0);
+    assert_eq!(nav_spatial(&cards, 0, OverviewNav::Up), 0);
+    assert_eq!(nav_spatial(&cards, 3, OverviewNav::Down), 3);
+    // Tab wraps both ways.
+    assert_eq!(nav_spatial(&cards, 3, OverviewNav::Next), 0);
+    assert_eq!(nav_spatial(&cards, 0, OverviewNav::Prev), 3);
+    // Empty and out-of-range input must not panic.
+    assert_eq!(nav_spatial(&[], 0, OverviewNav::Next), 0);
+    assert!(nav_spatial(&cards, 99, OverviewNav::Right) < cards.len());
 }
 
 #[test]

@@ -56,10 +56,11 @@ default, the binding syntax and actions, and the environment variables.
 
 ## Window overview
 
-Hold **Super** on its own for ~200 ms and every open window — across all
-workspaces — is laid out as a grid of live thumbnails sized to the screen
-(10 windows on a 16:9 display come out as 5 columns × 2 rows). While Super is
-held, `Tab`/`Shift+Tab`, the arrow keys or the pointer move the selection;
+Hold **Super** on its own for ~200 ms and every workspace that has windows is
+shown as a miniature screen, laid out in a grid. Inside each one, the live
+windows sit exactly where they are on the real workspace, so a split stays a
+split. While Super is held, `Tab`/`Shift+Tab` (reading order), the arrow keys
+(nearest window that way) or the pointer move the selection;
 releasing Super switches to the selected window (changing workspace if it lives
 on another one) and the grid disappears. `Esc` dismisses it without switching.
 

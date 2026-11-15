@@ -1,12 +1,16 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use smithay::backend::allocator::Buffer as _;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::element::PixelShaderElement;
-use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTarget, GlesTexture};
+use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
 use smithay::output::Output;
@@ -20,6 +24,7 @@ use smithay::reexports::wayland_server::{
     backend::{ClientId, GlobalId},
 };
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Size, Transform};
+use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::shm::with_buffer_contents_mut;
 use tracing::warn;
 
@@ -59,6 +64,19 @@ pub(crate) struct PendingScreencopyFrame {
     pub overlay_cursor: bool,
     pub buffer: Option<wl_buffer::WlBuffer>,
     pub copy_with_damage: bool,
+    /// Whether a GPU buffer was offered for this frame (see `create_screencopy_frame`).
+    pub dmabuf_offered: bool,
+    /// Set when the client attached a GPU buffer: the frame is drawn straight
+    /// into it, with no readback to system memory.
+    pub dmabuf: Option<Dmabuf>,
+}
+
+/// The GPU buffer format to offer screencopy clients: one the renderer can draw
+/// into, XRGB first (no alpha to carry for a screen image), then ARGB.
+pub(crate) fn pick_dmabuf_format(render_formats: &FormatSet) -> Option<Fourcc> {
+    [Fourcc::Xrgb8888, Fourcc::Argb8888]
+        .into_iter()
+        .find(|code| render_formats.iter().any(|format| format.code == *code))
 }
 
 pub(crate) fn create_screencopy_global<D>(display: &DisplayHandle) -> GlobalId
@@ -81,6 +99,9 @@ impl Beewm {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let frame = data_init.init(frame_resource, ());
+        if let Some(client) = frame.client() {
+            self.note_capture_frame(&client);
+        }
 
         let Some(output) = Output::from_resource(&output_resource) else {
             frame.failed();
@@ -99,6 +120,21 @@ impl Beewm {
             geometry.shm_stride as u32,
         );
         frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
+        // Offer a GPU buffer too, so a capable client (xdg-desktop-portal-wlr)
+        // gets frames that never leave video memory. Whole-output captures only:
+        // a region would need its own offset render, and the portal always
+        // captures whole outputs.
+        let whole_output = geometry.buffer_region == Rectangle::from_size(geometry.buffer_size);
+        let dmabuf_format = self
+            .screencopy_dmabuf_format
+            .filter(|_| frame.version() >= 3 && whole_output && !self.screencopy_dmabuf_broken);
+        if let Some(format) = dmabuf_format {
+            frame.linux_dmabuf(
+                format as u32,
+                geometry.buffer_region.size.w as u32,
+                geometry.buffer_region.size.h as u32,
+            );
+        }
         if frame.version() >= 3 {
             frame.buffer_done();
         }
@@ -123,6 +159,8 @@ impl Beewm {
             overlay_cursor,
             buffer: None,
             copy_with_damage: false,
+            dmabuf_offered: dmabuf_format.is_some(),
+            dmabuf: None,
         });
     }
 
@@ -148,18 +186,38 @@ impl Beewm {
             return;
         }
 
-        if !validate_shm_buffer(&buffer, &pending.geometry) {
-            frame.post_error(
-                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                "invalid screencopy wl_shm buffer",
-            );
-            self.drop_screencopy_frame(frame);
-            return;
+        match get_dmabuf(&buffer) {
+            Ok(dmabuf) => {
+                if !pending.dmabuf_offered || dmabuf.size() != pending.geometry.buffer_region.size {
+                    frame.post_error(
+                        zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                        "invalid screencopy dmabuf",
+                    );
+                    self.drop_screencopy_frame(frame);
+                    return;
+                }
+                pending.dmabuf = Some(dmabuf.clone());
+            }
+            Err(_) if !validate_shm_buffer(&buffer, &pending.geometry) => {
+                frame.post_error(
+                    zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                    "invalid screencopy wl_shm buffer",
+                );
+                self.drop_screencopy_frame(frame);
+                return;
+            }
+            Err(_) => {}
         }
 
         pending.buffer = Some(buffer);
         pending.copy_with_damage = copy_with_damage;
-        self.needs_render = true;
+        // `copy_with_damage` asks for the next frame *once something changes*,
+        // so it is served by the next redraw that happens anyway. Forcing one
+        // here made a stream of a static screen redraw it at full frame rate.
+        // A plain `copy` (a screenshot) wants a frame now.
+        if !copy_with_damage {
+            self.needs_render = true;
+        }
     }
 
     pub(crate) fn drop_screencopy_frame(&mut self, frame: &ZwlrScreencopyFrameV1) {
@@ -300,34 +358,36 @@ fn process_screencopy_frame(
         return;
     };
 
-    let result = (|| -> Result<bool, GlesError> {
-        let elements =
-            screencopy_render_elements(state, renderer, &pending.output, pending.overlay_cursor);
-        let mut target: GlesTexture =
-            renderer.create_buffer(Fourcc::Argb8888, pending.geometry.buffer_size)?;
-        let mut framebuffer = renderer.bind(&mut target)?;
-
-        let mut frame = renderer.render(
-            &mut framebuffer,
-            pending.geometry.render_size,
-            Transform::Normal,
-        )?;
-
-        let render_area = Rectangle::from_size(pending.geometry.render_size);
-        frame.clear(Color32F::from([0.1, 0.1, 0.1, 1.0]), &[render_area])?;
-        let _ = draw_render_elements::<GlesRenderer, _, ScreencopyRenderElement>(
-            &mut frame,
-            pending.geometry.output_scale,
-            &elements,
-            &[render_area],
-        )?;
-        let _ = frame.finish()?;
-
-        let read_region = readback_region(&pending.geometry);
-        let mapping = renderer.copy_framebuffer(&framebuffer, read_region, Fourcc::Argb8888)?;
-        let pixels = renderer.map_texture(&mapping)?;
-        Ok(write_pixels_into_buffer(&buffer, pixels, &pending.geometry))
-    })();
+    let elements =
+        screencopy_render_elements(state, renderer, &pending.output, pending.overlay_cursor);
+    let result = match pending.dmabuf.clone() {
+        // Straight into the client's GPU buffer: no readback, no copy.
+        Some(mut dmabuf) => (|| -> Result<bool, GlesError> {
+            let mut framebuffer = renderer.bind(&mut dmabuf)?;
+            let sync = draw_capture(renderer, &mut framebuffer, &elements, &pending.geometry)?;
+            // The client may read the buffer the moment it sees `ready`.
+            let _ = sync.wait();
+            Ok(true)
+        })()
+        .inspect_err(|error| {
+            // Most likely a buffer this driver cannot render into. Stop
+            // offering GPU buffers so the client falls back to shm.
+            warn!(
+                "Rendering into a screencopy dmabuf failed ({error:?}); offering shm only from now on"
+            );
+            state.screencopy_dmabuf_broken = true;
+        }),
+        None => (|| -> Result<bool, GlesError> {
+            let mut target: GlesTexture =
+                renderer.create_buffer(Fourcc::Argb8888, pending.geometry.buffer_size)?;
+            let mut framebuffer = renderer.bind(&mut target)?;
+            let _ = draw_capture(renderer, &mut framebuffer, &elements, &pending.geometry)?;
+            let read_region = readback_region(&pending.geometry);
+            let mapping = renderer.copy_framebuffer(&framebuffer, read_region, Fourcc::Argb8888)?;
+            let pixels = renderer.map_texture(&mapping)?;
+            Ok(write_pixels_into_buffer(&buffer, pixels, &pending.geometry))
+        })(),
+    };
 
     match result {
         Ok(true) => {
@@ -360,6 +420,25 @@ fn process_screencopy_frame(
             buffer.release();
         }
     }
+}
+
+/// Draw one capture of the output into `framebuffer`.
+fn draw_capture(
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut GlesTarget<'_>,
+    elements: &[ScreencopyRenderElement],
+    geometry: &ScreencopyGeometry,
+) -> Result<SyncPoint, GlesError> {
+    let mut frame = renderer.render(framebuffer, geometry.render_size, Transform::Normal)?;
+    let render_area = Rectangle::from_size(geometry.render_size);
+    frame.clear(Color32F::from([0.1, 0.1, 0.1, 1.0]), &[render_area])?;
+    let _ = draw_render_elements::<GlesRenderer, _, ScreencopyRenderElement>(
+        &mut frame,
+        geometry.output_scale,
+        elements,
+        &[render_area],
+    )?;
+    frame.finish()
 }
 
 fn screencopy_render_elements(
@@ -576,7 +655,34 @@ fn monotonic_time() -> (u64, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_geometry, readback_region};
+    use super::{capture_geometry, pick_dmabuf_format, readback_region};
+    use smithay::backend::allocator::format::FormatSet;
+    use smithay::backend::allocator::{Format, Fourcc, Modifier};
+
+    fn formats(codes: &[Fourcc]) -> FormatSet {
+        codes
+            .iter()
+            .map(|&code| Format {
+                code,
+                modifier: Modifier::Linear,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn offers_a_gpu_buffer_format_the_renderer_can_draw_into() {
+        assert_eq!(
+            pick_dmabuf_format(&formats(&[Fourcc::Argb8888, Fourcc::Xrgb8888])),
+            Some(Fourcc::Xrgb8888)
+        );
+        assert_eq!(
+            pick_dmabuf_format(&formats(&[Fourcc::Abgr8888, Fourcc::Argb8888])),
+            Some(Fourcc::Argb8888)
+        );
+        assert_eq!(pick_dmabuf_format(&formats(&[Fourcc::Nv12])), None);
+        assert_eq!(pick_dmabuf_format(&FormatSet::default()), None);
+    }
+
     use smithay::utils::{Logical, Physical, Rectangle, Size, Transform};
 
     #[test]

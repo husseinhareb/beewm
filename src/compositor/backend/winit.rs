@@ -332,6 +332,8 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     initial.push_str(&status.event_payload());
                     initial.push('\n');
                 }
+                initial.push_str(&data.state.screencast_status.event_payload());
+                initial.push('\n');
                 data.state.event_broadcaster.add_subscriber(stream, initial);
             }
             ChannelEvent::Closed => {
@@ -408,6 +410,11 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     );
     output.set_preferred(mode);
     data.state.add_output(output.clone(), (0, 0).into());
+    data.state.screencopy_dmabuf_format = crate::compositor::screencopy::pick_dmabuf_format(
+        BorrowMut::<GlesRenderer>::borrow_mut(winit_backend.renderer())
+            .egl_context()
+            .dmabuf_render_formats(),
+    );
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
@@ -457,6 +464,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // repainting at ~refresh rate and settles back to idle once they finish.
         data.state.tick_animations(Instant::now());
         data.state.tick_overview(Instant::now());
+        data.state.tick_screencast(Instant::now());
         data.state.refresh_overview_labels();
 
         // See run_udev for the rationale: rely on event sources to wake us

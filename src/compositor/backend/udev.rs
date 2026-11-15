@@ -425,6 +425,8 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     initial.push_str(&status.event_payload());
                     initial.push('\n');
                 }
+                initial.push_str(&data.state.screencast_status.event_payload());
+                initial.push('\n');
                 data.state.event_broadcaster.add_subscriber(stream, initial);
             }
             ChannelEvent::Closed => {
@@ -595,6 +597,10 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             data.state.set_output_modes(surface.output.clone(), modes);
                         }
                     }
+                    data.state.screencopy_dmabuf_format =
+                        crate::compositor::screencopy::pick_dmabuf_format(
+                            gd.renderer.egl_context().dmabuf_render_formats(),
+                        );
                     data.gpu = Some(gd);
                     data.state.drm_syncobj_state = syncobj_state;
                     let display_handle = data.state.display_handle.clone();
@@ -666,6 +672,7 @@ pub fn run_udev(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         // VBlank, so no busy loop), and clears back to idle when they finish.
         data.state.tick_animations(Instant::now());
         data.state.tick_overview(Instant::now());
+        data.state.tick_screencast(Instant::now());
         data.state.refresh_overview_labels();
 
         // A resume left the DRM device unusable (typically EACCES because we

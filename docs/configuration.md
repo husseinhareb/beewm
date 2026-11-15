@@ -139,7 +139,7 @@ environment variables.
 | Directive | Default | Notes |
 |---|---|---|
 | `tray_enabled` | `true` | Publish the settings tray icon (StatusNotifierItem). Also written `tray enable` / `tray disable`. |
-| `overview_enabled` | `true` | Hold Super alone to show every window as a grid. See the README. |
+| `overview_enabled` | `true` | Hold Super alone to show every workspace as a miniature screen with its windows in place. See the README. |
 
 ## Animations
 

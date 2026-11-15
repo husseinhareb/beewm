@@ -472,6 +472,11 @@ impl Beewm {
         let Some(window) = self.remove_mapped_toplevel(target_surface) else {
             return;
         };
+        // xdg-shell treats the next map like the first one: buffer-less
+        // commit, then a fresh initial configure from us.
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.reset_initial_configure_sent();
+        }
         // Only Wayland toplevels reach this path, but guard so a stray X11
         // window (which has its own unmap handler) is never re-queued here.
         if window.toplevel().is_some()
@@ -609,7 +614,13 @@ impl Beewm {
 
         match super::workspace::float_toggle_transition(is_fullscreen, is_floating) {
             super::workspace::FloatToggleTransition::SinkToTiling => {
+                // Seed the floating rect as the resting target so relayout
+                // animates float -> tile instead of replaying the open animation.
+                if let Some(from) = self.visual_geometry(&window) {
+                    self.animations.track_target(&root, from);
+                }
                 self.floating_windows.remove(&root);
+                self.auto_centered_floats.remove(&root);
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|s| {
                         s.states.unset(xdg_toplevel::State::Resizing);
@@ -733,16 +744,90 @@ impl Beewm {
 
         self.animations.forget(&root);
         self.floating_windows.insert(root.clone(), floating);
+        self.mark_auto_centered(&root);
         self.space
             .map_element(window.clone(), floating.position, true);
 
         if let Some(toplevel) = window.toplevel() {
-            toplevel.with_pending_state(|state| {
-                state.size = None;
-            });
-            toplevel.send_configure();
+            // Only release a size we actually imposed. A dialog that got a
+            // size-less initial configure is already at its natural size, and
+            // a redundant configure just costs it another round-trip.
+            let had_size = toplevel.with_pending_state(|state| state.size.take().is_some());
+            if had_size {
+                toplevel.send_configure();
+            }
             self.pending_float_centers.insert(root);
         }
+    }
+
+    /// Send the xdg-shell initial configure for a pending toplevel, in reply to
+    /// its initial (buffer-less) commit. By now the client has sent everything
+    /// that describes the window (parent, modal, app_id, title, min/max size),
+    /// so we can tell a dialog from a normal window *before* suggesting a size:
+    /// a window that will tile is told its tile size up front (so its first
+    /// frame is already the right size), a window that will float gets no size
+    /// and picks its own.
+    pub(crate) fn send_initial_toplevel_configure(&mut self, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        if toplevel.is_initial_configure_sent() {
+            return;
+        }
+        let root = root_surface(toplevel.wl_surface());
+        let floats =
+            should_map_toplevel_floating(window) || self.pending_should_float.contains(&root);
+        let size = if floats {
+            None
+        } else {
+            self.initial_toplevel_size(toplevel.wl_surface())
+        };
+        tracing::debug!(
+            target = "beewm::floating",
+            id = root.id().protocol_id(),
+            floats,
+            ?size,
+            "initial toplevel configure",
+        );
+        toplevel.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Activated);
+            state.size = size;
+        });
+        toplevel.send_configure();
+    }
+
+    /// Where a floating window goes after the client changed its own size to
+    /// `new_size`. A window we centered and the user has not touched stays
+    /// centered (over its parent, like on GNOME/KDE); anything else keeps its
+    /// top-left corner. Either way it is kept on screen.
+    pub(crate) fn resized_floating_data(
+        &self,
+        window: &Window,
+        root: &WlSurface,
+        current: FloatingWindowData,
+        new_size: Size<i32, Logical>,
+    ) -> FloatingWindowData {
+        if self.auto_centered_floats.contains(root)
+            && let Some((_, centered)) = self.centered_floating_data(window)
+        {
+            return centered;
+        }
+        let mut pos = current.position;
+        if let Some(output) = self
+            .output_for_window(window)
+            .or_else(|| self.focused_output())
+            && let Some(usable) = self.floating_usable_rect_for(&output)
+        {
+            pos = clamp_into_usable(pos, new_size, usable, ONSCREEN_MARGIN);
+        }
+        FloatingWindowData::new(pos, new_size)
+    }
+
+    /// Remember that `root` was placed by us (centered) and not yet touched by
+    /// the user, so it stays centered when the client resizes itself.
+    pub(crate) fn mark_auto_centered(&mut self, root: &WlSurface) {
+        self.auto_centered_floats.retain(|surface| surface.alive());
+        self.auto_centered_floats.insert(root.clone());
     }
 
     pub(crate) fn adopt_floating_dialog_state(&mut self, surface: &ToplevelSurface) {
@@ -763,7 +848,12 @@ impl Beewm {
             surface.with_pending_state(|state| {
                 state.size = None;
             });
-            surface.send_configure();
+            // Before the initial commit nothing has been suggested yet; the
+            // initial configure will carry the size-less state. Only a window
+            // that already got a configure (a remap) needs a correction now.
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
             return;
         }
 
@@ -802,7 +892,8 @@ impl Beewm {
             return;
         };
         self.animations.forget(&root);
-        self.floating_windows.insert(root, placeholder);
+        self.floating_windows.insert(root.clone(), placeholder);
+        self.mark_auto_centered(&root);
 
         if workspace_idx == self.active_workspace() {
             self.relayout();
@@ -844,8 +935,24 @@ impl Beewm {
             });
             toplevel.send_configure();
         }
+        // Where the window is drawn right now (its tile, or mid-animation rect),
+        // so the shrink starts exactly where the eye already sees it.
+        let from = self.visual_geometry(&window);
         self.remove_tiled_window(self.active_workspace(), &root);
-        self.animations.forget(&root);
+        match from {
+            Some(from) => {
+                let to = Rectangle::new(pos, Size::from((float_w, float_h)));
+                let app_id = Self::window_app_id(&window);
+                self.animations.start_untiled_transition(
+                    &root,
+                    from,
+                    to,
+                    std::time::Instant::now(),
+                    &app_id,
+                );
+            }
+            None => self.animations.forget(&root),
+        }
         self.space.map_element(window.clone(), pos, true);
         self.floating_windows.insert(
             root,

@@ -18,6 +18,7 @@ pub(crate) mod overview_chrome;
 pub(crate) mod power;
 mod render;
 pub(crate) mod runtime_flags;
+mod screencast_status;
 mod screencopy;
 pub(crate) mod state;
 pub(crate) mod text;

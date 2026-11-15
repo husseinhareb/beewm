@@ -1,19 +1,20 @@
 //! Hold-Super window overview ("task view").
 //!
 //! Holding Super for [`HOLD_DELAY`] without pressing anything else brings up a
-//! grid of live thumbnails of every window on every workspace, laid out in
-//! screen-shaped cells. Tab/arrow keys or the pointer move the
+//! grid of miniature screens, one per non-empty workspace, each showing live
+//! thumbnails of its windows at their real positions. Tab/arrow keys or the
+//! pointer move the
 //! selection; releasing Super activates the selected window and the grid
 //! disappears. Pressing any other key (or a mouse button) while Super is still
 //! down cancels the pending grid, so ordinary `mod+…` binds and `mod+drag` are
 //! completely untouched and never see it flash.
 //!
-//! The thumbnails are the *live* client surfaces scaled into their cell with
+//! The thumbnails are the *live* client surfaces scaled into their card with
 //! `constrain_space_element` — the same transform stack the window animations
 //! use — so there is no offscreen capture, texture copy or extra render pass.
 
 use std::borrow::BorrowMut;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use smithay::backend::allocator::Fourcc;
@@ -32,6 +33,7 @@ use smithay::desktop::Window;
 use smithay::desktop::space::{ConstrainBehavior, ConstrainReference, constrain_space_element};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::Output;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::seat::WaylandFocus;
 
@@ -45,8 +47,8 @@ pub const HOLD_DELAY: Duration = Duration::from_millis(180);
 
 /// Empty space kept between the grid and the edges of the output.
 const MARGIN: i32 = 48;
-/// Space between grid cells.
-const GAP: i32 = 24;
+/// Space between workspace panels.
+const GAP: i32 = 32;
 /// Width of the outline drawn around every cell. It sits *outside* the cell
 /// rather than eating into it, so the thumbnail still fills the cell exactly
 /// and a full-screen window has no matting at all.
@@ -60,6 +62,9 @@ const BACKDROP: Color32F = Color32F::new(0.03, 0.03, 0.05, 0.55);
 /// that is not the screen's shape, so it stays darker than the frame: empty
 /// space should read as empty, not as a broken tile.
 const CARD: Color32F = Color32F::new(0.09, 0.09, 0.11, 1.0);
+/// A workspace's miniature screen, behind its windows. A shade lighter than
+/// the cards so empty desktop space reads as part of the workspace.
+const PANEL: Color32F = Color32F::new(0.12, 0.12, 0.15, 0.92);
 /// Outline on every unselected cell. Without it the cards vanish into the
 /// backdrop and the grid reads as loose floating rectangles.
 const FRAME_IDLE: Color32F = Color32F::new(0.28, 0.28, 0.34, 1.0);
@@ -149,11 +154,9 @@ pub fn cell_rects(
 /// The largest rectangle of `aspect` (width / height) that fits inside `slot`,
 /// centred.
 ///
-/// A slot is the output's shape, but a tiled window is not. Fitting the card to
-/// the window rather than matting the window into the card keeps every
-/// thumbnail a complete, undistorted miniature of its window — the cards come
-/// out different shapes, which is itself what says "this one is a narrow
-/// window" at a glance.
+/// Used to fit a workspace's miniature screen into its grid slot when that
+/// workspace lives on a monitor with a different shape from the one showing
+/// the overview.
 pub fn fit(slot: Rectangle<i32, Logical>, aspect: f64) -> Rectangle<i32, Logical> {
     if !aspect.is_finite() || aspect <= 0.0 || slot.size.w <= 0 || slot.size.h <= 0 {
         return slot;
@@ -180,39 +183,108 @@ pub fn fit(slot: Rectangle<i32, Logical>, aspect: f64) -> Rectangle<i32, Logical
     )
 }
 
-/// Where `nav` moves a selection of `selected` in a `cols`-wide grid of `count`
-/// cells. Tab/Shift+Tab wrap around the whole grid; the arrow keys stay put at
-/// the edges instead of jumping to the other side.
-pub fn nav_target(selected: usize, count: usize, cols: usize, nav: OverviewNav) -> usize {
+/// Map `window` (global logical coordinates on `screen`) into `panel`, the
+/// miniature of that screen, then pull it in by `inset` on every side so the
+/// outline drawn around it stays inside its real footprint.
+///
+/// Both edges are scaled independently and rounded, so two windows that touch
+/// on the real screen keep the same spacing in the miniature (to within a
+/// pixel), the result keeps the window's proportions, and it never leaves
+/// `panel`.
+pub fn place_in_panel(
+    panel: Rectangle<i32, Logical>,
+    screen: Rectangle<i32, Logical>,
+    window: Rectangle<i32, Logical>,
+    inset: i32,
+) -> Rectangle<i32, Logical> {
+    if screen.size.w <= 0 || screen.size.h <= 0 {
+        return panel;
+    }
+    let sx = panel.size.w as f64 / screen.size.w as f64;
+    let sy = panel.size.h as f64 / screen.size.h as f64;
+    let map = |value: i32, origin: i32, scale: f64, base: i32, extent: i32| {
+        (base + ((value - origin) as f64 * scale).round() as i32).clamp(base, base + extent)
+    };
+    let x0 = map(window.loc.x, screen.loc.x, sx, panel.loc.x, panel.size.w);
+    let x1 = map(
+        window.loc.x + window.size.w,
+        screen.loc.x,
+        sx,
+        panel.loc.x,
+        panel.size.w,
+    );
+    let y0 = map(window.loc.y, screen.loc.y, sy, panel.loc.y, panel.size.h);
+    let y1 = map(
+        window.loc.y + window.size.h,
+        screen.loc.y,
+        sy,
+        panel.loc.y,
+        panel.size.h,
+    );
+    // Give up the inset before the window: a card must stay at least a pixel.
+    let shrink = |lo: i32, hi: i32| {
+        let inset = inset.clamp(0, ((hi - lo - 1) / 2).max(0));
+        (lo + inset, (hi - lo - 2 * inset).max(1))
+    };
+    let (x, w) = shrink(x0, x1);
+    let (y, h) = shrink(y0, y1);
+    // Taking the same inset off both axes changes the shape: a short, wide
+    // card ends up proportionally wider than its window, and the window, drawn
+    // undistorted inside it, leaves the outline showing as a thicker band down
+    // both sides. Trim the card back to the window's own proportions so the
+    // outline hugs it evenly. A pixel of difference is just rounding and is
+    // left alone, so cards that line up on screen still line up here.
+    let card = Rectangle::new((x, y).into(), (w, h).into());
+    let fitted = fit(card, window.size.w as f64 / window.size.h as f64);
+    if card.size.w - fitted.size.w > 1 || card.size.h - fitted.size.h > 1 {
+        fitted
+    } else {
+        card
+    }
+}
+
+/// Where `nav` moves the selection among `cards` laid out freely in 2D.
+///
+/// Tab/Shift+Tab walk the list and wrap. An arrow picks the nearest card whose
+/// centre lies in that direction (within a cone, so a card far off to the side
+/// does not count), favouring ones straight ahead, and stays put when there is
+/// none.
+pub fn nav_spatial(cards: &[Rectangle<i32, Logical>], selected: usize, nav: OverviewNav) -> usize {
+    let count = cards.len();
     if count == 0 {
         return 0;
     }
-    let cols = cols.max(1);
     let selected = selected.min(count - 1);
-    match nav {
-        OverviewNav::Next => (selected + 1) % count,
-        OverviewNav::Prev => (selected + count - 1) % count,
-        OverviewNav::Left => {
-            if selected.is_multiple_of(cols) {
-                selected
-            } else {
-                selected - 1
-            }
-        }
-        OverviewNav::Right => {
-            let next = selected + 1;
-            if next.is_multiple_of(cols) || next >= count {
-                selected
-            } else {
-                next
-            }
-        }
-        OverviewNav::Up => selected.checked_sub(cols).unwrap_or(selected),
-        OverviewNav::Down => {
-            let next = selected + cols;
-            if next < count { next } else { selected }
-        }
-    }
+    let center = |rect: &Rectangle<i32, Logical>| {
+        (
+            rect.loc.x as f64 + rect.size.w as f64 / 2.0,
+            rect.loc.y as f64 + rect.size.h as f64 / 2.0,
+        )
+    };
+    let (cx, cy) = center(&cards[selected]);
+    let (dx, dy) = match nav {
+        OverviewNav::Next => return (selected + 1) % count,
+        OverviewNav::Prev => return (selected + count - 1) % count,
+        OverviewNav::Left => (-1.0, 0.0),
+        OverviewNav::Right => (1.0, 0.0),
+        OverviewNav::Up => (0.0, -1.0),
+        OverviewNav::Down => (0.0, 1.0),
+    };
+    cards
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != selected)
+        .filter_map(|(index, rect)| {
+            let (x, y) = center(rect);
+            let ahead = (x - cx) * dx + (y - cy) * dy;
+            let aside = ((x - cx) * dy - (y - cy) * dx).abs();
+            // Only cards within a cone around the arrow count: "up" must not
+            // jump to something far off to the side that is barely higher.
+            (ahead > 0.5 && aside <= 2.0 * ahead).then_some((index, ahead + 2.0 * aside))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+        .unwrap_or(selected)
 }
 
 fn nav_for_keysym(keysym: Keysym, shift: bool) -> Option<OverviewNav> {
@@ -262,14 +334,17 @@ pub(crate) struct OverviewItem {
 /// the cell geometry and the render-element IDs stay stable while it is up.
 pub(crate) struct Overview {
     pub items: Vec<OverviewItem>,
-    /// Grid slots in output-local logical coordinates, index-aligned with
-    /// `items`. These are the pointer hit targets: a whole slot is easier to
-    /// aim at than the card drawn inside it.
-    pub cells: Vec<Rectangle<i32, Logical>>,
-    /// The card actually drawn in each slot — the slot narrowed to the window's
-    /// own aspect ratio. Everything visual uses these.
+    /// One miniature screen per non-empty workspace, in output-local logical
+    /// coordinates.
+    panels: Vec<Rectangle<i32, Logical>>,
+    panel_ids: Vec<Id>,
+    /// Each window's card, index-aligned with `items`: its real place on its
+    /// workspace, scaled into that workspace's panel. These are also the
+    /// pointer hit targets.
     thumbs: Vec<Rectangle<i32, Logical>>,
-    pub cols: usize,
+    /// Item indices topmost first (floating windows above tiled ones), for
+    /// drawing and for picking under the pointer.
+    z_order: Vec<usize>,
     pub selected: usize,
     /// Cell currently hovered by the pointer, if any.
     pub hovered: Option<usize>,
@@ -491,6 +566,62 @@ impl Beewm {
         }
     }
 
+    /// The global rectangle of the screen `workspace` is shown on, without any
+    /// bar strips: what each overview panel is a miniature of.
+    fn workspace_screen(&self, workspace: usize) -> Option<Rectangle<i32, Logical>> {
+        let output_idx = self.workspaces.get(workspace)?.output;
+        let output = &self.outputs.get(output_idx)?.output;
+        // The part of the screen windows can occupy: the output minus the
+        // strips layer-shell surfaces reserve (beebar). Miniaturising the whole
+        // output left that strip as an empty grey band on top of every panel.
+        self.floating_usable_rect_for(output)
+            .filter(|usable| usable.size.w > 0 && usable.size.h > 0)
+            .or_else(|| self.space.output_geometry(output))
+    }
+
+    /// Where every window of `workspace` sits on its screen, in global logical
+    /// coordinates, whether or not the workspace is visible right now. Tiled
+    /// windows (fullscreen ones included, at the slot they return to) come from
+    /// the layout itself; floating ones from their stored geometry.
+    fn workspace_window_rects(
+        &self,
+        workspace: usize,
+    ) -> HashMap<WlSurface, Rectangle<i32, Logical>> {
+        let mut rects = HashMap::new();
+        let Some(ws) = self.workspaces.get(workspace) else {
+            return rects;
+        };
+        let roots: Vec<WlSurface> = ws
+            .windows
+            .iter()
+            .filter_map(Self::window_root_surface)
+            .collect();
+        for root in &roots {
+            if let Some(floating) = self.floating_windows.get(root) {
+                rects.insert(
+                    root.clone(),
+                    Rectangle::new(floating.position, floating.size),
+                );
+            }
+        }
+        let tiled: Vec<WlSurface> = roots
+            .into_iter()
+            .filter(|root| !self.is_root_floating(root))
+            .collect();
+        let usable = self
+            .outputs
+            .get(ws.output)
+            .and_then(|ctx| self.tiling_usable_geometry_for(&ctx.output));
+        if let Some(usable) = usable {
+            for (root, geo) in self.layout_manager.geometries(workspace, &usable, &tiled) {
+                if tiled.contains(&root) {
+                    rects.insert(root, self.tiled_content_rect(geo));
+                }
+            }
+        }
+        rects
+    }
+
     fn open_overview(&mut self) {
         let Some(output) = self.focused_output() else {
             return;
@@ -533,8 +664,68 @@ impl Beewm {
             )
                 .into(),
         );
-        let cells = cell_rects(items.len(), area, GAP);
-        let cols = grid_columns(items.len());
+
+        // One miniature screen per non-empty workspace, laid out in a grid.
+        // Each window is then drawn inside its workspace's panel exactly where
+        // it sits on the real screen, so windows that share a workspace stay
+        // side by side instead of each taking a grid slot of its own.
+        let mut groups: Vec<usize> = items.iter().map(|item| item.workspace).collect();
+        groups.dedup();
+        let cells = cell_rects(groups.len(), area, GAP);
+        let mut panels = Vec::with_capacity(groups.len());
+        let mut thumbs = Vec::with_capacity(items.len());
+        let mut floating = Vec::with_capacity(items.len());
+        for (workspace, cell) in groups.iter().zip(&cells) {
+            let screen = self.workspace_screen(*workspace).unwrap_or(region);
+            let panel = fit(*cell, screen.size.w as f64 / screen.size.h.max(1) as f64);
+            panels.push(panel);
+            let rects = self.workspace_window_rects(*workspace);
+            for item in items.iter().filter(|item| item.workspace == *workspace) {
+                let root = Self::window_root_surface(&item.window);
+                let rect = root
+                    .as_ref()
+                    .and_then(|root| rects.get(root).copied())
+                    .unwrap_or_else(|| {
+                        // No layout slot (e.g. mid-map): centre it at its size.
+                        let size = item.window.geometry().size;
+                        Rectangle::new(
+                            screen.loc
+                                + Point::from((
+                                    (screen.size.w - size.w) / 2,
+                                    (screen.size.h - size.h) / 2,
+                                )),
+                            size,
+                        )
+                    });
+                thumbs.push(place_in_panel(panel, screen, rect, FRAME));
+                floating.push(
+                    root.as_ref()
+                        .map(|root| self.is_root_floating(root))
+                        .unwrap_or(false),
+                );
+            }
+        }
+
+        // Tab walks each workspace in reading order, not insertion order.
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by_key(|&index| {
+            (
+                items[index].workspace,
+                thumbs[index].loc.y,
+                thumbs[index].loc.x,
+            )
+        });
+        let mut items_by_order: Vec<Option<OverviewItem>> = items.into_iter().map(Some).collect();
+        let items: Vec<OverviewItem> = order
+            .iter()
+            .filter_map(|&index| items_by_order[index].take())
+            .collect();
+        let thumbs: Vec<_> = order.iter().map(|&index| thumbs[index]).collect();
+        let floating: Vec<bool> = order.iter().map(|&index| floating[index]).collect();
+        // Floating windows sit above the tiled ones, as on the real screen;
+        // this decides both drawing and which card the pointer lands on.
+        let mut z_order: Vec<usize> = (0..items.len()).collect();
+        z_order.sort_by_key(|&index| !floating[index]);
 
         // Start on the currently focused window so a hold-and-release with no
         // navigation is a no-op rather than a surprise focus change.
@@ -553,15 +744,6 @@ impl Beewm {
             })
             .unwrap_or(0);
 
-        let thumbs: Vec<_> = items
-            .iter()
-            .zip(&cells)
-            .map(|(item, cell)| {
-                let size = item.window.geometry().size;
-                fit(*cell, size.w as f64 / size.h as f64)
-            })
-            .collect();
-
         let label_scale = output.current_scale().fractional_scale();
         let labels = items
             .iter()
@@ -579,8 +761,9 @@ impl Beewm {
                 })
                 .collect(),
             items,
-            cells,
-            cols,
+            panel_ids: panels.iter().map(|_| Id::new()).collect(),
+            panels,
+            z_order,
             selected,
             hovered: Some(selected),
             output,
@@ -640,7 +823,7 @@ impl Beewm {
         let Some(overview) = self.overview.as_ref() else {
             return;
         };
-        let target = nav_target(overview.selected, overview.items.len(), overview.cols, nav);
+        let target = nav_spatial(&overview.thumbs, overview.selected, nav);
         self.set_overview_selection(target);
     }
 
@@ -655,9 +838,10 @@ impl Beewm {
         };
         let local = pos - region.loc.to_f64();
         let hovered = overview
-            .cells
+            .z_order
             .iter()
-            .position(|cell| cell.to_f64().contains(local));
+            .copied()
+            .find(|&index| overview.thumbs[index].to_f64().contains(local));
         overview.hovered = hovered;
         if let Some(idx) = hovered
             && overview.selected != idx
@@ -669,7 +853,7 @@ impl Beewm {
     }
 
     /// A pointer button while the grid is up picks the hovered thumbnail.
-    /// Clicking empty backdrop space outside any cell dismisses the grid
+    /// Clicking empty space outside any window card dismisses the grid
     /// without activating a new window. Returns `true` when the click was consumed.
     pub(crate) fn overview_pointer_pressed(&mut self) -> bool {
         let Some(overview) = self.overview.as_ref() else {
@@ -681,14 +865,22 @@ impl Beewm {
     }
 }
 
-/// Every layer of the open grid, kept apart so the stacking order lives in one
-/// place ([`OverviewElements::into_ordered`]) instead of being re-derived by
-/// each backend.
+/// Everything one window card draws, kept together so a floating window stacks
+/// over its tiled neighbours as a whole, outline and label included.
+struct WindowLayer<R: Renderer> {
+    label: Option<MemoryRenderBufferRenderElement<R>>,
+    thumbnail: Vec<WindowElement<R>>,
+    frame: Option<SolidColorRenderElement>,
+    card: SolidColorRenderElement,
+}
+
+/// Every layer of the open overview, kept apart so the stacking order lives in
+/// one place ([`OverviewElements::into_ordered`]) instead of being re-derived
+/// by each backend.
 pub(crate) struct OverviewElements<R: Renderer> {
-    labels: Vec<MemoryRenderBufferRenderElement<R>>,
-    thumbnails: Vec<WindowElement<R>>,
-    frames: Vec<SolidColorRenderElement>,
-    cards: Vec<SolidColorRenderElement>,
+    /// Topmost window first.
+    windows: Vec<WindowLayer<R>>,
+    panels: Vec<SolidColorRenderElement>,
     shadows: Vec<PixelShaderElement>,
     backdrop: Option<SolidColorRenderElement>,
 }
@@ -696,10 +888,8 @@ pub(crate) struct OverviewElements<R: Renderer> {
 impl<R: Renderer> Default for OverviewElements<R> {
     fn default() -> Self {
         Self {
-            labels: Vec::new(),
-            frames: Vec::new(),
-            thumbnails: Vec::new(),
-            cards: Vec::new(),
+            windows: Vec::new(),
+            panels: Vec::new(),
             shadows: Vec::new(),
             backdrop: None,
         }
@@ -709,11 +899,11 @@ impl<R: Renderer> Default for OverviewElements<R> {
 impl<R: Renderer> OverviewElements<R> {
     /// Flatten into one front-to-back list, topmost first.
     ///
-    /// The order is the whole point of this type. Labels sit over their
-    /// thumbnail. The frames sit *behind* the thumbnails and are grown a few
-    /// pixels past them, so what shows is a border. Cards sit behind those as a
-    /// backstop for a window that has not drawn yet, then the shadows the cards
-    /// cast, and the dimming backdrop last of all.
+    /// Per window: the label over the thumbnail, the outline *behind* the
+    /// thumbnail (grown a few pixels past it, so what shows is a border), and
+    /// the card behind that as a backstop for a window that has not drawn yet.
+    /// Below all windows come the workspace panels, the shadows they cast, and
+    /// the dimming backdrop last of all.
     pub fn into_ordered<T>(self) -> Vec<T>
     where
         T: From<MemoryRenderBufferRenderElement<R>>
@@ -722,10 +912,13 @@ impl<R: Renderer> OverviewElements<R> {
             + From<SolidColorRenderElement>,
     {
         let mut elements: Vec<T> = Vec::new();
-        elements.extend(self.labels.into_iter().map(T::from));
-        elements.extend(self.thumbnails.into_iter().map(T::from));
-        elements.extend(self.frames.into_iter().map(T::from));
-        elements.extend(self.cards.into_iter().map(T::from));
+        for layer in self.windows {
+            elements.extend(layer.label.map(T::from));
+            elements.extend(layer.thumbnail.into_iter().map(T::from));
+            elements.extend(layer.frame.map(T::from));
+            elements.push(T::from(layer.card));
+        }
+        elements.extend(self.panels.into_iter().map(T::from));
         elements.extend(self.shadows.into_iter().map(T::from));
         elements.extend(self.backdrop.into_iter().map(T::from));
         elements
@@ -790,19 +983,22 @@ where
         .collect();
     let is_live = |index: usize| live.get(index).copied().unwrap_or(false);
 
-    let mut thumbnails = Vec::new();
-    for (item, cell) in overview
-        .items
-        .iter()
-        .zip(&overview.thumbs)
-        .enumerate()
-        .filter(|(index, _)| is_live(*index))
-        .map(|(_, pair)| pair)
-    {
-        // `Fit` keeps the window whole and undistorted. The card is already cut
-        // to the window's own aspect ratio, so it fills that card exactly and
-        // nothing is cropped or letterboxed.
-        thumbnails.extend(constrain_space_element::<R, Window, WindowElement<R>>(
+    let mut windows = Vec::with_capacity(overview.items.len());
+    for &index in &overview.z_order {
+        if !is_live(index) {
+            continue;
+        }
+        let (Some(item), Some(cell), Some(ids)) = (
+            overview.items.get(index),
+            overview.thumbs.get(index),
+            overview.cell_ids.get(index),
+        ) else {
+            continue;
+        };
+
+        // `Fit` keeps the window whole and undistorted. The card is the
+        // window's own rectangle scaled down, so it fills it exactly.
+        let thumbnail = constrain_space_element::<R, Window, WindowElement<R>>(
             renderer,
             &item.window,
             cell.loc,
@@ -814,53 +1010,69 @@ where
                 behavior: ConstrainScaleBehavior::Fit,
                 align: ConstrainAlign::CENTER,
             },
-        ));
+        )
+        .collect();
+
+        // The selected outline is its own quad with its own ID rather than a
+        // colour swap on the idle one: the damage tracker notices an element
+        // appearing or moving, but not a colour change at identical geometry.
+        let frame = if index == overview.selected {
+            solid(
+                overview.selection_id.clone(),
+                grow(*cell, FRAME),
+                scale,
+                state.border_color_focused,
+            )
+        } else {
+            solid(ids.frame.clone(), grow(*cell, FRAME), scale, FRAME_IDLE)
+        };
+
+        // Labels ride on the bottom edge of their card, over the thumbnail.
+        let label = overview
+            .labels
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|label| {
+                let top_left = Point::<i32, Logical>::from((
+                    cell.loc.x,
+                    cell.loc.y + cell.size.h - label.size.h,
+                ));
+                let location: Point<f64, Physical> = top_left.to_f64().to_physical(scale);
+                MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    location,
+                    &label.buffer,
+                    None,
+                    None,
+                    Some(label.size),
+                    Kind::Unspecified,
+                )
+                .inspect_err(|error| tracing::warn!("overview label element failed: {error:?}"))
+                .ok()
+            });
+
+        windows.push(WindowLayer {
+            label,
+            thumbnail,
+            frame: Some(frame),
+            card: solid(ids.card.clone(), *cell, scale, CARD),
+        });
     }
 
-    // Outlines are plain quads grown out from the cell, so what shows around a
-    // thumbnail is a border. The selected one is a separate moving quad rather
-    // than a per-cell colour swap: the damage tracker notices a geometry change
-    // on the same element ID, but not a colour change at identical geometry.
-    let mut frames = Vec::with_capacity(overview.thumbs.len() + 1);
-    if let Some(cell) = overview
-        .thumbs
-        .get(overview.selected)
-        .filter(|_| is_live(overview.selected))
-    {
-        frames.push(solid(
-            overview.selection_id.clone(),
-            grow(*cell, FRAME),
-            scale,
-            state.border_color_focused,
-        ));
-    }
-    // Idle outlines trace the card (the window's own shape), not the grid slot:
-    // a slot-sized quad would show as grey bars beside a narrow window, uneven
-    // margins around the rest, and a grey rim outside the selection outline.
-    // The selected card gets no idle outline at all, so nothing grey can peek
-    // out from under the blue one.
-    for (index, (ids, cell)) in overview.cell_ids.iter().zip(&overview.thumbs).enumerate() {
-        if !is_live(index) || index == overview.selected {
-            continue;
-        }
-        frames.push(solid(
-            ids.frame.clone(),
-            grow(*cell, FRAME),
-            scale,
-            FRAME_IDLE,
-        ));
-    }
+    // Each workspace is a miniature screen: a panel with a soft shadow, so the
+    // windows on it read as one group.
+    let panels = overview
+        .panel_ids
+        .iter()
+        .zip(&overview.panels)
+        .map(|(id, panel)| solid(id.clone(), *panel, scale, PANEL))
+        .collect();
+    let shadows = overview
+        .panels
+        .iter()
+        .filter_map(|panel| overview_chrome::shadow_element(renderer, *panel))
+        .collect();
 
-    // Only ever seen through a window that has not drawn yet; the thumbnail
-    // fills its card otherwise. Without it such a card would be a hole onto the
-    // desktop showing through the backdrop.
-    let mut cards = Vec::with_capacity(overview.thumbs.len());
-    for (index, (ids, cell)) in overview.cell_ids.iter().zip(&overview.thumbs).enumerate() {
-        if !is_live(index) {
-            continue;
-        }
-        cards.push(solid(ids.card.clone(), *cell, scale, CARD));
-    }
     let backdrop = solid(
         overview.backdrop_id.clone(),
         Rectangle::from_size(region.size),
@@ -868,42 +1080,9 @@ where
         BACKDROP,
     );
 
-    // Labels ride on the bottom edge of their cell, over the thumbnail.
-    let mut labels = Vec::new();
-    for (index, (label, cell)) in overview.labels.iter().zip(&overview.thumbs).enumerate() {
-        let Some(label) = label.as_ref().filter(|_| is_live(index)) else {
-            continue;
-        };
-        let top_left =
-            Point::<i32, Logical>::from((cell.loc.x, cell.loc.y + cell.size.h - label.size.h));
-        let location: Point<f64, Physical> = top_left.to_f64().to_physical(scale);
-        match MemoryRenderBufferRenderElement::from_buffer(
-            renderer,
-            location,
-            &label.buffer,
-            None,
-            None,
-            Some(label.size),
-            Kind::Unspecified,
-        ) {
-            Ok(element) => labels.push(element),
-            Err(error) => tracing::warn!("overview label element failed: {error:?}"),
-        }
-    }
-
-    let mut shadows = Vec::with_capacity(overview.thumbs.len());
-    for (index, cell) in overview.thumbs.iter().enumerate() {
-        if !is_live(index) {
-            continue;
-        }
-        shadows.extend(overview_chrome::shadow_element(renderer, *cell));
-    }
-
     OverviewElements {
-        labels,
-        frames,
-        thumbnails,
-        cards,
+        windows,
+        panels,
         shadows,
         backdrop: Some(backdrop),
     }

@@ -77,7 +77,7 @@ use super::diagnostics::BufferKind;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::state::{
-    Beewm, FloatingWindowData, ONSCREEN_MARGIN, clamp_into_usable, lookup_client_compositor_state,
+    Beewm, lookup_client_compositor_state,
     root_surface,
 };
 use super::state::popup::classify_toplevel_floating;
@@ -265,6 +265,8 @@ impl CompositorHandler for Beewm {
                 // Leave the window in pending_windows so it only maps once a real buffer is
                 // presented and all geometry, dialog roles, and min/max sizes are set.
                 self.pending_windows[pos].on_commit();
+                let window = self.pending_windows[pos].clone();
+                self.send_initial_toplevel_configure(&window);
                 return;
             }
 
@@ -449,16 +451,8 @@ impl CompositorHandler for Beewm {
                     && let Some(data) = self.floating_windows.get(&root).copied()
                     && data.size != geo_size
                 {
-                    let output = self
-                        .output_for_window(&window)
-                        .or_else(|| self.focused_output());
-                    let mut new_pos = data.position;
-                    if let Some(output) = output
-                        && let Some(usable) = self.floating_usable_rect_for(&output)
-                    {
-                        new_pos = clamp_into_usable(new_pos, geo_size, usable, ONSCREEN_MARGIN);
-                    }
-                    let new_data = FloatingWindowData::new(new_pos, geo_size);
+                    let new_data = self.resized_floating_data(&window, &root, data, geo_size);
+                    let new_pos = new_data.position;
                     self.floating_windows.insert(root.clone(), new_data);
                     self.space.map_element(window.clone(), new_pos, false);
                     self.raise_floating_windows();
@@ -555,23 +549,12 @@ impl XdgShellHandler for Beewm {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         self.prime_surface_scale_state(surface.wl_surface());
 
-        // Send an initial tiled size up front so terminals can render their
-        // first real frame at the target geometry instead of painting a blank
-        // placeholder and immediately resizing on first commit.
-        let is_dialog_intent = surface.parent().is_some()
-            || self
-                .pending_should_float
-                .contains(&root_surface(surface.wl_surface()));
-        let initial_size = if !is_dialog_intent {
-            self.initial_toplevel_size(surface.wl_surface())
-        } else {
-            None
-        };
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
-            state.size = initial_size;
-        });
-        surface.send_configure();
+        // No configure yet: at this point the client has only created the
+        // role object. Its parent, modal flag, app_id and min/max size arrive
+        // in the requests that follow, up to the initial commit, which is when
+        // xdg-shell expects the first configure. Sending one now meant every
+        // dialog was told "you are a 944x1010 tile" before we could know it was
+        // a dialog. See `send_initial_toplevel_configure`.
         let window = Window::new_wayland_window(surface);
         self.pending_windows.push(window);
     }
@@ -601,7 +584,10 @@ impl XdgShellHandler for Beewm {
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
         let Some(window) = self.mapped_window_for_surface(surface.wl_surface()) else {
-            surface.send_configure();
+            // Before the initial commit the initial configure is the answer.
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
             return;
         };
 
@@ -1090,23 +1076,25 @@ impl smithay::wayland::selection::wlr_data_control::DataControlHandler for Beewm
 
 impl XdgDecorationHandler for Beewm {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
+        set_server_side_decoration(&toplevel);
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
+        set_server_side_decoration(&toplevel);
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
+        set_server_side_decoration(&toplevel);
+    }
+}
+
+/// Decorations are usually negotiated before the initial commit; the mode then
+/// rides along with the initial configure instead of forcing an early one.
+fn set_server_side_decoration(toplevel: &ToplevelSurface) {
+    toplevel.with_pending_state(|state| {
+        state.decoration_mode = Some(DecorationMode::ServerSide);
+    });
+    if toplevel.is_initial_configure_sent() {
         toplevel.send_configure();
     }
 }

@@ -89,7 +89,6 @@ pub use self::decorations::{
     window_border_overlaps_layer,
 };
 pub use self::output::OutputCtx;
-pub(crate) use self::output::{ONSCREEN_MARGIN, clamp_into_usable};
 pub use self::popup::{
     centered_dialog_position, constrain_popup_geometry, is_dialog_size_cap, is_dialog_title,
     is_fixed_size, popup_constraint_target,
@@ -334,6 +333,11 @@ pub struct Beewm {
     /// re-commit at its natural size; on that next commit we re-center the
     /// floating entry to match the client's actual size.
     pub(crate) pending_float_centers: HashSet<WlSurface>,
+    /// Floating windows we centered ourselves and the user has not moved or
+    /// resized since. When such a client resizes itself (dialogs often grow
+    /// right after mapping) it is re-centered instead of growing off its old
+    /// top-left corner and off the screen.
+    pub(crate) auto_centered_floats: HashSet<WlSurface>,
     /// Toplevel surfaces that announced a floating intent (set_parent, modal,
     /// xdg-dialog) BEFORE their initial commit — at that point the window is
     /// still in `pending_windows` and we can't yet act on the signal. Recorded
@@ -377,6 +381,15 @@ pub struct Beewm {
     pub syncobj_blocker_installer: Option<Box<SyncobjBlockerInstaller>>,
     /// Outstanding zwlr_screencopy_frame_v1 objects waiting for a buffer copy.
     pub(crate) pending_screencopy_frames: Vec<PendingScreencopyFrame>,
+    pub(crate) screencast_status: crate::compositor::screencast_status::ScreencastStatus,
+    /// GPU buffer format offered to screencopy clients (whole-output captures
+    /// only), picked from what the renderer can draw into. `None` until the
+    /// backend has a renderer, and on GPUs that can render to neither format.
+    pub(crate) screencopy_dmabuf_format: Option<smithay::backend::allocator::Fourcc>,
+    /// Set after rendering into a client's GPU buffer failed once: from then on
+    /// only shm is offered, so a driver that cannot do it costs one failed
+    /// frame instead of a broken stream.
+    pub(crate) screencopy_dmabuf_broken: bool,
     /// Compositor-specific environment for spawned child processes.
     pub(crate) child_env: ChildEnvironment,
     /// Pushes `event>>data\n` lines to event-socket subscribers from a
@@ -420,6 +433,10 @@ pub struct Beewm {
     /// so the game silently stayed windowed. We now record the intent here
     /// and replay it in `map_x11_window` once the window is tracked.
     pub(crate) pending_x11_fullscreen: Vec<smithay::xwayland::X11Surface>,
+    /// X11 windows we made fullscreen on our own because they mapped covering
+    /// the output without asking (borderless games). Only these get the
+    /// "still covers the output" exemption when they drop fullscreen.
+    pub(crate) x11_auto_fullscreen: Vec<smithay::xwayland::X11Surface>,
 }
 
 impl Beewm {
@@ -599,6 +616,7 @@ impl Beewm {
             floating_windows: HashMap::new(),
             sticky_windows: HashSet::new(),
             pending_float_centers: HashSet::new(),
+            auto_centered_floats: HashSet::new(),
             pending_should_float: HashSet::new(),
             mapped_with_buffer: HashSet::new(),
             overview: None,
@@ -612,6 +630,9 @@ impl Beewm {
             border_color_unfocused,
             syncobj_blocker_installer: None,
             pending_screencopy_frames: Vec::new(),
+            screencast_status: Default::default(),
+            screencopy_dmabuf_format: None,
+            screencopy_dmabuf_broken: false,
             event_broadcaster: EventBroadcaster::new(),
             focus_publish_pending: false,
             pending_map_focus: None,
@@ -625,6 +646,7 @@ impl Beewm {
             last_frame_callbacks_sent_at: None,
             sync_stats: SyncStats::new(),
             pending_x11_fullscreen: Vec::new(),
+            x11_auto_fullscreen: Vec::new(),
         };
 
         state.publish_workspace_state();

@@ -202,8 +202,15 @@ journalctl --user -u xdg-desktop-portal -u xdg-desktop-portal-wlr -f
 - **Window/toplevel capture** is not implemented yet. The architecture does not
   preclude it (it would need a foreign-toplevel + per-toplevel capture protocol
   or a native portal backend), but it is out of scope for now.
-- **Zero-copy dmabuf** capture is not implemented; capture uses an offscreen
-  re-composite + readback into a PipeWire shm buffer. Correct first, optimized
-  later. This is per-frame work only while a capture is active.
+- **GPU (dmabuf) capture**: for whole-output captures beewm offers a dmabuf
+  next to the shm buffer, and a client that takes it (xdg-desktop-portal-wlr
+  does when the PipeWire consumer supports it) gets frames rendered straight
+  into video memory, with no readback. Region captures and clients that pick
+  shm still get an offscreen re-composite plus a readback. If rendering into
+  a client's dmabuf ever fails, beewm logs it and offers shm only from then on.
+- **Damage-driven streaming**: `copy_with_damage` (what the portal uses) is
+  answered on the next redraw that happens anyway, so sharing a static screen
+  costs almost nothing. A plain `copy` (a screenshot) still forces a redraw.
+  The damage reported is always the whole frame.
 - Screenshot tooling that speaks `zwlr_screencopy` directly (grim, wf-recorder,
   `grimblast`) keeps working unchanged — it uses the same protocol.

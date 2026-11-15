@@ -246,6 +246,10 @@ pub(super) fn try_start_move_grab(state: &mut Beewm) -> bool {
     };
 
     focus_and_raise_window(state, &window);
+    // The user is placing it now; stop re-centering it on client resizes.
+    if let Some(root) = Beewm::window_root_surface(&window) {
+        state.auto_centered_floats.remove(&root);
+    }
     state.active_grab = Some(ActiveGrab::Move(MoveGrab {
         window,
         start_pointer: state.pointer_location,
@@ -301,6 +305,9 @@ pub(super) fn try_start_resize_grab(state: &mut Beewm) -> bool {
 
     let edges = resize_edges_for_pointer(window_geo.loc, window_geo.size, state.pointer_location);
     focus_and_raise_window(state, &window);
+    if let Some(root) = Beewm::window_root_surface(&window) {
+        state.auto_centered_floats.remove(&root);
+    }
 
     if let Some(toplevel) = window.toplevel() {
         toplevel.with_pending_state(|state| {
