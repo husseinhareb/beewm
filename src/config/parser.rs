@@ -241,6 +241,10 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.layout_animation = parse_bool(value, line_no, directive)?;
             }
+            "workspace_animation" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.workspace_animation = parse_bool(value, line_no, directive)?;
+            }
             "disable_animations_for_fullscreen" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.disable_animations_for_fullscreen = parse_bool(value, line_no, directive)?;
@@ -257,18 +261,24 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 config.layout_animation_duration_ms = parse_number(value, line_no, directive)?;
             }
+            "workspace_animation_duration_ms" => {
+                let value = expect_single_argument(parts, line_no, directive)?;
+                config.workspace_animation_duration_ms = parse_number(value, line_no, directive)?;
+            }
             "animation_duration_ms" => {
-                // Convenience: set all three durations at once.
+                // Convenience: set every animation duration at once.
                 let value = expect_single_argument(parts, line_no, directive)?;
                 let ms: u64 = parse_number(value, line_no, directive)?;
                 config.open_animation_duration_ms = ms;
                 config.close_animation_duration_ms = ms;
                 config.layout_animation_duration_ms = ms;
+                config.workspace_animation_duration_ms = ms;
             }
             "animation_easing"
             | "open_animation_easing"
             | "close_animation_easing"
-            | "layout_animation_easing" => {
+            | "layout_animation_easing"
+            | "workspace_animation_easing" => {
                 let value = expect_single_argument(parts, line_no, directive)?;
                 if crate::compositor::animation::Easing::parse(value).is_none() {
                     return Err(ConfigError::Parse {
@@ -284,11 +294,13 @@ pub(super) fn parse_config(contents: &str) -> Result<Config, ConfigError> {
                     "open_animation_easing" => config.open_animation_easing = value,
                     "close_animation_easing" => config.close_animation_easing = value,
                     "layout_animation_easing" => config.layout_animation_easing = value,
-                    // Convenience: set all three curves at once.
+                    "workspace_animation_easing" => config.workspace_animation_easing = value,
+                    // Convenience: set every curve at once.
                     _ => {
                         config.open_animation_easing = value.clone();
                         config.close_animation_easing = value.clone();
-                        config.layout_animation_easing = value;
+                        config.layout_animation_easing = value.clone();
+                        config.workspace_animation_easing = value;
                     }
                 }
             }

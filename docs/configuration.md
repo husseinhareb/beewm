@@ -149,15 +149,18 @@ environment variables.
 | `window_open_animation` | `true` | New tiled windows grow from their top-left corner. |
 | `window_close_animation` | `true` | Closing tiled windows shrink toward their top-left corner and fade out. |
 | `layout_animation` | `true` | Animate tiles when the layout changes. |
+| `workspace_animation` | `true` | Slide workspaces sideways when switching between them. |
 | `disable_animations_for_fullscreen` | `true` | No animations while a window owns the whole screen (games). |
 | `open_animation_duration_ms` | `180` | Up to 10000. |
 | `close_animation_duration_ms` | `150` | Up to 10000. |
 | `layout_animation_duration_ms` | `200` | Up to 10000. |
-| `animation_duration_ms` | (none) | Sets all three durations at once. |
+| `workspace_animation_duration_ms` | `250` | Up to 10000. |
+| `animation_duration_ms` | (none) | Sets every duration at once. |
 | `open_animation_easing` | `ease_out` | `linear`, `ease_in`, `ease_out` or `ease_in_out`. |
 | `close_animation_easing` | `ease_in_out` | Same curves. |
 | `layout_animation_easing` | `ease_in_out` | Same curves. |
-| `animation_easing` | (none) | Sets all three curves at once. A later per-kind line overrides it. |
+| `workspace_animation_easing` | `ease_out` | Same curves. |
+| `animation_easing` | (none) | Sets every curve at once. A later per-kind line overrides it. |
 
 ## Outputs (multi-monitor)
 

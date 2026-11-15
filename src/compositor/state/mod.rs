@@ -50,6 +50,7 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::selection::{ext_data_control, wlr_data_control};
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState};
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -58,6 +59,7 @@ use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWaylandClientData};
 
@@ -197,6 +199,11 @@ pub struct Beewm {
     pub _single_pixel_buffer_state: SinglePixelBufferState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    /// Background clipboard access for tools like `wl-paste`/`wl-copy`
+    /// (both the standard `ext` protocol and the older `wlr` one).
+    pub ext_data_control_state: ext_data_control::DataControlState,
+    pub wlr_data_control_state: wlr_data_control::DataControlState,
+    pub xdg_activation_state: XdgActivationState,
     pub _screencopy_global: GlobalId,
     pub _virtual_keyboard_manager_global: GlobalId,
     pub _virtual_pointer_manager_global: GlobalId,
@@ -437,6 +444,23 @@ impl Beewm {
             SessionLockManagerState::new::<Self, _>(&display_handle, |_| true);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        // Without data control, `wl-paste` falls back to mapping an invisible
+        // window and waiting for keyboard focus, which reflows the tiling
+        // layout, steals focus and hangs when focus never comes. That breaks
+        // image paste in terminal apps (Claude Code and friends shell out to
+        // `wl-paste`). Every client is allowed, matching `allow_selection_access`
+        // on the X side: any process running as the user can read it anyway.
+        let ext_data_control_state = ext_data_control::DataControlState::new::<Self, _>(
+            &display_handle,
+            Some(&primary_selection_state),
+            |_| true,
+        );
+        let xdg_activation_state = XdgActivationState::new::<Self>(&display_handle);
+        let wlr_data_control_state = wlr_data_control::DataControlState::new::<Self, _>(
+            &display_handle,
+            Some(&primary_selection_state),
+            |_| true,
+        );
         let screencopy_global = create_screencopy_global::<Self>(&display_handle);
         // Input-injection globals for remote-control tools such as `wayvnc`.
         let virtual_keyboard_manager_global =
@@ -523,6 +547,9 @@ impl Beewm {
             _single_pixel_buffer_state: single_pixel_buffer_state,
             data_device_state,
             primary_selection_state,
+            ext_data_control_state,
+            wlr_data_control_state,
+            xdg_activation_state,
             _screencopy_global: screencopy_global,
             _virtual_keyboard_manager_global: virtual_keyboard_manager_global,
             _virtual_pointer_manager_global: virtual_pointer_manager_global,

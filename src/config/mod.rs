@@ -153,16 +153,20 @@ pub struct Config {
     pub window_close_animation: bool,
     /// Animate tiled windows when the layout reassigns their geometry.
     pub layout_animation: bool,
+    /// Slide workspaces horizontally when switching between them.
+    pub workspace_animation: bool,
     /// Skip animations while a window owns the whole screen (fullscreen games).
     pub disable_animations_for_fullscreen: bool,
     pub open_animation_duration_ms: u64,
     pub close_animation_duration_ms: u64,
     pub layout_animation_duration_ms: u64,
+    pub workspace_animation_duration_ms: u64,
     /// Easing curve names (linear | ease_in | ease_out | ease_in_out), one per
-    /// animation kind. `animation_easing` in the config file sets all three.
+    /// animation kind. `animation_easing` in the config file sets all of them.
     pub open_animation_easing: String,
     pub close_animation_easing: String,
     pub layout_animation_easing: String,
+    pub workspace_animation_easing: String,
 }
 
 impl Default for Config {
@@ -199,13 +203,16 @@ impl Default for Config {
             window_open_animation: true,
             window_close_animation: true,
             layout_animation: true,
+            workspace_animation: true,
             disable_animations_for_fullscreen: true,
             open_animation_duration_ms: 180,
             close_animation_duration_ms: 150,
             layout_animation_duration_ms: 200,
+            workspace_animation_duration_ms: 250,
             open_animation_easing: "ease_out".to_string(),
             close_animation_easing: "ease_in_out".to_string(),
             layout_animation_easing: "ease_in_out".to_string(),
+            workspace_animation_easing: "ease_out".to_string(),
         }
     }
 }
@@ -580,6 +587,10 @@ impl Config {
         ));
         text.push_str(&format!("layout_animation {}\n", default.layout_animation));
         text.push_str(&format!(
+            "workspace_animation {}\n",
+            default.workspace_animation
+        ));
+        text.push_str(&format!(
             "disable_animations_for_fullscreen {}\n",
             default.disable_animations_for_fullscreen
         ));
@@ -595,8 +606,12 @@ impl Config {
             "layout_animation_duration_ms {}\n",
             default.layout_animation_duration_ms
         ));
+        text.push_str(&format!(
+            "workspace_animation_duration_ms {}\n",
+            default.workspace_animation_duration_ms
+        ));
         text.push_str("# Easing: linear | ease_in | ease_out | ease_in_out\n");
-        text.push_str("# (animation_easing <curve> sets all three at once)\n");
+        text.push_str("# (animation_easing <curve> sets all of them at once)\n");
         text.push_str(&format!(
             "open_animation_easing {}\n",
             default.open_animation_easing
@@ -606,8 +621,12 @@ impl Config {
             default.close_animation_easing
         ));
         text.push_str(&format!(
-            "layout_animation_easing {}\n\n",
+            "layout_animation_easing {}\n",
             default.layout_animation_easing
+        ));
+        text.push_str(&format!(
+            "workspace_animation_easing {}\n\n",
+            default.workspace_animation_easing
         ));
         text.push_str("# Start commands once when beewm launches.\n");
         text.push_str("# exec waybar\n");
@@ -743,6 +762,10 @@ impl Config {
             (
                 "layout_animation_duration_ms",
                 self.layout_animation_duration_ms,
+            ),
+            (
+                "workspace_animation_duration_ms",
+                self.workspace_animation_duration_ms,
             ),
         ] {
             if ms > u64::from(MAX_ANIMATION_OR_REPEAT_MS) {

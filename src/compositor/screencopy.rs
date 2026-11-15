@@ -5,11 +5,10 @@ use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::gles::GlesTexture;
+use smithay::backend::renderer::gles::element::PixelShaderElement;
+use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::draw_render_elements;
-use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, ImportAll, ImportMem, Offscreen, Renderer,
-};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
@@ -25,17 +24,19 @@ use smithay::wayland::shm::with_buffer_contents_mut;
 use tracing::warn;
 
 use crate::compositor::layering::{layers_rendered_above_windows, layers_rendered_below_windows};
+use crate::compositor::overview::overview_elements;
 use crate::compositor::render::{
     WindowElement, layer_render_elements, lock_render_elements, window_render_elements,
 };
 use crate::compositor::state::Beewm;
 
 render_elements! {
-    pub(crate) ScreencopyRenderElement<R> where R: ImportAll + ImportMem;
-    Surface=WaylandSurfaceRenderElement<R>,
-    Window=WindowElement<R>,
+    pub(crate) ScreencopyRenderElement<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Window=WindowElement<GlesRenderer>,
     Border=SolidColorRenderElement,
-    Cursor=MemoryRenderBufferRenderElement<R>,
+    Cursor=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Shader=PixelShaderElement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -251,12 +252,11 @@ impl Dispatch<ZwlrScreencopyFrameV1, (), Beewm> for Beewm {
     }
 }
 
-pub(crate) fn process_pending_screencopies<R>(state: &mut Beewm, renderer: &mut R, output: &Output)
-where
-    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
-    R: Renderer<TextureId = GlesTexture>,
-    R::Error: std::fmt::Debug,
-{
+pub(crate) fn process_pending_screencopies(
+    state: &mut Beewm,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) {
     // Fail and drop any frames whose output is no longer mapped (unplugged
     // mid-capture). Otherwise the client would wait forever for a `ready`/
     // `failed` that can never come, and the entry would leak.
@@ -291,20 +291,20 @@ where
     }
 }
 
-fn process_screencopy_frame<R>(state: &mut Beewm, renderer: &mut R, pending: PendingScreencopyFrame)
-where
-    R: Renderer + ImportAll + ImportMem + ExportMem + Offscreen<GlesTexture> + Bind<GlesTexture>,
-    R: Renderer<TextureId = GlesTexture>,
-    R::Error: std::fmt::Debug,
-{
+fn process_screencopy_frame(
+    state: &mut Beewm,
+    renderer: &mut GlesRenderer,
+    pending: PendingScreencopyFrame,
+) {
     let Some(buffer) = pending.buffer.clone() else {
         return;
     };
 
-    let result = (|| -> Result<bool, R::Error> {
+    let result = (|| -> Result<bool, GlesError> {
         let elements =
             screencopy_render_elements(state, renderer, &pending.output, pending.overlay_cursor);
-        let mut target = renderer.create_buffer(Fourcc::Argb8888, pending.geometry.buffer_size)?;
+        let mut target: GlesTexture =
+            renderer.create_buffer(Fourcc::Argb8888, pending.geometry.buffer_size)?;
         let mut framebuffer = renderer.bind(&mut target)?;
 
         let mut frame = renderer.render(
@@ -315,7 +315,7 @@ where
 
         let render_area = Rectangle::from_size(pending.geometry.render_size);
         frame.clear(Color32F::from([0.1, 0.1, 0.1, 1.0]), &[render_area])?;
-        let _ = draw_render_elements::<R, _, ScreencopyRenderElement<R>>(
+        let _ = draw_render_elements::<GlesRenderer, _, ScreencopyRenderElement>(
             &mut frame,
             pending.geometry.output_scale,
             &elements,
@@ -362,16 +362,12 @@ where
     }
 }
 
-fn screencopy_render_elements<R>(
+fn screencopy_render_elements(
     state: &mut Beewm,
-    renderer: &mut R,
+    renderer: &mut GlesRenderer,
     output: &Output,
     overlay_cursor: bool,
-) -> Vec<ScreencopyRenderElement<R>>
-where
-    R: Renderer + ImportAll + ImportMem,
-    R: Renderer<TextureId = GlesTexture>,
-{
+) -> Vec<ScreencopyRenderElement> {
     // A locked session must never be captured. The render path in the backend
     // already drops everything but the lock surface (see `render_surface`);
     // screencopy has to make the same cut, or any client that held a
@@ -415,12 +411,17 @@ where
         1.0,
     );
 
+    // The overview grid is drawn on screen above everything else, so capture
+    // it too, or a screen share shows the plain desktop while it is open.
+    let overview = overview_elements(state, renderer, output);
+
     let mut elements = Vec::new();
     elements.extend(
         cursor_elements
             .into_iter()
             .map(ScreencopyRenderElement::from),
     );
+    elements.extend(overview.into_ordered::<ScreencopyRenderElement>());
     elements.extend(layers_above.into_iter().map(ScreencopyRenderElement::from));
     elements.extend(
         border_elements

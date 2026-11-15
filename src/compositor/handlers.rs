@@ -1072,6 +1072,22 @@ impl PrimarySelectionHandler for Beewm {
     }
 }
 
+impl smithay::wayland::selection::ext_data_control::DataControlHandler for Beewm {
+    fn data_control_state(
+        &self,
+    ) -> &smithay::wayland::selection::ext_data_control::DataControlState {
+        &self.ext_data_control_state
+    }
+}
+
+impl smithay::wayland::selection::wlr_data_control::DataControlHandler for Beewm {
+    fn data_control_state(
+        &self,
+    ) -> &smithay::wayland::selection::wlr_data_control::DataControlState {
+        &self.wlr_data_control_state
+    }
+}
+
 impl XdgDecorationHandler for Beewm {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
@@ -1209,6 +1225,9 @@ delegate_layer_shell!(Beewm);
 delegate_session_lock!(Beewm);
 delegate_data_device!(Beewm);
 delegate_primary_selection!(Beewm);
+smithay::delegate_ext_data_control!(Beewm);
+smithay::delegate_data_control!(Beewm);
+smithay::delegate_xdg_activation!(Beewm);
 delegate_seat!(Beewm);
 delegate_output!(Beewm);
 delegate_presentation!(Beewm);

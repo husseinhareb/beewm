@@ -2,6 +2,14 @@ use smithay::wayland::seat::WaylandFocus;
 
 use crate::config::FocusDirection;
 
+use std::collections::HashSet;
+
+use smithay::desktop::Window;
+use smithay::output::Output;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+
+use crate::compositor::animation::OutgoingWindow;
+
 use super::Beewm;
 use super::focus::best_directional_focus_candidate;
 use crate::model::workspace::Workspace;
@@ -88,6 +96,19 @@ impl Beewm {
 
         tracing::info!("Switching workspace {} -> {}", current + 1, idx + 1);
 
+        // Capture the outgoing windows for the slide animation before they
+        // leave the Space (their positions are gone after `unmap_elem`).
+        let slide_output = self.focused_output().filter(|output| {
+            self.animations.wants_workspace_slide()
+                && !(self.animations.disable_for_fullscreen()
+                    && (self.screen_owned_by_window(output)
+                        || self.workspaces[idx].fullscreen.is_some()))
+        });
+        let outgoing = match &slide_output {
+            Some(_) => self.outgoing_slide_windows(current),
+            None => Vec::new(),
+        };
+
         // Leave the current workspace's fullscreen state intact — it is
         // re-presented when we return. Unmap everything currently shown except
         // sticky windows, which stay mapped at their position so they follow us
@@ -142,6 +163,66 @@ impl Beewm {
         } else {
             self.set_keyboard_focus(None);
         }
+
+        if let Some(output) = slide_output {
+            self.start_workspace_slide(&output, current, idx, outgoing);
+        }
+    }
+
+    /// The non-sticky windows of workspace `ws` that are currently in the
+    /// Space, bottom to top, with the position they are drawn at.
+    fn outgoing_slide_windows(&self, ws: usize) -> Vec<OutgoingWindow> {
+        self.space
+            .elements()
+            .filter(|window| self.workspaces[ws].windows.contains(window))
+            .filter(|window| !self.is_window_sticky(window))
+            .filter_map(|window| {
+                Some(OutgoingWindow {
+                    window: window.clone(),
+                    location: self.space.element_location(window)?,
+                    geometry: self.space.element_geometry(window)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Slide `output` from workspace `from` to the now-visible workspace `to`.
+    /// The new workspace's windows are already laid out at their real
+    /// positions; the slide only offsets how they are drawn.
+    fn start_workspace_slide(
+        &mut self,
+        output: &Output,
+        from: usize,
+        to: usize,
+        outgoing: Vec<OutgoingWindow>,
+    ) {
+        let Some(width) = self.space.output_geometry(output).map(|geo| geo.size.w) else {
+            return;
+        };
+        let incoming: HashSet<WlSurface> = self.workspaces[to]
+            .windows
+            .iter()
+            .filter(|window| !self.is_window_sticky(window))
+            .filter_map(Self::window_root_surface)
+            .collect();
+        if incoming.is_empty() && outgoing.is_empty() {
+            return;
+        }
+        self.animations.start_workspace_slide(
+            output,
+            to > from,
+            width,
+            incoming,
+            outgoing,
+            std::time::Instant::now(),
+        );
+        self.needs_render = true;
+    }
+
+    pub(crate) fn is_window_sticky(&self, window: &Window) -> bool {
+        Self::window_root_surface(window)
+            .map(|root| self.sticky_windows.contains(&root))
+            .unwrap_or(false)
     }
 
     /// Re-home every tiled sticky window from workspace `from` to workspace

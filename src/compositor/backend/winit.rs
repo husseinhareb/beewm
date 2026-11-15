@@ -1,3 +1,4 @@
+use std::borrow::BorrowMut;
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
@@ -8,8 +9,8 @@ use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::element::PixelShaderElement;
+use smithay::backend::renderer::gles::{GlesError, GlesRenderer};
 use smithay::backend::renderer::glow::{GlowFrame, GlowRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::winit::{self, WinitEvent};
@@ -572,7 +573,11 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             elements.extend(layers_below.into_iter().map(WinitRenderElement::from));
                         }
 
-                        process_pending_screencopies(&mut data.state, renderer, output);
+                        process_pending_screencopies(
+                            &mut data.state,
+                            BorrowMut::<GlesRenderer>::borrow_mut(renderer),
+                            output,
+                        );
 
                         let clear_color = if locked {
                             [0.0, 0.0, 0.0, 1.0]

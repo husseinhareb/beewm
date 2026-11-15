@@ -292,6 +292,27 @@ fn animation_easing_sets_all_three_and_later_lines_override() {
     assert_eq!(config.open_animation_easing, "linear");
     assert_eq!(config.close_animation_easing, "linear");
     assert_eq!(config.layout_animation_easing, "ease_in");
+    assert_eq!(config.workspace_animation_easing, "linear");
+}
+
+#[test]
+fn parses_workspace_animation_settings() {
+    let config = Config::parse(
+        r#"
+        workspace_animation off
+        workspace_animation_duration_ms 300
+        workspace_animation_easing ease_in_out
+        "#,
+    )
+    .unwrap();
+    assert!(!config.workspace_animation);
+    assert_eq!(config.workspace_animation_duration_ms, 300);
+    assert_eq!(config.workspace_animation_easing, "ease_in_out");
+
+    let defaults = Config::default();
+    assert!(defaults.workspace_animation);
+    assert_eq!(defaults.workspace_animation_duration_ms, 250);
+    assert_eq!(defaults.workspace_animation_easing, "ease_out");
 }
 
 #[test]
@@ -379,6 +400,7 @@ fn animation_duration_ms_sets_all_three() {
     assert_eq!(config.open_animation_duration_ms, 100);
     assert_eq!(config.close_animation_duration_ms, 100);
     assert_eq!(config.layout_animation_duration_ms, 100);
+    assert_eq!(config.workspace_animation_duration_ms, 100);
 }
 
 #[test]

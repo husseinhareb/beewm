@@ -1,3 +1,4 @@
+mod activation;
 pub mod animation;
 pub(crate) mod appicon;
 pub mod backend;

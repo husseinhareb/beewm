@@ -200,10 +200,11 @@ impl Beewm {
                 .skip(win_idx + 1)
                 .filter_map(|candidate| {
                     let root = Self::window_root_surface(candidate)?;
+                    // Visual geometry, so an occluding float that is
+                    // animating or sliding hides the border where it is drawn.
                     self.is_root_floating(&root)
                         .then(|| {
-                            self.space
-                                .element_geometry(candidate)
+                            self.visual_geometry(candidate)
                                 .map(|geo| expand_by_border(geo, bw))
                         })
                         .flatten()
@@ -238,6 +239,37 @@ impl Beewm {
                     .into_iter()
                     .map(|rect| (rect, color)),
             );
+        }
+
+        // Borders of the workspace sliding off this output, at their old
+        // positions plus the slide offset. Drawn unfocused: focus has already
+        // moved to the new workspace.
+        if let Some(slide) = self.animations.slide_on(output) {
+            let offset = slide.outgoing_offset(std::time::Instant::now());
+            let outgoing: Vec<(Rectangle<i32, Logical>, bool)> = slide
+                .outgoing
+                .iter()
+                .filter(|out| !self.is_window_fullscreen(&out.window))
+                .map(|out| {
+                    let floating = Self::window_root_surface(&out.window)
+                        .is_some_and(|root| self.is_root_floating(&root));
+                    let mut geo = out.geometry;
+                    geo.loc += offset;
+                    (geo, floating)
+                })
+                .collect();
+            for (idx, (geo, _)) in outgoing.iter().enumerate() {
+                let occluders: Vec<Rectangle<i32, Logical>> = outgoing[idx + 1..]
+                    .iter()
+                    .filter(|(_, floating)| *floating)
+                    .map(|(geo, _)| expand_by_border(*geo, bw))
+                    .collect();
+                border_fragments.extend(
+                    visible_border_rectangles(*geo, bw, &occluders)
+                        .into_iter()
+                        .map(|rect| (rect, unfocused_color)),
+                );
+            }
         }
 
         while self.border_ids.len() < border_fragments.len() {

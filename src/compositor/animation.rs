@@ -29,16 +29,23 @@
 //!   The ghost sits at the bottom of the window stack, so the surviving
 //!   windows' `GeometryChange` animations grow over it into the freed space.
 //!
+//! Workspace switches get their own animation, [`WorkspaceSlide`]: the old
+//! workspace's windows (still alive, just unmapped from the `Space`) slide off
+//! one side of the output while the new workspace's windows slide in from the
+//! other. Sticky windows, layer surfaces and the cursor stay put.
+//!
 //! Everything here is keyed by the *root* `WlSurface` of a window so the state
 //! survives buffer commits and is trivially pruned when the surface dies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use smithay::backend::renderer::ContextId;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::desktop::Window;
+use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Logical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
@@ -256,6 +263,67 @@ pub fn snapshot_surface_tree(
     layers
 }
 
+/// A window of the workspace being switched away from, drawn live at its old
+/// position while it slides off the output.
+#[derive(Debug, Clone)]
+pub struct OutgoingWindow {
+    pub window: Window,
+    /// `Space` location at the moment of the switch.
+    pub location: Point<i32, Logical>,
+    /// `Space` geometry at the moment of the switch (for its border).
+    pub geometry: Rectangle<i32, Logical>,
+}
+
+/// A horizontal slide between two workspaces on one output.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSlide {
+    pub output: Output,
+    /// +1 when moving to a higher-numbered workspace (content moves left so the
+    /// new workspace enters from the right), -1 otherwise.
+    dir: i32,
+    /// Distance travelled: the output's logical width.
+    width: i32,
+    started_at: Instant,
+    duration: Duration,
+    easing: Easing,
+    /// Roots of the windows that slide in (the new workspace's non-sticky
+    /// windows at the time of the switch).
+    incoming: HashSet<WlSurface>,
+    /// The old workspace's windows, bottom to top.
+    pub outgoing: Vec<OutgoingWindow>,
+}
+
+impl WorkspaceSlide {
+    fn eased(&self, now: Instant) -> f64 {
+        if self.duration.is_zero() {
+            return 1.0;
+        }
+        let elapsed = now.saturating_duration_since(self.started_at).as_secs_f64();
+        self.easing
+            .apply((elapsed / self.duration.as_secs_f64()).clamp(0.0, 1.0))
+    }
+
+    fn is_finished(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= self.duration
+    }
+
+    /// Offset added to an incoming window's real position at `now`: one full
+    /// width off to the side at the start, zero at the end.
+    pub fn incoming_offset(&self, now: Instant) -> Point<i32, Logical> {
+        let t = self.eased(now);
+        let x = (f64::from(self.dir) * f64::from(self.width) * (1.0 - t)).round() as i32;
+        (x, 0).into()
+    }
+
+    /// Offset added to an outgoing window's old position at `now`: zero at the
+    /// start, one full width off the opposite side at the end.
+    pub fn outgoing_offset(&self, now: Instant) -> Point<i32, Logical> {
+        let t = self.eased(now);
+        let x = (-f64::from(self.dir) * f64::from(self.width) * t).round() as i32;
+        (x, 0).into()
+    }
+}
+
 /// The visual rectangle a window should currently be rendered into, plus how to
 /// fill it (reveal/clip vs. scale).
 #[derive(Debug, Clone, Copy)]
@@ -271,14 +339,19 @@ pub struct AnimationManager {
     open_enabled: bool,
     close_enabled: bool,
     layout_enabled: bool,
+    workspace_enabled: bool,
     disable_for_fullscreen: bool,
     open_duration: Duration,
     close_duration: Duration,
     layout_duration: Duration,
+    workspace_duration: Duration,
     open_easing: Easing,
     close_easing: Easing,
     layout_easing: Easing,
+    workspace_easing: Easing,
     anims: HashMap<WlSurface, WindowAnimation>,
+    /// At most one workspace slide per output.
+    slides: Vec<WorkspaceSlide>,
     /// Ghosts of closed windows still playing their close animation. Keyed by
     /// the (possibly already dead) root so one window never gets two ghosts.
     closing: HashMap<WlSurface, ClosingWindow>,
@@ -296,14 +369,18 @@ impl AnimationManager {
             open_enabled: true,
             close_enabled: true,
             layout_enabled: true,
+            workspace_enabled: true,
             disable_for_fullscreen: true,
             open_duration: Duration::from_millis(180),
             close_duration: Duration::from_millis(150),
             layout_duration: Duration::from_millis(200),
+            workspace_duration: Duration::from_millis(250),
             open_easing: Easing::EaseOutCubic,
             close_easing: Easing::EaseInOutCubic,
             layout_easing: Easing::EaseInOutCubic,
+            workspace_easing: Easing::EaseOutCubic,
             anims: HashMap::new(),
+            slides: Vec::new(),
             closing: HashMap::new(),
             targets: HashMap::new(),
         };
@@ -319,10 +396,12 @@ impl AnimationManager {
         self.open_enabled = config.window_open_animation;
         self.close_enabled = config.window_close_animation;
         self.layout_enabled = config.layout_animation;
+        self.workspace_enabled = config.workspace_animation;
         self.disable_for_fullscreen = config.disable_animations_for_fullscreen;
         self.open_duration = Duration::from_millis(config.open_animation_duration_ms);
         self.close_duration = Duration::from_millis(config.close_animation_duration_ms);
         self.layout_duration = Duration::from_millis(config.layout_animation_duration_ms);
+        self.workspace_duration = Duration::from_millis(config.workspace_animation_duration_ms);
         // The parser rejects unknown curve names, so `None` only happens for a
         // hand-built `Config`; keep the current curve then.
         if let Some(easing) = Easing::parse(&config.open_animation_easing) {
@@ -333,6 +412,9 @@ impl AnimationManager {
         }
         if let Some(easing) = Easing::parse(&config.layout_animation_easing) {
             self.layout_easing = easing;
+        }
+        if let Some(easing) = Easing::parse(&config.workspace_animation_easing) {
+            self.workspace_easing = easing;
         }
     }
 
@@ -474,7 +556,63 @@ impl AnimationManager {
     }
 
     pub fn has_active(&self) -> bool {
-        !self.anims.is_empty() || !self.closing.is_empty()
+        !self.anims.is_empty() || !self.closing.is_empty() || !self.slides.is_empty()
+    }
+
+    /// Whether workspace switches should slide right now.
+    pub fn wants_workspace_slide(&self) -> bool {
+        self.enabled && self.workspace_enabled && !self.workspace_duration.is_zero()
+    }
+
+    /// Start sliding `output` from one workspace to another, replacing any
+    /// slide already running there. `forward` is true when the new workspace
+    /// has a higher index (it enters from the right).
+    pub fn start_workspace_slide(
+        &mut self,
+        output: &Output,
+        forward: bool,
+        width: i32,
+        incoming: HashSet<WlSurface>,
+        outgoing: Vec<OutgoingWindow>,
+        now: Instant,
+    ) {
+        if !self.wants_workspace_slide() || width <= 0 {
+            return;
+        }
+        self.slides.retain(|slide| slide.output != *output);
+        tracing::debug!(
+            target = "beewm::animation",
+            output = output.name(),
+            forward,
+            incoming = incoming.len(),
+            outgoing = outgoing.len(),
+            duration_ms = self.workspace_duration.as_millis() as u64,
+            "starting workspace slide",
+        );
+        self.slides.push(WorkspaceSlide {
+            output: output.clone(),
+            dir: if forward { 1 } else { -1 },
+            width,
+            started_at: now,
+            duration: self.workspace_duration,
+            easing: self.workspace_easing,
+            incoming,
+            outgoing,
+        });
+    }
+
+    /// Slide offset for a window that is entering its output, or `None` if it
+    /// is not part of a running workspace slide.
+    pub fn slide_offset(&self, root: &WlSurface, now: Instant) -> Option<Point<i32, Logical>> {
+        self.slides
+            .iter()
+            .find(|slide| slide.incoming.contains(root))
+            .map(|slide| slide.incoming_offset(now))
+    }
+
+    /// The running workspace slide on `output`, if any.
+    pub fn slide_on(&self, output: &Output) -> Option<&WorkspaceSlide> {
+        self.slides.iter().find(|slide| slide.output == *output)
     }
 
     /// Whether a close animation should be captured for `root` right now.
@@ -567,6 +705,7 @@ impl AnimationManager {
         });
         // Ghosts outlive their surface on purpose; only time ends them.
         self.closing.retain(|_, ghost| !ghost.anim.is_finished(now));
+        self.slides.retain(|slide| !slide.is_finished(now));
         self.targets.retain(|root, _| root.alive());
         self.has_active()
     }
@@ -726,6 +865,48 @@ mod tests {
         assert!((mid_alpha - 0.5).abs() < 1e-6);
         let (_, end_alpha) = ghost.current(now + Duration::from_millis(150));
         assert_eq!(end_alpha, 0.0);
+    }
+
+    fn slide(forward: bool, now: Instant) -> WorkspaceSlide {
+        WorkspaceSlide {
+            output: Output::new(
+                "test".into(),
+                smithay::output::PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: smithay::output::Subpixel::Unknown,
+                    make: String::new(),
+                    model: String::new(),
+                },
+            ),
+            dir: if forward { 1 } else { -1 },
+            width: 1920,
+            started_at: now,
+            duration: Duration::from_millis(200),
+            easing: Easing::Linear,
+            incoming: HashSet::new(),
+            outgoing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn workspace_slide_moves_one_output_width() {
+        let now = Instant::now();
+        let fwd = slide(true, now);
+        // Forward: the new workspace starts one width to the right and the old
+        // one ends one width to the left.
+        assert_eq!(fwd.incoming_offset(now).x, 1920);
+        assert_eq!(fwd.outgoing_offset(now).x, 0);
+        let mid = now + Duration::from_millis(100);
+        assert_eq!(fwd.incoming_offset(mid).x, 960);
+        assert_eq!(fwd.outgoing_offset(mid).x, -960);
+        let end = now + Duration::from_millis(200);
+        assert_eq!(fwd.incoming_offset(end).x, 0);
+        assert_eq!(fwd.outgoing_offset(end).x, -1920);
+        assert!(fwd.is_finished(end));
+
+        let back = slide(false, now);
+        assert_eq!(back.incoming_offset(now).x, -1920);
+        assert_eq!(back.outgoing_offset(end).x, 1920);
     }
 
     #[test]

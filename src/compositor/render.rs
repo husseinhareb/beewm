@@ -279,8 +279,15 @@ where
 
     // Front-to-back (topmost first), matching render_elements_for_region.
     for window in space.elements().rev() {
-        let visual =
-            Beewm::window_root_surface(window).and_then(|root| animations.active_rect(&root, now));
+        let root = Beewm::window_root_surface(window);
+        let visual = root
+            .as_ref()
+            .and_then(|root| animations.active_rect(root, now));
+        // Non-zero only while this window slides in with its workspace.
+        let slide = root
+            .as_ref()
+            .and_then(|root| animations.slide_offset(root, now))
+            .unwrap_or_default();
 
         // Skip windows fully outside the region that are not being animated.
         if visual.is_none() && !region.overlaps(window.bbox()) {
@@ -292,7 +299,7 @@ where
                 // The visual rect is in global-logical space; move it into the
                 // output's render region frame.
                 let mut constrain = visual.rect;
-                constrain.loc -= region.loc;
+                constrain.loc += slide - region.loc;
                 let behavior = ConstrainBehavior {
                     reference: ConstrainReference::Geometry,
                     behavior: if visual.reveal {
@@ -323,7 +330,7 @@ where
                 let Some(mut constrain) = animations.resting_target(&root) else {
                     continue;
                 };
-                constrain.loc -= region.loc;
+                constrain.loc += slide - region.loc;
                 elements.extend(constrain_space_element::<R, Window, WindowElement<R>>(
                     renderer,
                     window,
@@ -345,7 +352,7 @@ where
                 // Same location formula as Space::render_elements_for_region:
                 // render_location = element_location - geometry().loc, then made
                 // relative to the output region.
-                let render_loc = location - window.geometry().loc - region.loc;
+                let render_loc = location + slide - window.geometry().loc - region.loc;
                 let phys = render_loc.to_physical_precise_round(scale);
                 elements.extend(
                     window
@@ -356,6 +363,28 @@ where
                         .map(WindowElement::Surface),
                 );
             }
+        }
+    }
+
+    // The workspace being switched away from, drawn live at its old positions
+    // as it slides off the output. Top to bottom, like everything above.
+    if let Some(slide) = animations.slide_on(output) {
+        let offset = slide.outgoing_offset(now);
+        for outgoing in slide.outgoing.iter().rev() {
+            let render_loc =
+                outgoing.location + offset - outgoing.window.geometry().loc - region.loc;
+            elements.extend(
+                outgoing
+                    .window
+                    .render_elements::<WaylandSurfaceRenderElement<R>>(
+                        renderer,
+                        render_loc.to_physical_precise_round(scale),
+                        scale,
+                        alpha,
+                    )
+                    .into_iter()
+                    .map(WindowElement::Surface),
+            );
         }
     }
 

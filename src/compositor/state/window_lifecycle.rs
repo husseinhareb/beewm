@@ -203,13 +203,18 @@ impl Beewm {
     /// decorations track the animation. Input/focus never use this — they use
     /// the real geometry from `space`.
     pub(crate) fn visual_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
-        if let Some(root) = Self::window_root_surface(window) {
-            let now = std::time::Instant::now();
-            if let Some(visual) = self.animations.active_rect(&root, now) {
-                return Some(visual.rect);
-            }
+        let Some(root) = Self::window_root_surface(window) else {
+            return self.space.element_geometry(window);
+        };
+        let now = std::time::Instant::now();
+        let mut geo = match self.animations.active_rect(&root, now) {
+            Some(visual) => visual.rect,
+            None => self.space.element_geometry(window)?,
+        };
+        if let Some(slide) = self.animations.slide_offset(&root, now) {
+            geo.loc += slide;
         }
-        self.space.element_geometry(window)
+        Some(geo)
     }
 
     /// Snapshot a tiled window that is about to leave the layout and start its

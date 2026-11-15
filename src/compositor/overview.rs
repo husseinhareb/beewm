@@ -834,7 +834,15 @@ where
             state.border_color_focused,
         ));
     }
-    for (ids, cell) in overview.cell_ids.iter().zip(&overview.cells) {
+    // Idle outlines trace the card (the window's own shape), not the grid slot:
+    // a slot-sized quad would show as grey bars beside a narrow window, uneven
+    // margins around the rest, and a grey rim outside the selection outline.
+    // The selected card gets no idle outline at all, so nothing grey can peek
+    // out from under the blue one.
+    for (index, (ids, cell)) in overview.cell_ids.iter().zip(&overview.thumbs).enumerate() {
+        if !is_live(index) || index == overview.selected {
+            continue;
+        }
         frames.push(solid(
             ids.frame.clone(),
             grow(*cell, FRAME),
